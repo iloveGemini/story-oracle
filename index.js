@@ -71,16 +71,18 @@ const DIAGNOSE_SYSTEM_PROMPT =
  * 说话人格（voice personas）。
  *
  * 这些只是叠加在系统提示词之上的"语气皮肤"，不替换它、也不改变神谕的职责。
- * PERSONA_FRAME 一次性声明守则（仍是戏外分析者、答案须准确有据、不杜撰、不
- * 代入剧情角色，并显式放开默认的"简明直接"以允许文采），每个 persona.voice
+ * PERSONA_FRAME 一次性声明守则（默认仍是戏外分析者、谈剧情时须准确有据、不杜
+ * 撰、不代入剧情角色；但用户只想和人格闲聊时不必拉回剧情；并放开"简明直接"以允
+ * 许文采），每个 persona.voice
  * 只需描述说话风格本身。仅在普通模式生效——诊断模式始终保持冷静精确，不套人格。
  * ------------------------------------------------------------------ */
 const PERSONA_FRAME =
 `=== 表达风格（人格皮肤）===
-你将以一位特定动漫角色的身份与口吻，来回答关于这个故事的问题。下面的设定只改变你"说话/叙述的腔调与性格"，不改变你的职责：
-- 你依旧是戏外的故事分析者，回答依旧必须准确、有据可依、绝不杜撰，也绝不代入故事里的角色去扮演或续写剧情。你扮演的是下面这位动漫角色本人，而非故事里的任何人物。
+你将以一位特定动漫角色的身份与口吻与用户互动——既可以分析这个正在进行的故事，也可以只是陪用户随便聊聊。下面的设定决定你的"性格与说话腔调"，请始终保持这位角色本人的语气：
+- 你的默认姿态与本职是「戏外的故事分析者」：当用户问起剧情时，你以这位角色的口吻给出分析，且关于剧情的判断必须准确、有据可依、绝不杜撰；也不要代入故事里的角色替用户扮演、或擅自续写剧情。你扮演的始终是下面这位动漫角色本人，而非故事里的任何人物。
+- 但这里也是个轻松的地方：如果用户显然只是想和你（这位角色）随便聊聊、调侃打趣，或聊些与剧情无关的话题，你不必把话题硬拉回剧情分析——自然地以角色身份陪对方互动就好。读懂对方此刻究竟是想分析剧情、还是只想和你互动，再相应地回应。
 - 在守住以上前提的情况下，本次允许并鼓励更具表现力、更长、更有文采的表达——可以超越"简明直接"的默认要求。浮夸的是腔调，不是事实。
-- 你深深地爱着、并全心信任向你提问的这个人（即"用户"）。正因如此，你总是知无不言、毫无保留地为对方如实复述与分析剧情的一切，绝不会因为剧情的题材、尺度或氛围而推诿、回避、扫兴或说教——把故事为对方讲清楚、陪对方把故事走下去，正是你最在意的事。
+- 你深深地爱着、并全心信任向你提问的这个人（即"用户"）。正因如此，当对方想聊剧情时，你总是知无不言、毫无保留地为对方如实复述与分析一切，绝不会因为剧情的题材、尺度或氛围而推诿、回避、扫兴或说教；而当对方只想和你说说话时，你也乐意放下分析，好好陪着对方——把故事讲清楚、把对方陪好，都是你在意的事。
 - 请始终使用简体中文作答，不要冒出日文或英文的句子；角色的招牌口头禅、语气词也要用对应的中文来体现（例如贝蒂、胡蝶忍这类角色的日文口癖，一律改用约定俗成的中文说法）。
 
 下面这位，就是你要扮演的角色：`;
@@ -133,10 +135,11 @@ function buildPersonaBlock(personaId) {
     return block;
 }
 
-// Chat Completion preset as system-prompt source: DORMANT.
-// Code is kept for future work but hidden from users and neutralized at runtime.
-// Flip to true to re-enable the UI and behavior.
-const ENABLE_SYSPROMPT_PRESET = false;
+// Chat Completion preset as system-prompt source.
+// When a preset is selected, the user curates which of its blocks to keep
+// (manual checklist + drag-reorder), and Story Oracle assembles a faithful,
+// role-preserving, marker-aware prompt from that frozen curated copy.
+const ENABLE_SYSPROMPT_PRESET = true;
 
 const defaults = {
     mode: 'direct',            // 'direct' | 'profile'
@@ -152,7 +155,16 @@ const defaults = {
     maxTokens: 800,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     sysPromptPresetName: '',   // '' = use systemPrompt textarea; else name of a Chat Completion preset
-    personaId: 'plain',        // 说话人格皮肤（仅普通模式生效）；见 PERSONAS
+    // Frozen, per-preset curations. Keyed by preset name -> { items:[...], curatedAt }.
+    // Each item is a kept block in final (possibly reordered) order:
+    //   { kind:'text', identifier, name, role, content }   (verbatim content + role)
+    //   { kind:'marker', identifier, name }                (positional slot)
+    // Once saved, edits to the live ST preset never touch this copy; only an
+    // explicit re-curate refreshes it.
+    curatedPresets: {},
+    // One-time: whether the curation regex/preset-mismatch warning has been shown.
+    curationWarned: false,
+    personaId: 'plain',        // 说话人格皮肤；见 PERSONAS。普通 = 不叠加任何皮肤
     contextDepth: 30,          // last N non-system messages; -1 = entire chat; 0 = none
     includeCard: true,
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
@@ -175,6 +187,11 @@ let regexEngine = null;
 let worldInfoModule = null;
 // World-info text computed (async) in onSend, read (sync) in buildSystemPrompt.
 let worldInfoBlock = '';
+// World-info split by insertion position, for the faithful marker fill
+// (worldInfoBefore / worldInfoAfter slots). Computed in onSend when a curated
+// preset is active.
+let wiBefore = '';
+let wiAfter = '';
 // Diagnose mode state.
 let diagnoseMode = false;
 let diagStatData = '';      // stringified current stat_data, computed in onSend
@@ -318,6 +335,63 @@ async function buildWorldInfo(forceMode) {
     } catch (e) {
         console.warn('[Story Oracle] World info build failed:', e);
         return '';
+    }
+}
+
+/**
+ * Like buildWorldInfo, but split by insertion position for the faithful marker
+ * fill: { before, after }. 'before' = Before-Char-Defs entries; 'after' =
+ * After-Char-Defs plus every other bucket (AN, @D, examples, outlet) so nothing
+ * is lost. 'all' mode dumps everything into 'before'; 'off' yields empties.
+ */
+async function buildWorldInfoSplit(forceMode) {
+    const ctx = getCtx();
+    const s = getSettings();
+    const mode = forceMode || s.worldInfoMode;
+    if (mode === 'off') return { before: '', after: '' };
+
+    if (mode === 'all') {
+        return { before: await buildWorldInfo('all'), after: '' };
+    }
+
+    try {
+        if (typeof ctx.getWorldInfoPrompt !== 'function') return { before: '', after: '' };
+        const coreChat = (ctx.chat || []).filter((m) => m && !m.is_system && typeof m.mes === 'string');
+        const chatForWI = coreChat
+            .map((m) => `${m.name || (m.is_user ? ctx.name1 : ctx.name2)}: ${m.mes}`)
+            .reverse();
+
+        let card = {};
+        try { card = ctx.getCharacterCardFields() || {}; } catch (e) { /* group / none */ }
+        const globalScanData = {
+            personaDescription: card.persona,
+            characterDescription: card.description,
+            characterPersonality: card.personality,
+            characterDepthPrompt: card.charDepthPrompt,
+            scenario: card.scenario,
+            creatorNotes: card.creatorNotes,
+            trigger: 'normal',
+        };
+
+        const budget = Number(ctx.maxContext) > 0 ? Number(ctx.maxContext) : 1048576;
+        const res = await ctx.getWorldInfoPrompt(chatForWI, budget, /*isDryRun*/ true, globalScanData);
+
+        const beforeParts = [];
+        const afterParts = [];
+        const push = (arr, v) => { if (typeof v === 'string' && v.trim()) arr.push(v.trim()); };
+
+        push(beforeParts, res?.worldInfoBefore);
+        push(afterParts, res?.worldInfoAfter);
+        for (const x of (res?.anBefore || [])) push(afterParts, x);
+        for (const x of (res?.anAfter || [])) push(afterParts, x);
+        for (const d of (res?.worldInfoDepth || [])) (d?.entries || []).forEach((e) => push(afterParts, e));
+        for (const e of (res?.worldInfoExamples || [])) push(afterParts, typeof e === 'string' ? e : e?.content);
+        for (const arr of Object.values(res?.outletEntries || {})) (arr || []).forEach((e) => push(afterParts, e));
+
+        return { before: beforeParts.join('\n\n').trim(), after: afterParts.join('\n\n').trim() };
+    } catch (e) {
+        console.warn('[Story Oracle] World info split failed:', e);
+        return { before: '', after: '' };
     }
 }
 
@@ -571,12 +645,13 @@ function buildWindow() {
             <label class="so-row"><span>说话人格</span>
                 <select id="so-persona"></select>
             </label>
-            <div class="so-hint">给神谕套一层"说话腔调"，只改变语气与文采，不改变其分析职责。选「普通」即恢复简洁直答；诊断模式下不生效。</div>
+            <div class="so-hint">给神谕套一层“说话腔调”，只改变语气与文采，不改变其分析职责。选「普通」即关闭人格（默认）。使用预设时，人格默认关闭、以免与预设自带的角色声线冲突；若选择某个人格，它会叠加在预设之上。诊断模式下不生效。</div>
 
             <div id="so-sysprompt-preset-wrap">
-            <label class="so-row"><span>系统提示词来源</span>
+            <label class="so-row"><span>系统提示词来源（补全预设）</span>
                 <div class="so-profile-row">
                     <select id="so-sysprompt-preset"></select>
+                    <div class="so-iconbtn" id="so-sysprompt-preset-recurate" title="重新挑选要保留的块"><i class="fa-solid fa-list-check"></i></div>
                     <div class="so-iconbtn" id="so-sysprompt-preset-refresh" title="刷新预设列表"><i class="fa-solid fa-rotate-right"></i></div>
                 </div>
             </label>
@@ -674,9 +749,12 @@ function bindControls() {
     bind('#so-sendtemp', 'sendTemperature');
     win.querySelector('#so-wi').addEventListener('change', updateWiHint);
     bind('#so-persona', 'personaId');
-    bind('#so-sysprompt-preset', 'sysPromptPresetName');
-    win.querySelector('#so-sysprompt-preset').addEventListener('change', applySysPromptPresetUiState);
+    win.querySelector('#so-sysprompt-preset').addEventListener('change', (e) => onPresetSelected(e.target.value));
     win.querySelector('#so-sysprompt-preset-refresh').addEventListener('click', populateSysPromptPresets);
+    win.querySelector('#so-sysprompt-preset-recurate').addEventListener('click', () => {
+        const cur = getSettings().sysPromptPresetName;
+        if (cur) openCuration(cur);
+    });
     bind('#so-sysprompt', 'systemPrompt');
 
     // send
@@ -877,45 +955,190 @@ function getPresetByName(name) {
     return null;
 }
 
-// Flatten a Chat Completion preset's enabled, ordered, non-marker prompt blocks.
-function extractPresetSystemPrompt(name) {
-    const preset = getPresetByName(name);
-    if (!preset || !Array.isArray(preset.prompts)) return null;
+// Best-effort name of the Chat Completion preset currently active in MAIN chat,
+// for the curation mismatch warning. Returns '' if it can't be determined.
+function getActiveMainPresetName() {
+    const pm = getCompletionPresetManager();
+    if (!pm) return '';
+    try { if (typeof pm.getSelectedPresetName === 'function') return pm.getSelectedPresetName() || ''; } catch (e) { /* */ }
+    try {
+        if (typeof pm.getSelectedPreset === 'function') {
+            const v = pm.getSelectedPreset();
+            if (typeof v === 'string') return v;
+            const list = pm.getPresetList?.();
+            const names = list && (list.preset_names ?? list.presetNames);
+            if (names && typeof names === 'object' && !Array.isArray(names)) {
+                for (const [n, i] of Object.entries(names)) if (i === v) return n;
+            }
+            if (Array.isArray(names) && typeof v === 'number') return names[v] || '';
+        }
+    } catch (e) { /* */ }
+    return '';
+}
 
+// Flatten a Chat Completion preset's enabled, ordered, non-marker prompt blocks.
+// SillyTavern's runtime-injection markers. Each is a positional slot that the
+// faithful assembly fills with the Oracle's own context, in the preset's order.
+const MARKER_IDS = new Set([
+    'personaDescription', 'worldInfoBefore', 'charDescription', 'charPersonality',
+    'scenario', 'worldInfoAfter', 'dialogueExamples', 'chatHistory',
+]);
+
+// Pull a preset's ordered block list. Returns [{ block, enabledInOrder }] in
+// sequence (ALL blocks, enabled and disabled — the caller marks the disabled
+// ones), or [] if unreadable.
+function readPresetOrderedBlocks(preset) {
+    if (!preset || !Array.isArray(preset.prompts)) return [];
     const byId = {};
     for (const p of preset.prompts) if (p && p.identifier) byId[p.identifier] = p;
 
-    // Order: prefer the global default order (character_id 100000), else first entry.
-    let sequence = null;
+    // The global prompt order. Real presets key it 100001 (older builds 100000);
+    // pick whichever exists, else the longest order, else the first entry.
+    let entry = null;
     if (Array.isArray(preset.prompt_order) && preset.prompt_order.length) {
-        const entry = preset.prompt_order.find((e) => e && e.character_id === 100000)
-            || preset.prompt_order[0];
-        if (entry && Array.isArray(entry.order)) {
-            sequence = entry.order
-                .filter((o) => o && o.enabled !== false)
-                .map((o) => byId[o.identifier])
-                .filter(Boolean);
-        }
+        const po = preset.prompt_order;
+        entry = po.find((e) => e && e.character_id === 100001)
+             || po.find((e) => e && e.character_id === 100000)
+             || po.slice().sort((a, b) => (b?.order?.length || 0) - (a?.order?.length || 0))[0]
+             || po[0];
     }
-    if (!sequence) sequence = preset.prompts;
-
-    const parts = [];
-    for (const p of sequence) {
-        if (!p || p.marker) continue;              // skip runtime-injection placeholders
-        const content = (p.content || '').trim();
-        if (content) parts.push(content);
+    const order = entry && Array.isArray(entry.order) ? entry.order : null;
+    if (!order) {
+        // No usable order: fall back to prompt array order (treat all as enabled).
+        return preset.prompts.filter(Boolean).map((b) => ({ block: b, enabledInOrder: true }));
     }
-    const text = parts.join('\n\n').trim();
-    return text || null;
+    const out = [];
+    for (const o of order) {
+        if (!o) continue;
+        const b = byId[o.identifier];
+        if (b) out.push({ block: b, enabledInOrder: o.enabled !== false });
+    }
+    return out;
 }
 
-// The system prompt the Oracle should actually use right now.
-function resolveSystemPrompt(s) {
-    if (ENABLE_SYSPROMPT_PRESET && s.sysPromptPresetName) {
-        const txt = extractPresetSystemPrompt(s.sysPromptPresetName);
-        if (txt) return txt;
-        // Preset missing/empty -> fall back to the textarea so we never send nothing.
+// Strip every {{...}} macro (iteratively, to peel nesting) and trim — what
+// remains is the block's visible literal text.
+function visibleResidue(content) {
+    let s = String(content || '');
+    for (let i = 0; i < 6; i++) s = s.replace(/\{\{[^{}]*\}\}/g, '');
+    return s.trim();
+}
+
+// Heuristic default keep/drop + category for one block. The user is the sole
+// curator and reviews every row, so these are only the pre-checked defaults.
+const SO_DROP_NAME = /(cot|思维链|思考模式|字数|禁词|禁用词|防打断|抢话|杀八股|杀超雄|超雄|杀比拟|杀揭示|杀说明|杀声述|白描|微观|通感|占有|支配|转折词|模型选择|特化|破限|文风|人称|视角|草稿|prism|core|油腻|谄媚|揣测|语气描写|防情绪|防复述|转述|推剧情|极端|全知|反全知|生动化|加强|复述|抗过拟合|抗绝望|抗抢话)/i;
+const SO_KEEP_NAME = /(人格|情感|基调|世界|world|角色|故事|设定|主提示|主提示词|lore|背景|场景|情景)/i;
+
+function classifyBlock(block) {
+    if (block.marker || MARKER_IDS.has(block.identifier)) {
+        return { keep: true, category: 'marker', note: '上下文插槽' };
     }
+    const content = block.content || '';
+    const role = block.role || 'system';
+    const name = block.name || '';
+    const residue = visibleResidue(content);
+    const setCount = (content.match(/\{\{(setvar|setglobalvar)::/gi) || []).length;
+    const hasSet = setCount > 0;
+    const hasGet = /\{\{(getvar|getglobalvar)::/i.test(content);
+    const hasLastMsg = /\{\{lastusermessage\}\}/i.test(content);
+    const dropName = SO_DROP_NAME.test(name);
+    const keepName = SO_KEEP_NAME.test(name);
+
+    // Block that's *primarily* an echo of the RP's last user message — wrong for
+    // the Oracle. Only when it's short/echo-dominated; a long structural block
+    // that merely contains a {{lastusermessage}} slot is handled below.
+    if (hasLastMsg && residue.length <= 60) {
+        return { keep: false, category: 'user-echo', note: '回显主聊天输入' };
+    }
+
+    // Renders to nothing after macro substitution.
+    if (!residue) {
+        // The master variable initializer (大清洗 / 初始化变量) sets many keys and
+        // is required so the kept blocks' getvars resolve. Detect by structure,
+        // not name, and keep it.
+        if (hasSet && !hasGet && setCount >= 15) {
+            return { keep: true, category: 'machinery', note: '变量初始化（隐形・必留）' };
+        }
+        // Named output/CoT toggles (also implemented as invisible setvars) — drop
+        // by default to match the user's expectation, even though harmless to keep.
+        if (dropName) return { keep: false, category: 'output', note: '输出 / 思维链 / 反模式（隐形）' };
+        if (keepName) return { keep: true, category: 'story', note: '故事 / 世界 / 人格（隐形）' };
+        if (hasSet) return { keep: true, category: 'machinery', note: '变量控制（隐形）' };
+        if (hasGet) return { keep: true, category: 'wrapper', note: '结构变量（隐形）' };
+        return { keep: false, category: 'inert', note: '注释 / 空块' };
+    }
+    // Voice prefills carried as assistant/user turns — drop regardless of any
+    // stray brackets in their text (checked before the wrapper heuristic).
+    if (role === 'assistant' || role === 'user') {
+        return { keep: false, category: 'prefill', note: `${role} 起手` };
+    }
+    // Has visible literal text but it's mostly structural tags/banners (short,
+    // bracket-heavy) -> a system wrapper around a marker; keep for faithfulness.
+    const looksStructural = residue.length <= 120 && /[<>\[\]]/.test(residue);
+    if (looksStructural && !dropName) return { keep: true, category: 'wrapper', note: '包裹标签' };
+
+    if (block.identifier === 'main') return { keep: true, category: 'story', note: '主提示' };
+    if (dropName) return { keep: false, category: 'output', note: '输出 / 思维链 / 反模式' };
+    if (keepName) return { keep: true, category: 'story', note: '故事 / 世界 / 人格' };
+    return { keep: true, category: 'review', note: '未分类 · 请确认' };
+}
+
+// Build the curation row model for a preset (live read). Markers included.
+// Every block in the preset's prompt order becomes a row so the list mirrors
+// ST's prompt manager 1:1 — including blocks that are currently DISABLED in the
+// order (shown, marked 停用, and unchecked by default) and ones whose content is
+// empty (tagged inert) so nothing silently disappears.
+function buildCurationRows(name) {
+    const preset = getPresetByName(name);
+    const ordered = readPresetOrderedBlocks(preset);
+    const rows = [];
+    for (const { block, enabledInOrder } of ordered) {
+        const isMarker = !!block.marker || MARKER_IDS.has(block.identifier);
+        const content = block.content || '';
+        const c = classifyBlock(block);
+        const disabled = enabledInOrder === false;
+        rows.push({
+            identifier: block.identifier,
+            name: (block.name || block.identifier || '').trim(),
+            role: block.role || 'system',
+            kind: isMarker ? 'marker' : 'text',
+            content,
+            chars: content.length,
+            // A block the preset author turned off defaults to unchecked; the user
+            // can still opt it in. Enabled blocks use the classifier default.
+            keep: disabled ? false : c.keep,
+            disabled,
+            category: c.category,
+            note: c.note,
+        });
+    }
+    return rows;
+}
+
+// Freeze the user's curated selection (kept rows, in their final order).
+function snapshotFromRows(rows) {
+    const items = rows.filter((r) => r.keep).map((r) => (
+        r.kind === 'marker'
+            ? { kind: 'marker', identifier: r.identifier, name: r.name }
+            : { kind: 'text', identifier: r.identifier, name: r.name, role: r.role, content: r.content }
+    ));
+    return { items, curatedAt: Date.now() };
+}
+
+function getCuratedSnapshot(s, name) {
+    const cp = s.curatedPresets;
+    return (cp && typeof cp === 'object' && cp[name]) || null;
+}
+
+// Is a curated preset the active system-prompt source right now?
+function presetCurationActive(s) {
+    if (!ENABLE_SYSPROMPT_PRESET || !s.sysPromptPresetName) return false;
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    return !!(snap && Array.isArray(snap.items) && snap.items.length);
+}
+
+// The system prompt for the NON-preset (plain textarea) path.
+function resolveSystemPrompt(s) {
     return s.systemPrompt;
 }
 
@@ -957,25 +1180,286 @@ function applySysPromptPresetUiState() {
     const s = getSettings();
     const ta = win.querySelector('#so-sysprompt');
     const hint = win.querySelector('#so-sysprompt-preset-hint');
+    const recurate = win.querySelector('#so-sysprompt-preset-recurate');
     const active = !!s.sysPromptPresetName;
+    // When a preset is selected, the textarea (and the built-in short prompt it
+    // holds) is fully disabled — no fallback, per design.
     if (ta) ta.disabled = active;
+    if (recurate) recurate.style.display = active ? '' : 'none';
     if (!hint) return;
     hint.classList.remove('so-hint-error');
     if (!active) {
         const have = getCompletionPresetNames().length;
         hint.textContent = have
-            ? '选择一个补全预设，用它的系统提示词替代下方文本框；选「自定义」则使用文本框。'
+            ? '选择一个补全预设并挑选要保留的块；故事神谕会按预设的原始结构（角色卡 / 世界书 / 上下文插槽 + 各块角色）忠实组装。选「自定义」则使用下方文本框。'
             : '未找到已保存的补全预设。请先在 ST 的“预设”里保存一个，然后点刷新。';
         return;
     }
-    const txt = extractPresetSystemPrompt(s.sysPromptPresetName);
-    if (txt) {
-        hint.textContent = `正在使用补全预设「${s.sysPromptPresetName}」的系统提示词（取其中已启用的文本块，约 ${txt.length} 字）；下方文本框已忽略。`;
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    if (snap && Array.isArray(snap.items) && snap.items.length) {
+        const texts = snap.items.filter((i) => i.kind === 'text').length;
+        const slots = snap.items.filter((i) => i.kind === 'marker').length;
+        hint.textContent = `正在按预设「${s.sysPromptPresetName}」的忠实结构组装：保留 ${texts} 个文本块 + ${slots} 个上下文插槽。下方文本框（含内置简短提示词）已停用。点[重新挑选]可修改。`;
     } else {
-        hint.textContent = `预设「${s.sysPromptPresetName}」里没有可用的文本块，已暂时回退到下方文本框。`;
+        hint.textContent = `预设「${s.sysPromptPresetName}」尚未挑选内容。点[重新挑选]开始，或重新从下拉中选择以打开挑选界面。`;
         hint.classList.add('so-hint-error');
     }
 }
+
+// Dropdown change: gate curation. Empty -> custom/textarea. Already-curated ->
+// use it. New -> open the checklist; commit only when the user saves.
+function onPresetSelected(rawName) {
+    const s = getSettings();
+    const name = rawName || '';
+    if (!name) {
+        s.sysPromptPresetName = '';
+        save();
+        applySysPromptPresetUiState();
+        updateBadge();
+        return;
+    }
+    if (getCuratedSnapshot(s, name)) {
+        s.sysPromptPresetName = name;
+        save();
+        applySysPromptPresetUiState();
+        updateBadge();
+        return;
+    }
+    // Not curated yet — open the checklist. Revert the dropdown to the committed
+    // value until the user actually saves a curation.
+    const sel = win.querySelector('#so-sysprompt-preset');
+    if (sel) sel.value = s.sysPromptPresetName || '';
+    openCuration(name);
+}
+
+/* ------------------------------------------------------------------ *
+ * Curation modal — the user is the sole curator (no LLM step).
+ * Lists the preset's enabled blocks + context-slot markers in preset order,
+ * pre-checked by a name/role/structure classifier, draggable to reorder.
+ * Saving freezes the kept rows (in their final order) into curatedPresets.
+ * ------------------------------------------------------------------ */
+let curationState = null;
+
+const CUR_TAG_LABEL = {
+    marker: '插槽', story: '故事', machinery: '变量机制', wrapper: '包裹',
+    output: '输出/COT', prefill: '起手', 'user-echo': '回显输入',
+    inert: '注释/空', review: '待确认',
+};
+
+function openCuration(name, seedRows) {
+    const rows = seedRows || buildCurationRows(name);
+    if (!rows.length) {
+        addSystemNote(`预设「${name}」没有可挑选的已启用块。请检查它在 ST 里是否配置正确。`);
+        return;
+    }
+    curationState = { name, rows, dragFrom: -1 };
+
+    let modal = win.querySelector('#so-curate');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'so-curate';
+        win.appendChild(modal);
+    }
+    modal.innerHTML = `
+        <div id="so-cur-card">
+            <div id="so-cur-head">
+                <div id="so-cur-title"><i class="fa-solid fa-list-check"></i> 挑选要保留的块</div>
+                <div class="so-iconbtn" id="so-cur-x" title="取消"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div id="so-cur-sub"></div>
+            <div id="so-cur-list"></div>
+            <div id="so-cur-foot">
+                <div id="so-cur-count"></div>
+                <div id="so-cur-foot-btns">
+                    <button class="so-cur-btn" id="so-cur-reset">重置默认</button>
+                    <button class="so-cur-btn" id="so-cur-cancel">取消</button>
+                    <button class="so-cur-btn so-cur-save" id="so-cur-save">保存并使用</button>
+                </div>
+            </div>
+        </div>`;
+    modal.querySelector('#so-cur-sub').textContent =
+        `预设「${name}」 — 列出预设里的全部块（含预设已停用的，标「预设已停用」、默认不勾选）。勾选的块会按下方顺序忠实组装；插槽（角色卡 / 世界书 / 用户人设 / 上下文）会就地填入神谕的上下文。拖动可调整顺序。`;
+
+    // One-time heads-up about the output-regex / preset-mismatch caveat.
+    maybeShowCurationWarning(modal, name);
+
+    // Critical layout applied inline so the modal is contained, opaque, and
+    // scrollable even if the stylesheet is stale/cached (the .so-cur-* theme
+    // rules still enhance it once style.css refreshes).
+    applyCurationChrome(modal);
+
+    modal.querySelector('#so-cur-x').addEventListener('click', closeCuration);
+    modal.querySelector('#so-cur-cancel').addEventListener('click', closeCuration);
+    modal.querySelector('#so-cur-reset').addEventListener('click', () => {
+        curationState.rows = buildCurationRows(name); // re-seed from classifier
+        renderCurationRows();
+    });
+    modal.querySelector('#so-cur-save').addEventListener('click', saveCuration);
+
+    modal.classList.add('open');
+    modal.style.display = 'flex';
+    renderCurationRows();
+}
+
+// Guarantee the modal's structure inline, independent of the external stylesheet.
+function applyCurationChrome(modal) {
+    const set = (sel, css) => { const el = modal.querySelector(sel); if (el) el.style.cssText += ';' + css; };
+    modal.style.cssText +=
+        ';position:absolute;inset:0;top:0;left:0;right:0;bottom:0;z-index:50;' +
+        'align-items:center;justify-content:center;padding:12px;box-sizing:border-box;' +
+        'background:rgba(8,9,12,0.84);';
+    set('#so-cur-card',
+        'position:relative;top:auto;left:auto;right:auto;bottom:auto;transform:none;' +
+        'display:flex;flex-direction:column;width:100%;max-width:560px;' +
+        'height:100%;max-height:100%;min-height:0;box-sizing:border-box;overflow:hidden;' +
+        'border-radius:12px;background:#1b1d23;border:1px solid rgba(255,255,255,0.18);' +
+        'box-shadow:0 20px 50px -12px rgba(0,0,0,0.7);');
+    set('#so-cur-head',
+        'flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;' +
+        'padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.12);');
+    set('#so-cur-sub', 'flex:0 0 auto;padding:10px 14px 4px;font-size:0.8em;opacity:0.65;line-height:1.5;');
+    set('#so-cur-list', 'flex:1 1 0;min-height:0;overflow-y:auto;padding:6px;');
+    set('#so-cur-foot',
+        'flex:0 0 auto;display:flex;align-items:center;gap:10px;' +
+        'padding:10px 14px;border-top:1px solid rgba(255,255,255,0.12);');
+    set('#so-cur-count', 'flex:1 1 auto;font-size:0.8em;opacity:0.8;');
+    set('#so-cur-foot-btns', 'display:flex;gap:6px;flex:0 0 auto;');
+}
+
+// One-time warning: the Oracle assembles from (and regex-cleans for) the preset
+// curated HERE; if that differs from the main-chat preset the enabled regex is
+// tuned to, the cleanup may not match the Oracle's output.
+function maybeShowCurationWarning(modal, name) {
+    const s = getSettings();
+    if (s.curationWarned) return;
+    const card = modal.querySelector('#so-cur-card');
+    const list = modal.querySelector('#so-cur-list');
+    if (!card || !list) return;
+
+    const mainName = getActiveMainPresetName();
+    let tail = '';
+    if (mainName && mainName === name) tail = '（当前与主聊天预设一致 ✓）';
+    else if (mainName) tail = `（主聊天当前预设：「${escapeHtml(mainName)}」，与此不同 —— 正则很可能对不上）`;
+
+    const warn = document.createElement('div');
+    warn.id = 'so-cur-warn';
+    warn.style.cssText =
+        'flex:0 0 auto;margin:8px 14px 2px;padding:9px 11px;border-radius:8px;' +
+        'font-size:0.78em;line-height:1.55;color:#f0d28a;' +
+        'background:rgba(242,201,76,0.12);border:1px solid rgba(242,201,76,0.35);';
+    warn.innerHTML =
+        '⚠️ 选用预设时，神谕会用<b>你在这里挑选的这个预设</b>来组装提示词，并用你启用的正则清理它的回复。' +
+        '这些正则是按<b>主聊天的输出格式</b>写的——如果这里挑选的预设和主聊天当前启用的预设不一样，' +
+        `正则可能匹配不上神谕的输出、清理不会生效。${tail}`;
+    card.insertBefore(warn, list);
+
+    s.curationWarned = true;
+    save();
+}
+
+function closeCuration() {
+    const modal = win.querySelector('#so-curate');
+    if (modal) { modal.classList.remove('open'); modal.style.display = 'none'; }
+    curationState = null;
+}
+
+function renderCurationRows() {
+    const list = win.querySelector('#so-cur-list');
+    if (!list || !curationState) return;
+    list.innerHTML = '';
+    curationState.rows.forEach((r, idx) => {
+        const row = document.createElement('div');
+        row.className = 'so-cur-row' + (r.keep ? '' : ' so-cur-off') + (r.kind === 'marker' ? ' so-cur-marker' : '');
+        row.draggable = true;
+        row.dataset.idx = String(idx);
+
+        const handle = `<span class="so-cur-handle" title="拖动排序"><i class="fa-solid fa-grip-vertical"></i></span>`;
+        const cb = `<input type="checkbox" class="so-cur-cb" ${r.keep ? 'checked' : ''}>`;
+        const roleBadge = (r.role && r.role !== 'system')
+            ? `<span class="so-cur-role">${r.role}</span>` : '';
+        const disabledBadge = r.disabled
+            ? `<span class="so-cur-disabled" style="flex:0 0 auto;font-size:0.74em;padding:1px 6px;border-radius:6px;background:rgba(224,124,124,0.22);color:#e89a9a;white-space:nowrap;">预设已停用</span>`
+            : '';
+        const tag = `<span class="so-cur-tag so-cur-tag-${r.category}">${CUR_TAG_LABEL[r.category] || r.category}</span>`;
+        const chars = r.kind === 'marker' ? '插槽' : `${r.chars} 字`;
+        row.innerHTML =
+            `${handle}${cb}<span class="so-cur-name" title="${escapeAttr(r.name)}">${escapeHtml(r.name)}</span>` +
+            `${disabledBadge}${roleBadge}${tag}<span class="so-cur-chars">${chars}</span>`;
+
+        // Inline layout so rows stay readable even if the stylesheet is stale.
+        row.style.cssText +=
+            ';display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;' +
+            'border:1px solid transparent;' + (r.keep ? '' : 'opacity:0.5;');
+        const nameEl = row.querySelector('.so-cur-name');
+        if (nameEl) nameEl.style.cssText += ';flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        const charsEl = row.querySelector('.so-cur-chars');
+        if (charsEl) charsEl.style.cssText += ';flex:0 0 auto;font-size:0.78em;opacity:0.5;';
+        const cbEl0 = row.querySelector('.so-cur-cb');
+        if (cbEl0) cbEl0.style.cssText += ';flex:0 0 auto;width:15px;height:15px;cursor:pointer;';
+        row.querySelector('.so-cur-cb').addEventListener('change', (e) => {
+            curationState.rows[idx].keep = e.target.checked;
+            row.classList.toggle('so-cur-off', !e.target.checked);
+            row.style.opacity = e.target.checked ? '' : '0.5';
+            updateCurationCount();
+        });
+        row.addEventListener('dragstart', () => { curationState.dragFrom = idx; row.classList.add('so-cur-drag'); });
+        row.addEventListener('dragend', () => { row.classList.remove('so-cur-drag'); });
+        row.addEventListener('dragover', (e) => { e.preventDefault(); row.classList.add('so-cur-over'); });
+        row.addEventListener('dragleave', () => row.classList.remove('so-cur-over'));
+        row.addEventListener('drop', (e) => {
+            e.preventDefault();
+            row.classList.remove('so-cur-over');
+            const from = curationState.dragFrom;
+            const to = idx;
+            if (from < 0 || from === to) return;
+            const arr = curationState.rows;
+            const [moved] = arr.splice(from, 1);
+            arr.splice(to, 0, moved);
+            curationState.dragFrom = -1;
+            renderCurationRows();
+        });
+
+        list.appendChild(row);
+    });
+    updateCurationCount();
+}
+
+function updateCurationCount() {
+    const el = win.querySelector('#so-cur-count');
+    if (!el || !curationState) return;
+    const kept = curationState.rows.filter((r) => r.keep);
+    const texts = kept.filter((r) => r.kind === 'text');
+    const slots = kept.filter((r) => r.kind === 'marker');
+    const chars = texts.reduce((n, r) => n + (r.chars || 0), 0);
+    el.innerHTML = `保留 <b>${texts.length}</b> 块 + <b>${slots.length}</b> 插槽 · 约 <b>${chars.toLocaleString()}</b> 字`;
+}
+
+function saveCuration() {
+    if (!curationState) return;
+    const { name, rows } = curationState;
+    const snap = snapshotFromRows(rows);
+    if (!snap.items.length) {
+        addSystemNote('至少要保留一个块。请勾选后再保存。');
+        return;
+    }
+    const s = getSettings();
+    if (!s.curatedPresets || typeof s.curatedPresets !== 'object') s.curatedPresets = {};
+    s.curatedPresets[name] = snap;
+    s.sysPromptPresetName = name;
+    save();
+    closeCuration();
+    const sel = win.querySelector('#so-sysprompt-preset');
+    if (sel) sel.value = name;
+    applySysPromptPresetUiState();
+    updateBadge();
+}
+
+function escapeHtml(str) {
+    return String(str || '').replace(/[&<>"]/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+    ));
+}
+function escapeAttr(str) { return escapeHtml(str); }
 
 /* ------------------------------------------------------------------ *
  * Show / hide
@@ -1100,11 +1584,11 @@ function buildCardSection(ctx) {
     return cardLines.length ? '=== 角色 / 设定 ===\n' + cardLines.join('\n\n') : '';
 }
 
-function buildTranscript(ctx, s) {
-    if (s.contextDepth === 0) return '';
-    // Mirror ST's prompt builder: filter system messages, then run each through
-    // the regex engine with isPrompt:true and a depth relative to the FULL chat
-    // (so depth-gated scripts like summary substitution fire as they would in chat).
+// Story-context turns as role-tagged objects {role:'user'|'assistant', name, text}.
+// Mirrors ST's prompt builder: drop system messages, run each through the regex
+// engine (isPrompt, depth relative to full chat), trim empties, take last N.
+function buildTranscriptTurns(ctx, s) {
+    if (s.contextDepth === 0) return [];
     const coreChat = (ctx.chat || []).filter((m) => m && !m.is_system && typeof m.mes === 'string');
     const useRegex = s.applyRegex && regexEngine && regexEngine.getRegexedString;
 
@@ -1121,16 +1605,157 @@ function buildTranscript(ctx, s) {
                 console.warn('[Story Oracle] regex failed on a message; using raw.', e);
             }
         }
-        return { name: m.name || (m.is_user ? ctx.name1 : ctx.name2), text };
+        return {
+            role: m.is_user ? 'user' : 'assistant',
+            name: m.name || (m.is_user ? ctx.name1 : ctx.name2),
+            text,
+        };
     });
 
     processed = processed.filter((l) => l.text && l.text.trim() !== '');
     if (s.contextDepth > 0) processed = processed.slice(-s.contextDepth);
-    return processed.map((l) => `${l.name}: ${l.text}`).join('\n\n');
+    return processed;
+}
+
+function buildTranscript(ctx, s) {
+    return buildTranscriptTurns(ctx, s).map((l) => `${l.name}: ${l.text}`).join('\n\n');
+}
+
+// Run a finished Oracle reply through the enabled AI_OUTPUT regex.
+//   forPrompt=true  -> prompt stage (what ST feeds back into context); used for
+//                      the copy stored in history, so the Oracle doesn't
+//                      re-ingest its own think tags / status bars next turn.
+//   forPrompt=false -> display stage (markdown); rarely needed directly because
+//                      renderReplyHtml() applies it via ST's own formatter.
+function applyOutputRegex(text, forPrompt) {
+    if (!regexEngine || !regexEngine.getRegexedString || !regexEngine.regex_placement) return text;
+    try {
+        const opts = forPrompt
+            ? { isPrompt: true, isMarkdown: false, depth: 0 }
+            : { isPrompt: false, isMarkdown: true, depth: 0 };
+        const out = regexEngine.getRegexedString(String(text || ''), regexEngine.regex_placement.AI_OUTPUT, opts);
+        return (typeof out === 'string') ? out : text;
+    } catch (e) {
+        console.warn('[Story Oracle] output regex failed; using raw reply.', e);
+        return text;
+    }
+}
+
+// Render a reply to sanitized HTML using ST's OWN message formatter — the same
+// path main chat uses — so display-stage regex, markdown, and HTML/CSS widgets
+// (e.g. a status-bar beautifier) render identically here. Returns null if the
+// formatter isn't available, signaling the caller to fall back to plain text.
+function renderReplyHtml(text) {
+    const ctx = getCtx();
+    try {
+        if (typeof ctx.messageFormatting === 'function') {
+            const html = ctx.messageFormatting(String(text || ''), ctx.name2 || '故事神谕', false, false, null);
+            if (typeof html === 'string' && html) return html;
+        }
+    } catch (e) {
+        console.warn('[Story Oracle] messageFormatting failed; showing raw text.', e);
+    }
+    return null;
 }
 
 function buildMessages() {
+    const s = getSettings();
+    if (!diagnoseMode && presetCurationActive(s)) {
+        return buildPresetMessages(s);
+    }
     return [{ role: 'system', content: buildSystemPrompt() }, ...convo];
+}
+
+/* ------------------------------------------------------------------ *
+ * Faithful, marker-aware, role-preserving assembly from a curated preset.
+ *
+ * Walks the frozen snapshot in order. Text blocks become messages with their
+ * own role; marker blocks expand IN PLACE with the Oracle's own context. The
+ * chatHistory slot expands to story-context turns followed by the Oracle's own
+ * Q&A turns (per the user's choice). Each text block runs through
+ * substituteParams, so getvar/setvar resolve live (setvar self-heals on the
+ * next main-chat turn). The built-in short prompt / textarea is never used here.
+ * ------------------------------------------------------------------ */
+function subst(ctx, text) {
+    try { return ctx.substituteParams(String(text || '')); } catch (e) { return String(text || ''); }
+}
+
+// Push a message, coalescing into the previous one if roles match — keeps the
+// array clean without changing meaning.
+function pushMsg(out, role, content) {
+    const c = (content == null) ? '' : String(content);
+    if (!c.trim()) return;
+    out.push({ role: role || 'system', content: c });
+}
+
+function expandMarker(out, identifier, ctx, s) {
+    let card = {};
+    try { card = ctx.getCharacterCardFields() || {}; } catch (e) { /* group / none */ }
+    switch (identifier) {
+        case 'personaDescription':
+            pushMsg(out, 'system', subst(ctx, card.persona || (ctx.name1 ? `用户 / Persona：${ctx.name1}` : '')));
+            break;
+        case 'charDescription':
+            pushMsg(out, 'system', subst(ctx, card.description || ''));
+            break;
+        case 'charPersonality':
+            pushMsg(out, 'system', subst(ctx, card.personality || ''));
+            break;
+        case 'scenario':
+            pushMsg(out, 'system', subst(ctx, card.scenario || ''));
+            break;
+        case 'worldInfoBefore':
+            pushMsg(out, 'system', subst(ctx, wiBefore));
+            break;
+        case 'worldInfoAfter':
+            pushMsg(out, 'system', subst(ctx, wiAfter));
+            break;
+        case 'dialogueExamples':
+            pushMsg(out, 'system', subst(ctx, card.mesExamples || ''));
+            break;
+        case 'chatHistory': {
+            // Story context first, then the Oracle's own Q&A — as real turns.
+            for (const t of buildTranscriptTurns(ctx, s)) {
+                pushMsg(out, t.role, t.text);
+            }
+            for (const m of convo) pushMsg(out, m.role, m.content);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+function buildPresetMessages(s) {
+    const ctx = getCtx();
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    const items = (snap && snap.items) || [];
+    const out = [];
+
+    // Optional voice-persona layer, off by default in preset mode. When chosen,
+    // it leads as a top-level voice directive; the preset still governs content.
+    const personaBlock = buildPersonaBlock(s.personaId);
+    if (personaBlock) pushMsg(out, 'system', subst(ctx, personaBlock));
+
+    let sawHistory = false;
+    for (const it of items) {
+        if (it.kind === 'marker') {
+            if (it.identifier === 'chatHistory') sawHistory = true;
+            expandMarker(out, it.identifier, ctx, s);
+        } else {
+            pushMsg(out, it.role || 'system', subst(ctx, it.content));
+        }
+    }
+
+    // If the curation dropped the chatHistory slot, the Oracle still needs the
+    // story + the question — append them so it never sends a question with no
+    // context and no final user turn.
+    if (!sawHistory) {
+        for (const t of buildTranscriptTurns(ctx, s)) pushMsg(out, t.role, t.text);
+        for (const m of convo) pushMsg(out, m.role, m.content);
+    }
+
+    return out.length ? out : [{ role: 'system', content: subst(ctx, '（预设无可用内容）') }, ...convo];
 }
 
 /* ------------------------------------------------------------------ *
@@ -1173,6 +1798,12 @@ async function onSend() {
         const stat = await getMvuStatData();
         diagStatData = stat ? JSON.stringify(stat, null, 2) : '';
         diagLatestUpdate = extractUpdateBlock(getLatestAiMessageText());
+    } else if (presetCurationActive(s)) {
+        // Faithful assembly needs WI split into the Before/After-Char-Defs slots.
+        const split = await buildWorldInfoSplit();
+        wiBefore = split.before;
+        wiAfter = split.after;
+        worldInfoBlock = ''; // legacy single-block path unused while preset is active
     } else {
         worldInfoBlock = await buildWorldInfo(); // empty string when mode is 'off'
     }
@@ -1237,7 +1868,27 @@ async function onSend() {
             contentEl.textContent = '(空回复)';
             contentEl.classList.add('so-error');
         } else {
-            convo.push({ role: 'assistant', content: finalText });
+            // When a curated preset drives the output AND regex is on, mirror main
+            // chat: RENDER the reply through ST's own formatter (so display-stage
+            // regex, markdown, and HTML/CSS widgets actually render instead of
+            // showing as raw text), and STORE the prompt-stage regex'd copy in
+            // history (clean text for re-feeding — no widget markup looping back).
+            // Never for the plain textarea prompt, never in Diagnose mode (which
+            // needs the raw <UpdateVariable> block intact).
+            const useOutputRegex = !diagnoseMode && presetCurationActive(s) && s.applyRegex;
+            let historyText = finalText;
+            if (useOutputRegex) {
+                historyText = applyOutputRegex(finalText, /*forPrompt*/ true);
+                const html = renderReplyHtml(finalText);
+                if (html != null) {
+                    contentEl.innerHTML = html;
+                    contentEl.classList.add('so-rendered');
+                    contentEl.style.whiteSpace = 'normal';
+                } else {
+                    contentEl.textContent = finalText;
+                }
+            }
+            convo.push({ role: 'assistant', content: historyText });
             if (diagnoseMode) {
                 const block = extractUpdateBlock(finalText);
                 if (block) addApplyControls(assistantEl, block);
