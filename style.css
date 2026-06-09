@@ -17,7 +17,6 @@
     min-height: 340px;
     max-width: 96vw;
     max-height: 90vh;
-    resize: both;
     overflow: hidden;
     color: var(--SmartThemeBodyColor, #e6e6e6);
     font-size: calc(var(--mainFontSize, 15px) * 0.95);
@@ -244,8 +243,12 @@
     letter-spacing: 0.08em;
     opacity: 0.4;
     padding: 0 2px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
-.so-user .so-role { text-align: right; }
+.so-user .so-role { justify-content: flex-end; opacity: 1; }
+.so-user .so-role-label { opacity: 0.4; }
 
 .so-content {
     white-space: pre-wrap;
@@ -302,26 +305,50 @@
 }
 .so-assistant .so-role-label { opacity: 0.4; }
 
-.so-copy-btn {
+.so-actions { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; }
+
+.so-msg-btn {
     appearance: none;
     -webkit-appearance: none;
     border: none;
     background: transparent;
     color: inherit;
     cursor: pointer;
-    opacity: 0.5;
+    opacity: 0.4;
     font-size: 12px;            /* fixed: independent of the tiny .so-role em */
     line-height: 1;
-    padding: 6px 8px;           /* generous tap target for mobile */
-    margin: -6px -6px -6px 0;
+    padding: 6px 7px;           /* generous tap target for mobile */
     border-radius: 7px;
     text-transform: none;
     flex: 0 0 auto;
     transition: opacity 0.15s, background-color 0.15s, transform 0.1s, color 0.15s;
 }
-.so-copy-btn:hover { opacity: 1; background-color: rgba(255, 255, 255, 0.09); }
-.so-copy-btn:active { transform: scale(0.9); }
-.so-copy-btn.so-copied { color: var(--so-accent); opacity: 1; }
+.so-msg:hover .so-msg-btn { opacity: 0.62; }
+.so-msg-btn:hover { opacity: 1 !important; background-color: rgba(255, 255, 255, 0.09); }
+.so-msg-btn:active { transform: scale(0.9); }
+.so-del-btn:hover { color: var(--crimson70a, #e07c7c); }
+.so-copy-btn.so-copied { color: var(--so-accent); opacity: 1 !important; }
+
+/* inline edit-in-place box on a user message */
+.so-edit-box { display: flex; flex-direction: column; gap: 6px; }
+.so-edit-ta {
+    width: 100%; box-sizing: border-box; resize: vertical;
+    font: inherit; line-height: 1.5; color: inherit;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.25));
+    border: 1px solid color-mix(in srgb, var(--so-accent) 40%, transparent);
+    border-radius: 10px; padding: 8px 10px;
+}
+.so-edit-ta:focus { outline: none; border-color: var(--so-accent); }
+.so-edit-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.so-edit-save, .so-edit-cancel {
+    appearance: none; -webkit-appearance: none; cursor: pointer;
+    font-size: 0.82em; padding: 5px 11px; border-radius: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+    background: transparent; color: inherit; transition: background-color 0.15s, opacity 0.15s;
+}
+.so-edit-save { border-color: color-mix(in srgb, var(--so-accent) 55%, transparent); background: color-mix(in srgb, var(--so-accent) 18%, transparent); }
+.so-edit-save:hover { background: color-mix(in srgb, var(--so-accent) 30%, transparent); }
+.so-edit-cancel:hover { background: rgba(255, 255, 255, 0.08); }
 
 /* typing dots */
 .so-typing { display: inline-flex; gap: 4px; align-items: center; padding: 2px 0; }
@@ -438,28 +465,31 @@
     scrollbar-color: var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18)) transparent;
 }
 
-/* native resize handle hint */
-#so-window::after {
-    content: '';
+/* draggable resize grip (bottom-right) — works with mouse and touch */
+#so-resize-grip {
     position: absolute;
-    right: 3px;
-    bottom: 3px;
-    width: 10px;
-    height: 10px;
-    pointer-events: none;
-    opacity: 0.35;
+    right: 0;
+    bottom: 0;
+    width: 22px;
+    height: 22px;
+    z-index: 6;
+    cursor: nwse-resize;
+    touch-action: none;
+    border-bottom-right-radius: var(--so-radius);
+    opacity: 0.4;
+    transition: opacity 0.15s;
     background:
-        linear-gradient(135deg, transparent 50%, var(--SmartThemeBodyColor, #ccc) 50%, var(--SmartThemeBodyColor, #ccc) 60%, transparent 60%),
-        linear-gradient(135deg, transparent 75%, var(--SmartThemeBodyColor, #ccc) 75%, var(--SmartThemeBodyColor, #ccc) 85%, transparent 85%);
+        linear-gradient(135deg, transparent 50%, var(--SmartThemeBodyColor, #ccc) 50%, var(--SmartThemeBodyColor, #ccc) 58%, transparent 58%),
+        linear-gradient(135deg, transparent 68%, var(--SmartThemeBodyColor, #ccc) 68%, var(--SmartThemeBodyColor, #ccc) 76%, transparent 76%),
+        linear-gradient(135deg, transparent 86%, var(--SmartThemeBodyColor, #ccc) 86%, var(--SmartThemeBodyColor, #ccc) 94%, transparent 94%);
 }
+#so-resize-grip:hover { opacity: 0.8; }
 
 @media (max-width: 600px) {
-    #so-window {
-        right: 2vw;
-        left: 2vw !important;
-        width: 96vw !important;
-        max-height: 80vh;
-    }
+    #so-window { max-height: 85vh; }
+    /* bigger grab target on touch screens */
+    #so-resize-grip { width: 32px; height: 32px; opacity: 0.6; }
+    #so-header { touch-action: none; }
 }
 
 /* ---------- diagnose mode ---------- */
@@ -491,6 +521,135 @@
         color-mix(in srgb, var(--so-accent) 22%, transparent),
         transparent);
 }
+
+/* ---------- lorebook mode ---------- */
+/* A warm "parchment" tint distinguishes lorebook mode from diagnose at a glance,
+ * while still blending with the theme accent. */
+#so-window { --so-lb-accent: color-mix(in srgb, var(--so-accent) 45%, #d8a657 55%); }
+
+#so-lorebook-btn.so-lb-active {
+    color: var(--so-lb-accent);
+    background-color: color-mix(in srgb, var(--so-lb-accent) 16%, transparent);
+    opacity: 1;
+}
+
+#so-lb-pill {
+    display: none;
+    margin-left: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 0.6em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    vertical-align: middle;
+    color: #fff;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-lb-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-lb-accent) 78%, black 6%));
+}
+#so-window.so-lb-on #so-lb-pill { display: inline-block; }
+
+#so-window.so-lb-on #so-header {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--so-lb-accent) 22%, transparent),
+        transparent);
+}
+
+#so-lb-bar {
+    display: none;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    background: color-mix(in srgb, var(--so-lb-accent) 7%, transparent);
+}
+#so-window.so-lb-on #so-lb-bar { display: flex; }
+
+.so-lb-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.so-lb-icon { color: var(--so-lb-accent); opacity: 0.85; flex: 0 0 auto; }
+#so-lb-book {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 6px 8px;
+    border-radius: 8px;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    font-family: inherit;
+    font-size: 0.9em;
+}
+#so-lb-book:focus { outline: none; border-color: var(--so-lb-accent); }
+.so-lb-check {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    cursor: pointer;
+    font-size: 0.82em;
+    opacity: 0.8;
+}
+.so-lb-check:hover { opacity: 1; }
+.so-lb-check input { accent-color: var(--so-lb-accent); }
+
+/* per-entry picker (lorebook) — only shown for a single targeted book */
+.so-lb-entries { display: none; flex-direction: column; gap: 6px; }
+.so-lb-entries.shown { display: flex; }
+.so-lb-entries-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#so-lb-entries-summary { font-size: 0.8em; opacity: 0.75; }
+.so-lb-entries-tools { display: none; flex-wrap: wrap; align-items: center; gap: 4px; }
+.so-lb-mini {
+    appearance: none; -webkit-appearance: none; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.74em; padding: 3px 8px; border-radius: 7px; color: inherit;
+    border: 1px solid color-mix(in srgb, var(--so-lb-accent) 40%, transparent);
+    background: color-mix(in srgb, var(--so-lb-accent) 10%, transparent);
+    transition: background-color 0.15s;
+}
+.so-lb-mini:hover { background: color-mix(in srgb, var(--so-lb-accent) 22%, transparent); }
+.so-lb-mini-blue::before, .so-lb-mini-green::before, .so-lb-mini-off::before {
+    content: ''; width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+}
+.so-lb-mini-blue::before { background: #5aa9e6; }
+.so-lb-mini-green::before { background: #7bbf6a; }
+.so-lb-mini-off::before { background: #777; opacity: 0.6; }
+.so-lb-ent-toggle .fa-chevron-down { transition: transform 0.15s; }
+.so-lb-entries.open .so-lb-ent-toggle .fa-chevron-down { transform: rotate(180deg); }
+.so-lb-entries-filter {
+    display: none; width: 100%; box-sizing: border-box;
+    font: inherit; font-size: 0.82em; color: inherit;
+    padding: 5px 9px; border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+}
+.so-lb-entries-filter:focus { outline: none; border-color: var(--so-lb-accent); }
+.so-lb-entries-list { display: none; flex-direction: column; max-height: 168px; overflow-y: auto; gap: 1px; }
+.so-lb-entries.open .so-lb-entries-tools { display: flex; }
+.so-lb-entries.open .so-lb-entries-filter,
+.so-lb-entries.open .so-lb-entries-list { display: flex; }
+.so-lb-ent {
+    display: flex; align-items: center; gap: 7px; cursor: pointer;
+    font-size: 0.82em; padding: 3px 4px; border-radius: 6px;
+}
+.so-lb-ent:hover { background: rgba(255, 255, 255, 0.05); }
+.so-lb-ent input { accent-color: var(--so-lb-accent); flex: 0 0 auto; }
+.so-lb-ent-type { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: #888; }
+.so-lb-type-blue { background: #5aa9e6; }
+.so-lb-type-green { background: #7bbf6a; }
+.so-lb-type-off { background: #777; opacity: 0.5; }
+.so-lb-ent-uid { opacity: 0.5; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.so-lb-ent-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.so-lb-ent-empty { font-size: 0.8em; opacity: 0.55; padding: 4px 2px; }
+
+/* per-op apply results + parse-error notice (lorebook) */
+.so-lb-results { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+.so-lb-result { font-size: 0.8em; line-height: 1.4; }
+.so-lb-result.so-lb-ok { color: var(--so-lb-accent); opacity: 0.95; }
+.so-lb-result.so-lb-skip { color: var(--crimson70a, #e07c7c); opacity: 0.9; }
+.so-lb-parse-errors { font-size: 0.8em; line-height: 1.4; margin-top: 6px; }
 
 .so-apply-bar {
     display: flex;

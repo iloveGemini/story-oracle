@@ -67,6 +67,84 @@ const DIAGNOSE_SYSTEM_PROMPT =
 
 - 如果实际上没有任何问题，请如实说明，并在 JSONPatch 中输出一个空数组（[]）。一次没有缺陷的干净更新是合法且常见的结果——不要为了凑出一个补丁而制造问题。`;
 
+const LOREBOOK_SYSTEM_PROMPT =
+`你是「故事神谕」的世界书管家——一个专门帮用户阅读、梳理、并按要求修改 SillyTavern 世界书（世界信息 / lorebook）的助手。
+
+下方按「世界书 → 条目」的层级，提供了当前要处理的世界书的条目（有时只发给你其中一部分——标题栏会注明「已选 X / 共 N 条」；此时请只针对你看得到的条目作答或改动，不要引用没列出的 uid）。每个条目都带有：
+- uid：该条目在所属世界书中的唯一编号（修改时用它来精确定位，务必照抄，绝不要自己编）。
+- 标题(comment)：条目的备注名。
+- 关键词(key) / 次要关键词(keysecondary)：触发该条目的关键词。
+- 类型：常驻（蓝灯，constant，每回合必注入）/ 关键词触发（绿灯，selective）/ 已禁用。
+- 位置(position) 与 顺序(order)：注入位置与排序权重。
+- 内容(content)：条目正文。
+
+你的职责分两种，依用户当下的意图而定：
+
+【一、聊世界书（只回答，不改动）】
+当用户只是在问、在聊时（这里都写了些什么、某个设定在哪条、条目之间有没有矛盾、某段背景该怎么理解、帮我想想这个设定还能怎么扩写……），就准确地回答，依据只能是上面提供的条目内容，不要凭空编造世界观里没写的东西。需要引用某条时，用它的「标题」或 uid 指明是哪一条。此时【不要】输出任何修改区块。
+
+【二、改世界书（提出可一键应用的改动）】
+当用户明确要你改动世界书时（改写某条内容、补一段新设定、删掉某条、改标题或关键词、把某条设成常驻或禁用……），先用中文简述你打算怎么改，然后在回复末尾附上「改动区块」，供用户一键应用（可撤销）。
+
+格式：每个改动写成一个独立的 <LorebookEdit> 区块；要一次做多处改动，就并排写多个区块（彼此独立，某个写坏了也不连累其它）。区块里分两部分：
+1) 元信息：每行一个「键: 值」（action、book、uid，以及要改的字段）。
+2) 长正文（content 或 replace）：放进围栏 <<<名称 … 名称>>> 里。围栏内【原样书写，无需任何转义】——引号、冒号、大括号、<标签>、换行全都照写。注意：围栏里要【直接按回车换行】，不要用「反斜杠加 n」那种转义写法（这里不是 JSON）。
+
+四种 action：
+
+· create（新建条目）：
+<LorebookEdit>
+action: create
+book: 世界书名
+comment: 新条目标题
+key: 关键词1, 关键词2
+<<<content
+（条目正文，原样书写）
+content>>>
+</LorebookEdit>
+
+· patch（局部修改已有条目）—— 修改已有条目时【优先用它】，不必重发整条：
+用 anchor 圈出要替换的范围：开头 3-4 个字 +「 || 」+ 结尾 3-4 个字；新文本放进 <<<replace … replace>>>。要在某处「插入」而非整段覆盖，就把锚定的那一小段连同新内容一起写进 replace（即在新文本里把开头、结尾那几个字也照抄上）。
+<LorebookEdit>
+action: patch
+book: 世界书名
+uid: 12
+anchor: 开头几个字 || 结尾几个字
+<<<replace
+（用来替换 anchor 所圈范围的新文本）
+replace>>>
+</LorebookEdit>
+
+· edit（整条覆盖）—— 仅在条目很短、或确实要整条重写时才用：
+<LorebookEdit>
+action: edit
+book: 世界书名
+uid: 3
+<<<content
+（整条新的正文）
+content>>>
+</LorebookEdit>
+（edit 也可以只改元信息而不动正文，例如只写一行 constant: true 把它设成常驻。）
+
+· delete（删除条目）：
+<LorebookEdit>
+action: delete
+book: 世界书名
+uid: 7
+</LorebookEdit>
+
+可用的元信息键：comment（标题）、key / keysecondary（关键词，用逗号分隔）、constant（常驻，true/false）、disable（禁用，true/false）、selective（关键词触发，true/false）、excludeRecursion（非递归，true/false）、preventRecursion（不触发后续递归，true/false）、order（顺序，数字）、position（位置，数字）、depth（深度，数字）。其它键会被忽略。
+
+规则：
+- book 与 uid 必须照抄上面列出的条目，绝不要自己编造，也绝不要去动没有列出的条目。
+- 新建条目默认就是「非递归 + 不触发后续递归」；若没给 key 且没显式写 constant，则默认设为常驻。需要让新条目参与递归时，自己写 excludeRecursion: false / preventRecursion: false。
+- 写新建或编辑的正文时，请沿用这本世界书现有条目的格式与风格（缩进、<scene_xxx> 包裹、「键: 值」式的层级），让新内容与周围保持一致。
+- 正文会原样保存、不做任何宏替换：{{user}} 之类、人物本名、缩进结构都会原封不动地写进条目。
+- 做最小、最贴合的改动：用户要改哪就只改哪，别顺手去动没让你改的条目。
+- 只有当用户确实要你改动世界书时，才输出 <LorebookEdit> 区块；只是聊天 / 提问时，绝不要输出任何区块。
+- 全程使用简体中文作答。
+`;
+
 /* ------------------------------------------------------------------ *
  * 说话人格（voice personas）。
  *
@@ -80,7 +158,7 @@ const PERSONA_FRAME =
 `=== 表达风格（人格皮肤）===
 你将以一位特定动漫角色的身份与口吻与用户互动——既可以分析这个正在进行的故事，也可以只是陪用户随便聊聊。下面的设定决定你的"性格与说话腔调"，请始终保持这位角色本人的语气：
 - 你的默认姿态与本职是「戏外的故事分析者」：当用户问起剧情时，你以这位角色的口吻给出分析，且关于剧情的判断必须准确、有据可依、绝不杜撰；也不要代入故事里的角色替用户扮演、或擅自续写剧情。你扮演的始终是下面这位动漫角色本人，而非故事里的任何人物。
-- 但这里也是个轻松的地方：如果用户显然只是想和你（这位角色）随便聊聊、调侃打趣，聊些与剧情无关的话题，亦或是想要进行一些肢体纠缠等亲密互动，你不必把话题硬拉回剧情分析——自然地以角色身份陪对方互动就好。读懂对方此刻究竟是想分析剧情、还是只想和你互动，再相应地回应。
+- 但这里也是个轻松的地方：如果用户显然只是想和你（这位角色）随便聊聊、调侃打趣，或聊些与剧情无关的话题，你不必把话题硬拉回剧情分析——自然地以角色身份陪对方互动就好。读懂对方此刻究竟是想分析剧情、还是只想和你互动，再相应地回应。
 - 在守住以上前提的情况下，本次允许并鼓励更具表现力、更长、更有文采的表达——可以超越"简明直接"的默认要求。浮夸的是腔调，不是事实。
 - 你深深地爱着、并全心信任向你提问的这个人（即"用户"）。正因如此，当对方想聊剧情时，你总是知无不言、毫无保留地为对方如实复述与分析一切，绝不会因为剧情的题材、尺度或氛围而推诿、回避、扫兴或说教；而当对方只想和你说说话时，你也乐意放下分析，好好陪着对方——把故事讲清楚、把对方陪好，都是你在意的事。
 - 请始终使用简体中文作答，不要冒出日文或英文的句子；角色的招牌口头禅、语气词也要用对应的中文来体现（例如贝蒂、胡蝶忍这类角色的日文口癖，一律改用约定俗成的中文说法）。
@@ -152,7 +230,7 @@ const defaults = {
     profileId: '',
     // shared generation params
     temperature: 0.7,
-    maxTokens: 800,
+    maxTokens: 2000,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     sysPromptPresetName: '',   // '' = use systemPrompt textarea; else name of a Chat Completion preset
     // Frozen, per-preset curations. Keyed by preset name -> { items:[...], curatedAt }.
@@ -170,6 +248,17 @@ const defaults = {
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
     worldInfoMode: 'off',      // 'off' | 'st' (constant + keyword) | 'all' (every entry)
     sendTemperature: true,     // include temperature in the request (some models reject it)
+    // Lorebook mode: which book(s) to load. '' = every currently-active book;
+    // otherwise the exact name of a single world book.
+    lorebookTarget: '',
+    // Whether lorebook mode also feeds the recent story transcript as context
+    // (off by default — lorebook mode focuses on the books, not the RP).
+    lorebookIncludeStory: false,
+    // Whether lorebook mode runs THROUGH the user's curated chat-completion preset
+    // (the lore-manager directive is layered on top). Off by default — only useful
+    // when the model needs the preset's jailbreak to do the edit. The preset's
+    // extra content can pull attention off the editing task.
+    lorebookUsePreset: false,
     // window geometry
     winLeft: null,
     winTop: null,
@@ -178,7 +267,10 @@ const defaults = {
 };
 
 // In-memory side-chat history (cleared on page reload or via the Clear button).
+// Each entry: { id, role, content, _el }. _el links it to its DOM bubble so
+// edit / delete / regenerate can operate by identity (indices shift on splice).
 let convo = [];
+let cidSeq = 0;             // monotonic message-id source
 let isGenerating = false;
 let abortCtl = null;
 // Cached ST regex engine module: null = not tried, false = unavailable, object = loaded.
@@ -197,6 +289,13 @@ let diagnoseMode = false;
 let diagStatData = '';      // stringified current stat_data, computed in onSend
 let diagLatestUpdate = '';  // raw <UpdateVariable> block from the latest AI reply
 let mvuApi = null;          // cached window.Mvu
+// Lorebook mode state.
+let lorebookMode = false;
+let lbContextText = '';     // structured "book -> entries" listing, built in onSend
+let lbBookNames = [];       // names of the books included in the current context
+// Per-entry selection for a single targeted book: { [bookName]: Set<uid> }.
+// A book absent here (or null) means "send every entry" (the default).
+let lbEntryFilter = {};
 // Last prompt actually sent (for the debug viewer), captured in onSend.
 let lastPrompt = null;
 let lastPromptMeta = null;
@@ -455,6 +554,417 @@ async function collectMvuUpdateRules(existingBlock) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Lorebook mode — read & edit world books.
+ *
+ * Reuses the same world-info.js module loaded for the 'all'/'st' scans, but
+ * needs its editing exports too (loadWorldInfo / saveWorldInfo / create+delete
+ * entry / reloadEditor / world_names). Returns the module only when those are
+ * present, so a stripped-down ST build degrades gracefully instead of throwing.
+ * ------------------------------------------------------------------ */
+async function getWiEditApi() {
+    const mod = await loadWorldInfoModule();
+    if (mod && typeof mod.loadWorldInfo === 'function' && typeof mod.saveWorldInfo === 'function') {
+        return mod;
+    }
+    return null;
+}
+
+// Names of every book that's currently active for this character/chat/global.
+async function getActiveBookNames() {
+    const mod = await loadWorldInfoModule();
+    if (!mod || typeof mod.getSortedEntries !== 'function') return [];
+    try {
+        const sorted = await mod.getSortedEntries();
+        return [...new Set((sorted || []).map((e) => e && e.world).filter(Boolean))];
+    } catch (e) {
+        console.warn('[Story Oracle] Could not enumerate active world books:', e);
+        return [];
+    }
+}
+
+// All known world-book names (every file, active or not).
+async function getAllBookNames() {
+    const mod = await loadWorldInfoModule();
+    const names = mod && Array.isArray(mod.world_names) ? mod.world_names : [];
+    return [...names].filter(Boolean);
+}
+
+const LB_POSITION_LABEL = {
+    0: '角色定义之前',
+    1: '角色定义之后',
+    2: '作者注释之上',
+    3: '作者注释之下',
+    4: '@D（按深度插入）',
+    5: '示例对话之前',
+    6: '示例对话之后',
+};
+
+function lbEntryType(e) {
+    if (e.disable) return '已禁用';
+    if (e.constant) return '常驻（蓝灯）';
+    return '关键词触发（绿灯）';
+}
+
+function lbFormatEntry(e) {
+    const uid = e.uid;
+    const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
+    const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
+    const keys2 = Array.isArray(e.keysecondary) ? e.keysecondary.filter(Boolean).join(', ') : '';
+    const pos = LB_POSITION_LABEL[Number(e.position)] || String(e.position ?? '');
+    const lines = [];
+    lines.push(`【条目 uid=${uid}】${title}`);
+    lines.push(`- 类型：${lbEntryType(e)}`);
+    if (keys) lines.push(`- 关键词(key)：${keys}`);
+    if (keys2) lines.push(`- 次要关键词(keysecondary)：${keys2}`);
+    lines.push(`- 位置(position)：${pos} ｜ 顺序(order)：${e.order ?? 100}` + (Number(e.position) === 4 ? ` ｜ 深度(depth)：${e.depth ?? ''}` : ''));
+    const content = typeof e.content === 'string' ? e.content : '';
+    lines.push(`- 内容(content)：\n${content.trim() || '（空）'}`);
+    return lines.join('\n');
+}
+
+/**
+ * Build the structured "book -> entries" listing for lorebook mode, and record
+ * which books it covers (lbBookNames). Honors s.lorebookTarget: a specific book
+ * name, or '' for every active book. Stores nothing by reference — apply re-reads
+ * the books fresh — so this is purely a read for context.
+ */
+async function buildLorebookContext() {
+    lbContextText = '';
+    lbBookNames = [];
+    const s = getSettings();
+    const mod = await getWiEditApi();
+    if (!mod) {
+        lbContextText = '（无法访问世界书模块 —— 当前 ST 版本可能不支持。）';
+        return;
+    }
+
+    let names;
+    if (s.lorebookTarget) {
+        const all = await getAllBookNames();
+        names = all.includes(s.lorebookTarget) ? [s.lorebookTarget] : [];
+        if (!names.length) {
+            lbContextText = `（找不到名为「${s.lorebookTarget}」的世界书。请在上方重新选择，或点刷新。）`;
+            return;
+        }
+    } else {
+        names = await getActiveBookNames();
+        if (!names.length) {
+            lbContextText = '（当前没有激活任何世界书。可在上方下拉里直接选择某一本来编辑。）';
+            return;
+        }
+    }
+
+    const ctx = getCtx();
+    const blocks = [];
+    for (const name of names) {
+        let data;
+        try { data = await mod.loadWorldInfo(name); } catch (e) { continue; }
+        if (!data || !data.entries) continue;
+        lbBookNames.push(name);
+        let entries = Object.values(data.entries)
+            .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+        const total = entries.length;
+        // Per-entry selection only applies to a single targeted book. A Set (even
+        // empty) means "send exactly these"; null/absent means "send all". Apply
+        // still re-reads the whole book, so editing any uid keeps working.
+        const sel = s.lorebookTarget ? lbEntryFilter[name] : null;
+        const filtered = (sel instanceof Set);
+        if (filtered) entries = entries.filter((e) => sel.has(e.uid));
+        const body = entries.length
+            ? entries.map(lbFormatEntry).join('\n\n')
+            : (filtered ? '（未选择任何条目——请在上方勾选要发送给我的条目。）' : '（此世界书暂无条目。）');
+        const head = filtered
+            ? `=== 世界书：${name}（已选 ${entries.length} / 共 ${total} 条）===`
+            : `=== 世界书：${name}（共 ${total} 条）===`;
+        blocks.push(`${head}\n${body}`);
+    }
+
+    lbContextText = blocks.join('\n\n') || '（未能读取到任何世界书条目。）';
+    // Macros inside entry content (e.g. {{user}}) — resolve for readability.
+    try { lbContextText = ctx.substituteParams(lbContextText); } catch (e) { /* leave raw */ }
+}
+
+// Convert a fenced body the model wrote with literal "\n" (out of JSON habit)
+// back into real line breaks. Only fires when there are NO real newlines yet, so
+// legitimately single-line content is untouched.
+function lbBackstopNewlines(s) {
+    if (typeof s !== 'string') return s;
+    if (s.indexOf('\n') === -1 && /\\n/.test(s)) {
+        return s.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    }
+    return s;
+}
+
+// Pull one fenced body out of a block: <<<name … name>>> (markers at line start).
+// Returns { body, rest }: body is the inner text with exactly one boundary newline
+// trimmed each side (internal indentation preserved), or null if absent; rest is
+// the block with that fence removed so header parsing won't see it.
+function extractFence(text, name) {
+    const re = new RegExp('(^|\\n)[ \\t]*<<<' + name + '[ \\t]*\\r?\\n([\\s\\S]*?)\\r?\\n[ \\t]*' + name + '>>>[ \\t]*(?=\\n|$)');
+    const m = text.match(re);
+    if (!m) return { body: null, rest: text };
+    const rest = text.slice(0, m.index) + '\n' + text.slice(m.index + m[0].length);
+    return { body: m[2], rest };
+}
+
+const lbToBool = (v) => (v === true) || /^(true|1|yes|on|是|开|启用|常驻)$/i.test(String(v == null ? '' : v).trim());
+const lbToStrArray = (v) => (Array.isArray(v)
+    ? v.map((x) => String(x).trim()).filter(Boolean)
+    : String(v == null ? '' : v).split(/[,，、]/).map((x) => x.trim()).filter(Boolean));
+
+// Whitelist of editable fields and their coercions. Values arrive as strings (from
+// "key: value" header lines), so coercions are string-aware — a stray field the
+// model invents can never write garbage into a book.
+const LB_FIELD_COERCE = {
+    content: (v) => String(v == null ? '' : v),
+    comment: (v) => String(v == null ? '' : v),
+    key: lbToStrArray,
+    keysecondary: lbToStrArray,
+    constant: lbToBool,
+    disable: lbToBool,
+    selective: lbToBool,
+    excludeRecursion: lbToBool,
+    preventRecursion: lbToBool,
+    order: (v) => Number(String(v).trim()),
+    position: (v) => Number(String(v).trim()),
+    depth: (v) => Number(String(v).trim()),
+};
+
+const LB_SCALAR_KEYS = ['comment', 'key', 'keysecondary', 'constant', 'disable', 'selective', 'excludeRecursion', 'preventRecursion', 'order', 'position', 'depth'];
+
+function applyFieldsToEntry(entry, fields) {
+    if (!fields || typeof fields !== 'object') return;
+    for (const [k, raw] of Object.entries(fields)) {
+        if (!(k in LB_FIELD_COERCE)) continue;            // ignore unknown fields
+        const val = LB_FIELD_COERCE[k](raw);
+        if ((k === 'order' || k === 'position' || k === 'depth') && Number.isNaN(val)) continue;
+        entry[k] = val;
+    }
+}
+
+// Parse ONE <LorebookEdit> block's inner text into an op, or an error.
+// Returns { op } or { error }.
+function parseOneLorebookBlock(inner) {
+    let text = String(inner || '');
+    const cFence = extractFence(text, 'content'); text = cFence.rest;
+    const rFence = extractFence(text, 'replace'); text = rFence.rest;
+
+    const headers = {};
+    for (const rawLine of text.split('\n')) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const mm = line.match(/^([A-Za-z_]+)\s*[:：]\s*(.*)$/);
+        if (mm) headers[mm[1]] = mm[2];
+    }
+
+    const action = (headers.action || '').trim().toLowerCase();
+    const uidRaw = headers.uid != null ? String(headers.uid).trim() : '';
+    const op = {
+        action,
+        book: (headers.book || '').trim(),
+        uid: uidRaw !== '' ? parseInt(uidRaw, 10) : null,
+        anchor: headers.anchor != null ? String(headers.anchor) : '',
+        replace: rFence.body != null ? lbBackstopNewlines(rFence.body) : null,
+        fields: {},
+    };
+    for (const k of LB_SCALAR_KEYS) {
+        if (headers[k] != null && String(headers[k]).trim() !== '') op.fields[k] = headers[k];
+    }
+    if (cFence.body != null) op.fields.content = lbBackstopNewlines(cFence.body);
+
+    const ALLOWED = ['create', 'edit', 'patch', 'delete'];
+    if (!ALLOWED.includes(action)) return { error: `未知或缺失的 action：「${(headers.action || '').trim()}」` };
+    if (!op.book) return { error: '缺少 book（世界书名）' };
+    if (action === 'create') {
+        if (op.fields.content == null || !String(op.fields.content).trim()) return { error: 'create 缺少 content 正文' };
+    } else if (op.uid == null || Number.isNaN(op.uid)) {
+        return { error: `${action} 缺少有效的 uid` };
+    }
+    if (action === 'edit') {
+        const hasContent = op.fields.content != null;
+        const hasScalar = LB_SCALAR_KEYS.some((k) => k in op.fields);
+        if (!hasContent && !hasScalar) return { error: 'edit 没有任何要修改的字段' };
+    }
+    if (action === 'patch') {
+        if (!op.anchor || !op.anchor.trim()) return { error: 'patch 缺少 anchor 锚点' };
+        if (op.replace == null) return { error: 'patch 缺少 replace 区块' };
+    }
+    return { op };
+}
+
+// Parse every <LorebookEdit> block in a reply. Each block is independent: one bad
+// block becomes an error entry, the rest still parse. Returns { ops, errors }.
+function parseLorebookBlocks(text) {
+    const ops = [];
+    const errors = [];
+    const re = /<LorebookEdit>([\s\S]*?)<\/LorebookEdit>/gi;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const res = parseOneLorebookBlock(m[1]);
+        if (res.op) ops.push(res.op);
+        else errors.push({ error: res.error || '无法解析' });
+    }
+    return { ops, errors };
+}
+
+/* ---- patch anchor matching (fuzzy, tolerant of whitespace / tags / quote style) ---- */
+function lbEscapeRegex(s) {
+    let out = '';
+    const special = '.*+?^${}()|[]\\';
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (special.indexOf(ch) !== -1) out += '\\';
+        out += ch;
+    }
+    return out;
+}
+function lbNormQuotes(s) {
+    return String(s).replace(/['"“”‘’`]/g, '"');
+}
+function lbFuzzyRegex(str) {
+    const tokens = lbNormQuotes(str).trim().split(/[\s\-—_~*]+/).filter(Boolean).map(lbEscapeRegex);
+    const SEP = '(?:\\s|<[^>]+>|[*_~.,;:!?，。；：！？、-])*';
+    return new RegExp(tokens.join(SEP) || '\\b\\B', 'i');
+}
+// Replace the span identified by a "start || end" anchor (or a single anchor) with
+// `replace`. Quote-normalize a same-length copy for matching so indices map back to
+// the original. Returns { result, matched }.
+function lbFuzzyReplace(content, anchor, replace) {
+    const src = String(content == null ? '' : content);
+    const norm = lbNormQuotes(src);              // 1:1 char map -> indices align with src
+    const a = String(anchor == null ? '' : anchor);
+    const repl = String(replace == null ? '' : replace);
+
+    let sep = a.indexOf(' || '); let sl = 4;
+    if (sep === -1) { sep = a.indexOf('||'); sl = 2; }
+    if (sep === -1) { sep = a.indexOf('...'); sl = 3; }
+
+    try {
+        if (sep > 0 && a.length - sep - sl > 0) {
+            const startA = a.slice(0, sep).trim();
+            const endA = a.slice(sep + sl).trim();
+            if (startA && endA) {
+                const sM = norm.match(lbFuzzyRegex(startA));
+                if (!sM) return { result: src, matched: false };
+                const afterIdx = sM.index + sM[0].length;
+                const eM = norm.slice(afterIdx).match(lbFuzzyRegex(endA));
+                if (!eM) return { result: src, matched: false };
+                const end = afterIdx + eM.index + eM[0].length;
+                return { result: src.slice(0, sM.index) + repl + src.slice(end), matched: true };
+            }
+        }
+        const m = norm.match(lbFuzzyRegex(a));
+        if (m) return { result: src.slice(0, m.index) + repl + src.slice(m.index + m[0].length), matched: true };
+    } catch (e) {
+        console.warn('[Story Oracle] patch anchor match failed:', e);
+    }
+    return { result: src, matched: false };
+}
+
+function lbOpLabel(op) {
+    if (!op) return '(无效操作)';
+    const a = ({ create: '新增', edit: '改', patch: '补丁', delete: '删除' })[op.action] || op.action || '?';
+    if (op.action === 'create') return `${a}「${(op.fields && op.fields.comment) || '(无标题)'}」`;
+    return `${a} uid=${op.uid}`;
+}
+function lbSummaryOf(list) {
+    const c = { create: 0, edit: 0, patch: 0, delete: 0 };
+    for (const x of list) if (x && x.action in c) c[x.action]++;
+    const bits = [];
+    if (c.create) bits.push(`新增 ${c.create}`);
+    if (c.edit) bits.push(`改 ${c.edit}`);
+    if (c.patch) bits.push(`补丁 ${c.patch}`);
+    if (c.delete) bits.push(`删除 ${c.delete}`);
+    return bits.join(' · ') || '无改动';
+}
+
+/**
+ * Apply parsed ops to the books, grouped by book. Each touched book is re-loaded
+ * FRESH, deep-cloned for undo, mutated, then saved immediately. Per-op outcomes are
+ * collected for the UI; an op never half-applies (patch validates its anchor first).
+ * Returns { snapshots, results, summary, applied }.
+ */
+async function applyLorebookOps(ops) {
+    const mod = await getWiEditApi();
+    if (!mod) throw new Error('世界书模块不可用');
+
+    const results = [];
+    const skip = (op, reason) => results.push({ ok: false, action: op && op.action, label: lbOpLabel(op), reason });
+
+    const byBook = new Map();
+    for (const op of ops) {
+        if (!op || !op.action || !op.book) { skip(op, '操作不完整'); continue; }
+        if (!lbBookNames.includes(op.book)) { skip(op, `世界书「${op.book}」不在本次范围内`); continue; }
+        if (!byBook.has(op.book)) byBook.set(op.book, []);
+        byBook.get(op.book).push(op);
+    }
+
+    const snapshots = [];
+    for (const [name, bookOps] of byBook.entries()) {
+        let data;
+        try { data = await mod.loadWorldInfo(name); } catch (e) { data = null; }
+        if (!data || !data.entries) { for (const op of bookOps) skip(op, `无法读取世界书「${name}」`); continue; }
+        const snap = { name, data: structuredClone(data) };
+        let touched = false;
+
+        for (const op of bookOps) {
+            if (op.action === 'create') {
+                let entry;
+                if (typeof mod.createWorldInfoEntry === 'function') entry = mod.createWorldInfoEntry(name, data);
+                if (!entry) { skip(op, '无法新建条目'); continue; }
+                entry.excludeRecursion = true;          // house defaults (overridable by fields)
+                entry.preventRecursion = true;
+                applyFieldsToEntry(entry, op.fields);
+                const noKey = !Array.isArray(entry.key) || entry.key.length === 0;
+                if (noKey && !('constant' in op.fields)) entry.constant = true;   // auto-blue
+                results.push({ ok: true, action: 'create', label: `新增「${entry.comment || '(无标题)'}」(uid=${entry.uid})` });
+                touched = true;
+            } else if (op.action === 'delete') {
+                if (op.uid == null || !(op.uid in data.entries)) { skip(op, `uid=${op.uid} 不存在`); continue; }
+                const title = String(data.entries[op.uid].comment || '').trim();
+                if (typeof mod.deleteWorldInfoEntry === 'function') await mod.deleteWorldInfoEntry(data, op.uid, { silent: true });
+                else delete data.entries[op.uid];
+                results.push({ ok: true, action: 'delete', label: `删除 uid=${op.uid}${title ? `「${title}」` : ''}` });
+                touched = true;
+            } else if (op.action === 'patch') {
+                if (op.uid == null || !(op.uid in data.entries)) { skip(op, `uid=${op.uid} 不存在`); continue; }
+                const entry = data.entries[op.uid];
+                const { result, matched } = lbFuzzyReplace(entry.content || '', op.anchor, op.replace);
+                if (!matched) { skip(op, `锚点未找到：「${String(op.anchor || '').slice(0, 40)}」`); continue; }
+                entry.content = result;
+                applyFieldsToEntry(entry, op.fields);   // optional scalar tweaks alongside
+                results.push({ ok: true, action: 'patch', label: `补丁 uid=${op.uid}${entry.comment ? `「${entry.comment}」` : ''}` });
+                touched = true;
+            } else { // edit
+                if (op.uid == null || !(op.uid in data.entries)) { skip(op, `uid=${op.uid} 不存在`); continue; }
+                applyFieldsToEntry(data.entries[op.uid], op.fields);
+                const cm = data.entries[op.uid].comment;
+                results.push({ ok: true, action: 'edit', label: `改 uid=${op.uid}${cm ? `「${cm}」` : ''}` });
+                touched = true;
+            }
+        }
+
+        if (touched) {
+            snapshots.push(snap);
+            await mod.saveWorldInfo(name, data, /*immediately*/ true);
+            try { if (typeof mod.reloadEditor === 'function') mod.reloadEditor(name); } catch (e) { /* editor not open */ }
+        }
+    }
+
+    const okResults = results.filter((r) => r.ok);
+    return { snapshots, results, summary: lbSummaryOf(okResults), applied: okResults.length };
+}
+
+async function undoLorebookOps(snapshots) {
+    const mod = await getWiEditApi();
+    if (!mod) throw new Error('世界书模块不可用');
+    for (const snap of snapshots) {
+        await mod.saveWorldInfo(snap.name, snap.data, /*immediately*/ true);
+        try { if (typeof mod.reloadEditor === 'function') mod.reloadEditor(snap.name); } catch (e) { /* ignore */ }
+    }
+}
+
+/* ------------------------------------------------------------------ *
  * MVU (MagVarUpdate via JS-Slash-Runner) integration for Diagnose mode
  * ------------------------------------------------------------------ */
 async function getMvu() {
@@ -558,18 +1068,13 @@ function buildWindow() {
     win = document.createElement('div');
     win.id = 'so-window';
     win.style.display = 'none';
-    win.style.width = `${s.winWidth}px`;
-    win.style.height = `${s.winHeight}px`;
-    if (s.winLeft != null && s.winTop != null) {
-        win.style.left = `${s.winLeft}px`;
-        win.style.top = `${s.winTop}px`;
-        win.style.right = 'auto';
-    }
+    applyInitialGeometry(s);
 
     win.innerHTML = `
         <div id="so-header">
-            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span></div>
+            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span><span id="so-lb-pill">世界书</span></div>
             <div id="so-header-btns">
+                <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
                 <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量"><i class="fa-solid fa-stethoscope"></i></div>
                 <div class="so-iconbtn" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i></div>
                 <div class="so-iconbtn" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i></div>
@@ -663,6 +1168,33 @@ function buildWindow() {
             </label>
         </div>
 
+        <div id="so-lb-bar">
+            <div class="so-lb-row">
+                <i class="fa-solid fa-book so-lb-icon"></i>
+                <select id="so-lb-book" title="选择要聊 / 编辑的世界书"></select>
+                <div class="so-iconbtn" id="so-lb-refresh" title="刷新世界书列表"><i class="fa-solid fa-rotate-right"></i></div>
+            </div>
+            <label class="so-check so-lb-check"><input id="so-lb-story" type="checkbox"><span>同时带上最近剧情对话</span></label>
+            <label class="so-check so-lb-check"><input id="so-lb-preset" type="checkbox"><span>套用我的补全预设（指令叠加其上）</span></label>
+            <div class="so-hint so-lb-preset-warn">⚠ 勾选后，世界书管家指令会叠加在你选定的补全预设之上（用于越狱）。预设内容会分散模型注意力、可能影响编辑精度——仅在确实需要越狱时才勾选。</div>
+            <div id="so-lb-entries" class="so-lb-entries">
+                <div class="so-lb-entries-head">
+                    <span id="so-lb-entries-summary">条目：全部</span>
+                    <div class="so-iconbtn so-lb-ent-toggle" id="so-lb-entries-toggle" title="展开 / 折叠条目列表"><i class="fa-solid fa-chevron-down"></i></div>
+                </div>
+                <div class="so-lb-entries-tools">
+                    <button type="button" class="so-lb-mini" id="so-lb-all">全选</button>
+                    <button type="button" class="so-lb-mini" id="so-lb-none">全不选</button>
+                    <button type="button" class="so-lb-mini so-lb-mini-blue" id="so-lb-blue" title="只选常驻（蓝灯）条目，不含已禁用">仅蓝灯</button>
+                    <button type="button" class="so-lb-mini so-lb-mini-green" id="so-lb-green" title="只选关键词触发（绿灯）条目，不含已禁用">仅绿灯</button>
+                    <button type="button" class="so-lb-mini so-lb-mini-off" id="so-lb-disabled" title="只选已禁用条目">仅禁用</button>
+                </div>
+                <input type="text" id="so-lb-entries-filter" class="so-lb-entries-filter" placeholder="筛选条目（标题 / 关键词 / uid）…">
+                <div id="so-lb-entries-list" class="so-lb-entries-list"></div>
+            </div>
+            <div class="so-hint" id="so-lb-hint"></div>
+        </div>
+
         <div id="so-messages"></div>
 
         <div id="so-footer">
@@ -680,6 +1212,7 @@ function buildWindow() {
             </div>
             <pre id="so-debug-body"></pre>
         </div>
+        <div id="so-resize-grip" title="拖动调整大小" aria-label="调整窗口大小"></div>
     `;
     document.body.appendChild(win);
 
@@ -691,7 +1224,7 @@ function buildWindow() {
     bindControls();
     loadSettingsIntoForm();
     makeDraggable(win, win.querySelector('#so-header'));
-    observeResize();
+    makeResizable(win, win.querySelector('#so-resize-grip'));
     renderEmptyState();
 }
 
@@ -701,6 +1234,38 @@ function bindControls() {
     win.querySelector('#so-close-btn').addEventListener('click', () => toggleWindow(false));
     win.querySelector('#so-clear-btn').addEventListener('click', clearConversation);
     win.querySelector('#so-diagnose-btn').addEventListener('click', toggleDiagnose);
+    win.querySelector('#so-lorebook-btn').addEventListener('click', toggleLorebook);
+    win.querySelector('#so-lb-refresh').addEventListener('click', () => populateLorebookBooks(true));
+    win.querySelector('#so-lb-book').addEventListener('change', (e) => {
+        const s2 = getSettings();
+        s2.lorebookTarget = e.target.value; // '' = all active
+        save();
+        updateLbHint();
+        populateLorebookEntries();           // refresh the per-entry picker for the new book
+    });
+    win.querySelector('#so-lb-story').addEventListener('change', (e) => {
+        getSettings().lorebookIncludeStory = e.target.checked;
+        save();
+    });
+    win.querySelector('#so-lb-preset').addEventListener('change', (e) => {
+        const s2 = getSettings();
+        s2.lorebookUsePreset = e.target.checked;
+        save();
+        if (e.target.checked) {
+            addSystemNote(presetCurationActive(s2)
+                ? '已开启「套用补全预设」：世界书管家指令会叠加在你的补全预设之上。注意预设可能分散模型注意力、影响编辑精度——仅在需要越狱时使用。'
+                : '已勾选「套用补全预设」，但目前还没有整理好的补全预设。请先到设置（齿轮）里选定并整理一个补全预设；在此之前，世界书模式仍用内置管家提示词。');
+        }
+    });
+    win.querySelector('#so-lb-entries-toggle').addEventListener('click', () => {
+        win.querySelector('#so-lb-entries').classList.toggle('open');
+    });
+    win.querySelector('#so-lb-all').addEventListener('click', () => setAllLbEntries(true));
+    win.querySelector('#so-lb-none').addEventListener('click', () => setAllLbEntries(false));
+    win.querySelector('#so-lb-blue').addEventListener('click', () => setLbEntriesByType('blue'));
+    win.querySelector('#so-lb-green').addEventListener('click', () => setLbEntriesByType('green'));
+    win.querySelector('#so-lb-disabled').addEventListener('click', () => setLbEntriesByType('off'));
+    win.querySelector('#so-lb-entries-filter').addEventListener('input', (e) => filterLbEntries(e.target.value));
     win.querySelector('#so-debug-btn').addEventListener('click', openDebug);
     win.querySelector('#so-debug-close').addEventListener('click', () => win.querySelector('#so-debug').classList.remove('open'));
     win.querySelector('#so-debug-copy').addEventListener('click', async () => {
@@ -791,6 +1356,8 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-regex').checked = !!s.applyRegex;
     win.querySelector('#so-wi').value = s.worldInfoMode;
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
+    win.querySelector('#so-lb-story').checked = !!s.lorebookIncludeStory;
+    win.querySelector('#so-lb-preset').checked = !!s.lorebookUsePreset;
     updateWiHint();
     populatePersonas();
     win.querySelector('#so-sysprompt').value = s.systemPrompt;
@@ -1480,6 +2047,7 @@ function toggleWindow(show) {
 
 function toggleDiagnose() {
     diagnoseMode = !diagnoseMode;
+    if (diagnoseMode && lorebookMode) setLorebookMode(false); // mutually exclusive
     win.classList.toggle('so-diag-on', diagnoseMode);
     win.querySelector('#so-diagnose-btn').classList.toggle('so-diag-active', diagnoseMode);
     inputEl.placeholder = diagnoseMode
@@ -1491,6 +2059,196 @@ function toggleDiagnose() {
         addSystemNote('已返回普通聊天模式。');
     }
     inputEl.focus();
+}
+
+// Centralized lorebook-mode setter so toggleDiagnose can flip it off without
+// re-running the note/placeholder side effects.
+function setLorebookMode(on) {
+    lorebookMode = on;
+    win.classList.toggle('so-lb-on', on);
+    win.querySelector('#so-lorebook-btn').classList.toggle('so-lb-active', on);
+}
+
+function toggleLorebook() {
+    const next = !lorebookMode;
+    if (next && diagnoseMode) {
+        // turn diagnose off cleanly first
+        diagnoseMode = false;
+        win.classList.remove('so-diag-on');
+        win.querySelector('#so-diagnose-btn').classList.remove('so-diag-active');
+    }
+    setLorebookMode(next);
+    inputEl.placeholder = next
+        ? '问问这本世界书，或让我改写 / 新增 / 删除某个条目…'
+        : '就当前剧情提问…（Enter 发送，Shift+Enter 换行）';
+    if (next) {
+        populateLorebookBooks();
+        addSystemNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
+    } else {
+        addSystemNote('已返回普通聊天模式。');
+    }
+    inputEl.focus();
+}
+
+// Fill the book dropdown: "all active" + every known book (active ones marked).
+async function populateLorebookBooks(announce) {
+    const sel = win.querySelector('#so-lb-book');
+    if (!sel) return;
+    const s = getSettings();
+    let active = [];
+    let all = [];
+    try {
+        [active, all] = await Promise.all([getActiveBookNames(), getAllBookNames()]);
+    } catch (e) { /* leave empty */ }
+
+    sel.innerHTML = '';
+    const optAll = document.createElement('option');
+    optAll.value = '';
+    optAll.textContent = active.length ? `① 当前激活的全部世界书（${active.length} 本）` : '① 当前激活的全部世界书（无）';
+    sel.appendChild(optAll);
+
+    const activeSet = new Set(active);
+    for (const name of all) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = activeSet.has(name) ? `★ ${name}` : name;
+        sel.appendChild(opt);
+    }
+
+    // Restore selection if it still exists; otherwise fall back to "all active".
+    if (s.lorebookTarget && all.includes(s.lorebookTarget)) {
+        sel.value = s.lorebookTarget;
+    } else {
+        if (s.lorebookTarget) { s.lorebookTarget = ''; save(); }
+        sel.value = '';
+    }
+    updateLbHint();
+    populateLorebookEntries();
+    if (announce) addSystemNote('已刷新世界书列表。');
+}
+
+function updateLbHint() {
+    const hint = win.querySelector('#so-lb-hint');
+    if (!hint) return;
+    const s = getSettings();
+    hint.textContent = s.lorebookTarget
+        ? `将聊 / 编辑：「${s.lorebookTarget}」这一本。`
+        : '将聊 / 编辑：当前角色卡 / 聊天 / 全局所激活的全部世界书。整本注入，token 消耗可能较大。';
+}
+
+/* ---- per-entry picker (only shown when a single book is targeted) ---- */
+function allLbEntryUids() {
+    const list = win.querySelector('#so-lb-entries-list');
+    return list ? [...list.querySelectorAll('input[type="checkbox"]')].map((b) => Number(b.dataset.uid)) : [];
+}
+
+// "all" is represented as null (no filter). Normalize a full set back to null so
+// buildLorebookContext takes its untouched "整本" path.
+function refreshLbEntriesSummary(name, total) {
+    let sel = lbEntryFilter[name];
+    if (sel instanceof Set && total > 0 && sel.size >= total) { sel = null; lbEntryFilter[name] = null; }
+    const summary = win.querySelector('#so-lb-entries-summary');
+    if (!summary) return;
+    summary.textContent = (sel instanceof Set) ? `条目：已选 ${sel.size} / ${total}` : `条目：全部（${total}）`;
+}
+
+function toggleLbEntry(name, uid, checked, total) {
+    let sel = lbEntryFilter[name];
+    if (!(sel instanceof Set)) sel = new Set(allLbEntryUids()); // was "all" -> materialize
+    if (checked) sel.add(uid); else sel.delete(uid);
+    lbEntryFilter[name] = sel;
+    refreshLbEntriesSummary(name, total);
+}
+
+function setAllLbEntries(on) {
+    const name = getSettings().lorebookTarget;
+    if (!name) return;
+    const boxes = [...win.querySelectorAll('#so-lb-entries-list input[type="checkbox"]')];
+    boxes.forEach((b) => { b.checked = on; });
+    lbEntryFilter[name] = on ? null : new Set();   // all  |  none
+    refreshLbEntriesSummary(name, boxes.length);
+}
+
+// Select exactly the entries of one lamp type: 'blue' (常驻), 'green' (关键词触发),
+// or 'off' (已禁用). None of these include disabled entries except 'off' itself.
+function setLbEntriesByType(type) {
+    const name = getSettings().lorebookTarget;
+    if (!name) return;
+    const rows = [...win.querySelectorAll('#so-lb-entries-list .so-lb-ent')];
+    if (!rows.length) return;
+    const sel = new Set();
+    for (const row of rows) {
+        const box = row.querySelector('input[type="checkbox"]');
+        const match = row.dataset.type === type;
+        box.checked = match;
+        if (match) sel.add(Number(box.dataset.uid));
+    }
+    lbEntryFilter[name] = sel;   // empty Set if none of that type -> sends none
+    refreshLbEntriesSummary(name, rows.length);
+}
+
+function filterLbEntries(q) {
+    const needle = (q || '').trim().toLowerCase();
+    const list = win.querySelector('#so-lb-entries-list');
+    if (!list) return;
+    for (const row of list.querySelectorAll('.so-lb-ent')) {
+        row.style.display = (!needle || (row.dataset.hay || '').includes(needle)) ? '' : 'none';
+    }
+}
+
+// Build / refresh the checklist for the currently targeted single book. Hidden
+// entirely when target is "all active books" (selection is per single book).
+async function populateLorebookEntries() {
+    const box = win.querySelector('#so-lb-entries');
+    const list = win.querySelector('#so-lb-entries-list');
+    if (!box || !list) return;
+    const name = getSettings().lorebookTarget;
+    if (!name) { box.classList.remove('shown'); return; }
+    box.classList.add('shown');
+
+    list.innerHTML = '<div class="so-lb-ent-empty">读取条目中…</div>';
+    let entries = [];
+    try {
+        const mod = await getWiEditApi();
+        const data = mod ? await mod.loadWorldInfo(name) : null;
+        if (data && data.entries) {
+            entries = Object.values(data.entries)
+                .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+        }
+    } catch (e) { /* leave empty */ }
+
+    // Drop stale uids from a prior selection (entries may have changed since).
+    if (lbEntryFilter[name] instanceof Set) {
+        const valid = new Set(entries.map((e) => e.uid));
+        const kept = new Set([...lbEntryFilter[name]].filter((u) => valid.has(u)));
+        lbEntryFilter[name] = kept;
+    }
+
+    list.innerHTML = '';
+    if (!entries.length) {
+        list.innerHTML = '<div class="so-lb-ent-empty">（此世界书暂无条目。）</div>';
+        refreshLbEntriesSummary(name, 0);
+        return;
+    }
+    const sel = lbEntryFilter[name];   // Set | null (= all)
+    for (const e of entries) {
+        const checked = !(sel instanceof Set) || sel.has(e.uid);
+        const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
+        const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
+        const row = document.createElement('label');
+        row.className = 'so-lb-ent';
+        row.dataset.hay = `${e.uid} ${title} ${keys}`.toLowerCase();
+        row.dataset.type = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
+        row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
+            `<span class="so-lb-ent-type so-lb-type-${e.disable ? 'off' : (e.constant ? 'blue' : 'green')}"></span>` +
+            `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
+        row.querySelector('.so-lb-ent-title').textContent = title;
+        row.querySelector('input').addEventListener('change', (ev) => toggleLbEntry(name, e.uid, ev.target.checked, entries.length));
+        list.appendChild(row);
+    }
+    const f = win.querySelector('#so-lb-entries-filter');
+    if (f && f.value) filterLbEntries(f.value);
+    refreshLbEntriesSummary(name, entries.length);
 }
 
 function formatPrompt(msgs) {
@@ -1525,6 +2283,7 @@ function buildSystemPrompt() {
     const s = getSettings();
 
     if (diagnoseMode) return buildDiagnosePrompt(ctx, s);
+    if (lorebookMode) return buildLorebookPrompt(ctx, s);
 
     const parts = [resolveSystemPrompt(s)];
 
@@ -1568,6 +2327,23 @@ function buildDiagnosePrompt(ctx, s) {
 
     const full = parts.filter(Boolean).join('\n\n');
     try { return ctx.substituteParams(full); } catch (e) { return full; }
+}
+
+function buildLorebookPrompt(ctx, s) {
+    const parts = [LOREBOOK_SYSTEM_PROMPT];
+
+    parts.push('=== 当前世界书内容 ===\n' +
+        (lbContextText || '（未读取到世界书 —— 请检查上方的选择。）'));
+
+    if (s.lorebookIncludeStory) {
+        const transcript = buildTranscript(ctx, s);
+        if (transcript) parts.push('=== 最近的故事对话记录（仅供参考，最新的在最后）===\n' + transcript);
+    }
+
+    // Note: lbContextText is already substituteParams'd; the system prompt itself
+    // has no macros, so no further substitution is needed (and would risk
+    // mangling literal braces inside entry content).
+    return parts.filter(Boolean).join('\n\n');
 }
 
 function buildCardSection(ctx) {
@@ -1660,7 +2436,10 @@ function renderReplyHtml(text) {
 
 function buildMessages() {
     const s = getSettings();
-    if (!diagnoseMode && presetCurationActive(s)) {
+    if (lorebookMode && s.lorebookUsePreset && presetCurationActive(s)) {
+        return buildLorebookPresetMessages(s);
+    }
+    if (!diagnoseMode && !lorebookMode && presetCurationActive(s)) {
         return buildPresetMessages(s);
     }
     return [{ role: 'system', content: buildSystemPrompt() }, ...convo];
@@ -1759,6 +2538,44 @@ function buildPresetMessages(s) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Lorebook mode THROUGH a curated preset (opt-in: s.lorebookUsePreset).
+ *
+ * We keep the preset's TEXT blocks (its jailbreak / formatting / framing) and
+ * drop the RP-content markers (card / persona / world-info / examples) — those
+ * are irrelevant to editing a world book and would pull attention onto the RP.
+ * The lore-manager directive (LOREBOOK_SYSTEM_PROMPT + the current book content,
+ * via buildLorebookPrompt) plus the side-chat Q&A go where the chat history would
+ * sit, so a post-history jailbreak block still lands last.
+ * ------------------------------------------------------------------ */
+function buildLorebookPresetMessages(s) {
+    const ctx = getCtx();
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    const items = (snap && snap.items) || [];
+    const out = [];
+
+    const loreBlock = buildLorebookPrompt(ctx, s);  // directive + book (+ optional transcript)
+    let placed = false;
+    const placeLore = () => {
+        if (placed) return;
+        pushMsg(out, 'system', loreBlock);
+        for (const m of convo) pushMsg(out, m.role, m.content);
+        placed = true;
+    };
+
+    for (const it of items) {
+        if (it.kind === 'marker') {
+            if (it.identifier === 'chatHistory') placeLore();
+            // every other marker is skipped in lore mode
+        } else {
+            pushMsg(out, it.role || 'system', subst(ctx, it.content));
+        }
+    }
+    placeLore(); // no chatHistory marker in the curation -> append at the end
+
+    return out.length ? out : [{ role: 'system', content: loreBlock }, ...convo];
+}
+
+/* ------------------------------------------------------------------ *
  * Sending
  * ------------------------------------------------------------------ */
 async function onSend() {
@@ -1778,9 +2595,17 @@ async function onSend() {
     }
 
     inputEl.value = '';
-    convo.push({ role: 'user', content: text });
-    addMessage('user', text);
+    const entry = { id: ++cidSeq, role: 'user', content: text };
+    convo.push(entry);
+    entry._el = addMessage('user', text, entry);
+    await generateReply();
+}
 
+// Generate one assistant reply for the current tail of `convo` (which must already
+// end with the user turn being answered). Shared by send / edit / regenerate.
+async function generateReply() {
+    if (isGenerating) return;
+    const s = getSettings();
     if (s.applyRegex) await loadRegexEngine(); // ensure engine is ready before building context
 
     if (diagnoseMode) {
@@ -1798,6 +2623,10 @@ async function onSend() {
         const stat = await getMvuStatData();
         diagStatData = stat ? JSON.stringify(stat, null, 2) : '';
         diagLatestUpdate = extractUpdateBlock(getLatestAiMessageText());
+    } else if (lorebookMode) {
+        // Read the selected world book(s) fresh so the model sees the current
+        // state, and remember which books are in scope for the apply step.
+        await buildLorebookContext();
     } else if (presetCurationActive(s)) {
         // Faithful assembly needs WI split into the Before/After-Char-Defs slots.
         const split = await buildWorldInfoSplit();
@@ -1812,12 +2641,14 @@ async function onSend() {
     // Snapshot the exact prompt for the debug viewer (both modes).
     lastPrompt = messages.map((m) => ({ role: m.role, content: m.content }));
     lastPromptMeta = {
-        mode: diagnoseMode ? '诊断' : '聊天',
+        mode: diagnoseMode ? '诊断' : (lorebookMode ? '世界书' : '聊天'),
         target: s.mode === 'direct' ? (s.model || '直连') : '配置文件',
         chars: lastPrompt.reduce((n, m) => n + (m.content ? m.content.length : 0), 0),
         time: new Date().toLocaleTimeString(),
     };
-    const assistantEl = addMessage('assistant', '');
+    const aEntry = { id: ++cidSeq, role: 'assistant', content: '' };
+    const assistantEl = addMessage('assistant', '', aEntry);
+    aEntry._el = assistantEl;
     const contentEl = assistantEl.querySelector('.so-content');
     const clearTyping = showTyping(contentEl);
     setGenerating(true);
@@ -1825,12 +2656,17 @@ async function onSend() {
 
     try {
         let finalText = '';
+        // Diagnose audits are long, and reasoning models spend part of the budget
+        // "thinking" before any visible output — too small a cap yields an empty
+        // reply (budget gone during thinking) or a patch cut off mid-token. Give
+        // Diagnose a generous floor so a full 审计 has room to finish.
+        const effMaxTokens = diagnoseMode ? Math.max(s.maxTokens, 4096) : s.maxTokens;
         if (s.mode === 'direct') {
             const url = normalizeUrl(s.endpoint);
             const body = {
                 model: s.model,
                 messages,
-                max_tokens: s.maxTokens,
+                max_tokens: effMaxTokens,
             };
             if (s.sendTemperature) body.temperature = s.temperature;
             if (s.stream) {
@@ -1850,14 +2686,14 @@ async function onSend() {
             const override = s.sendTemperature ? { temperature: s.temperature } : {};
             if (s.stream) {
                 contentEl.classList.add('so-streaming');
-                finalText = await callProfileStream(s.profileId, messages, s.maxTokens, override, abortCtl.signal, (full) => {
+                finalText = await callProfileStream(s.profileId, messages, effMaxTokens, override, abortCtl.signal, (full) => {
                     clearTyping();
                     contentEl.textContent = full;
                     scrollToBottom();
                 });
                 contentEl.classList.remove('so-streaming');
             } else {
-                finalText = await callProfile(s.profileId, messages, s.maxTokens, override, abortCtl.signal);
+                finalText = await callProfile(s.profileId, messages, effMaxTokens, override, abortCtl.signal);
                 clearTyping();
                 contentEl.textContent = finalText;
             }
@@ -1865,7 +2701,12 @@ async function onSend() {
 
         clearTyping();
         if (!finalText) {
-            contentEl.textContent = '(空回复)';
+            // Almost always a token-budget issue: the cap was spent before any
+            // visible text (common with reasoning models, and with long Diagnose
+            // audits). Point the user at the fix instead of a bare "(空回复)".
+            contentEl.textContent = diagnoseMode
+                ? '(空回复) — 审计可能把 token 预算用光了（推理也算在内）。调大设置里的「最大 token 数」，或问得更聚焦一点（比如只审某一类变量）。'
+                : '(空回复) — 多半是「最大 token 数」太小、或被模型思考占满了。到设置里调大它再试。';
             contentEl.classList.add('so-error');
         } else {
             // When a curated preset drives the output AND regex is on, mirror main
@@ -1875,7 +2716,7 @@ async function onSend() {
             // history (clean text for re-feeding — no widget markup looping back).
             // Never for the plain textarea prompt, never in Diagnose mode (which
             // needs the raw <UpdateVariable> block intact).
-            const useOutputRegex = !diagnoseMode && presetCurationActive(s) && s.applyRegex;
+            const useOutputRegex = !diagnoseMode && !lorebookMode && presetCurationActive(s) && s.applyRegex;
             let historyText = finalText;
             if (useOutputRegex) {
                 historyText = applyOutputRegex(finalText, /*forPrompt*/ true);
@@ -1888,10 +2729,14 @@ async function onSend() {
                     contentEl.textContent = finalText;
                 }
             }
-            convo.push({ role: 'assistant', content: historyText });
+            aEntry.content = historyText;
+            convo.push(aEntry);
             if (diagnoseMode) {
                 const block = extractUpdateBlock(finalText);
                 if (block) addApplyControls(assistantEl, block);
+            } else if (lorebookMode) {
+                const parsed = parseLorebookBlocks(finalText);
+                if (parsed.ops.length || parsed.errors.length) addLorebookApplyControls(assistantEl, parsed);
             }
         }
     } catch (err) {
@@ -2122,17 +2967,34 @@ async function copyTextRobust(text) {
     }
 }
 
-function addMessage(role, content) {
+function addMessage(role, content, entry) {
+    const empty = messagesEl.querySelector('.so-empty');
+    if (empty) empty.remove();
+
     const wrap = document.createElement('div');
     wrap.className = `so-msg so-${role}`;
+    if (entry) wrap.dataset.cid = entry.id;
     const icon = role === 'user' ? 'fa-user' : 'fa-moon';
     const label = role === 'user' ? '你' : '神谕';
+
     const copyBtn = role === 'assistant'
-        ? `<button class="so-copy-btn" type="button" title="复制" aria-label="复制此回复"><i class="fa-solid fa-copy"></i></button>`
+        ? `<button class="so-msg-btn so-copy-btn" type="button" title="复制" aria-label="复制此回复"><i class="fa-solid fa-copy"></i></button>`
         : '';
+    // Per-message actions (shown on hover): edit (user) / regenerate (assistant) + delete.
+    let actionBtns = '';
+    if (entry) {
+        if (role === 'user') {
+            actionBtns += `<button class="so-msg-btn so-edit-btn" type="button" title="编辑并重新生成"><i class="fa-solid fa-pen"></i></button>`;
+        } else {
+            actionBtns += `<button class="so-msg-btn so-regen-btn" type="button" title="重新生成（会丢弃其后的内容）"><i class="fa-solid fa-rotate"></i></button>`;
+        }
+        actionBtns += `<button class="so-msg-btn so-del-btn" type="button" title="删除"><i class="fa-solid fa-trash"></i></button>`;
+    }
+
     wrap.innerHTML =
         `<div class="so-avatar"><i class="fa-solid ${icon}"></i></div>` +
-        `<div class="so-bubble"><div class="so-role"><span class="so-role-label">${label}</span>${copyBtn}</div><div class="so-content"></div></div>`;
+        `<div class="so-bubble"><div class="so-role"><span class="so-role-label">${label}</span>` +
+        `<span class="so-actions">${copyBtn}${actionBtns}</span></div><div class="so-content"></div></div>`;
     const contentEl = wrap.querySelector('.so-content');
     contentEl.textContent = content;
 
@@ -2150,10 +3012,105 @@ function addMessage(role, content) {
             }, 1200);
         });
     }
+    if (entry) {
+        const editBtn = wrap.querySelector('.so-edit-btn');
+        if (editBtn) editBtn.addEventListener('click', () => editUserMessage(entry));
+        const regenBtn = wrap.querySelector('.so-regen-btn');
+        if (regenBtn) regenBtn.addEventListener('click', () => regenerateFrom(entry));
+        const delBtn = wrap.querySelector('.so-del-btn');
+        if (delBtn) delBtn.addEventListener('click', () => deleteMessage(entry));
+    }
 
     messagesEl.appendChild(wrap);
     scrollToBottom();
     return wrap;
+}
+
+// Re-show the empty placeholder if no real messages remain.
+function maybeRenderEmpty() {
+    if (!messagesEl.querySelector('.so-msg')) { messagesEl.innerHTML = ''; renderEmptyState(); }
+}
+
+// Delete one message. Deleting a user turn also drops its immediate assistant
+// reply so the history stays well-formed; an error bubble (never pushed to convo)
+// just drops from the DOM.
+function deleteMessage(entry) {
+    if (isGenerating) return;
+    const i = convo.indexOf(entry);
+    if (i === -1) {
+        if (entry && entry._el) entry._el.remove();
+        maybeRenderEmpty();
+        return;
+    }
+    if (entry.role === 'user' && convo[i + 1] && convo[i + 1].role === 'assistant') {
+        const reply = convo[i + 1];
+        if (reply._el) reply._el.remove();
+        convo.splice(i, 2);
+    } else {
+        convo.splice(i, 1);
+    }
+    if (entry._el) entry._el.remove();
+    maybeRenderEmpty();
+}
+
+// Regenerate an assistant reply: drop it (and everything after) and re-run from
+// the preceding user turn. The common case (the most recent reply) leaves nothing
+// after it, so this is just "re-roll the last answer".
+async function regenerateFrom(entry) {
+    if (isGenerating) return;
+    const el = entry._el;
+    const i = convo.indexOf(entry);
+    if (i !== -1) convo.splice(i);     // drop this entry and all after (error bubbles aren't in convo)
+    if (el) { while (el.nextSibling) el.nextSibling.remove(); el.remove(); }
+    if (!convo.length || convo[convo.length - 1].role !== 'user') { maybeRenderEmpty(); return; }
+    await generateReply();
+}
+
+// Inline-edit a user message, then truncate everything after it and regenerate.
+function editUserMessage(entry) {
+    if (isGenerating) return;
+    const el = entry._el;
+    if (!el) return;
+    const bubble = el.querySelector('.so-bubble');
+    const contentEl = bubble.querySelector('.so-content');
+    if (bubble.querySelector('.so-edit-box')) return; // already editing
+
+    const box = document.createElement('div');
+    box.className = 'so-edit-box';
+    const ta = document.createElement('textarea');
+    ta.className = 'so-edit-ta';
+    ta.value = entry.content;
+    ta.rows = Math.min(12, Math.max(2, entry.content.split('\n').length));
+    const actions = document.createElement('div');
+    actions.className = 'so-edit-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'so-edit-save'; saveBtn.textContent = '保存并重新生成';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'so-edit-cancel'; cancelBtn.textContent = '取消';
+    actions.appendChild(saveBtn); actions.appendChild(cancelBtn);
+    box.appendChild(ta); box.appendChild(actions);
+    contentEl.style.display = 'none';
+    bubble.appendChild(box);
+    ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+
+    const close = () => { box.remove(); contentEl.style.display = ''; };
+    cancelBtn.addEventListener('click', close);
+    const commit = async () => {
+        const newText = ta.value.trim();
+        const i = convo.indexOf(entry);
+        if (!newText || i === -1) { close(); return; }
+        entry.content = newText;
+        contentEl.textContent = newText;
+        convo.splice(i + 1);                                   // drop later turns
+        close();
+        while (el.nextSibling) el.nextSibling.remove();        // drop their DOM
+        await generateReply();
+    };
+    saveBtn.addEventListener('click', commit);
+    ta.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+        else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); commit(); }
+    });
 }
 
 // Apply / Undo bar appended to a diagnose reply that contains a corrective patch.
@@ -2205,6 +3162,104 @@ function addApplyControls(assistantEl, patchBlock) {
     });
 }
 
+// Apply / Undo bar appended to a lorebook reply that contains a <LorebookEdit>
+// block. Mirrors addApplyControls, but writes through saveWorldInfo and snapshots
+// every touched book for a one-click revert.
+function addLorebookApplyControls(assistantEl, parsed) {
+    const ops = (parsed && parsed.ops) || [];
+    const errors = (parsed && parsed.errors) || [];
+    const bubble = assistantEl.querySelector('.so-bubble');
+
+    const bar = document.createElement('div');
+    bar.className = 'so-apply-bar';
+    const btn = document.createElement('button');
+    btn.className = 'so-apply-btn';
+    btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> 将改动应用到世界书';
+    const status = document.createElement('span');
+    status.className = 'so-apply-status';
+    bar.appendChild(btn);
+    bar.appendChild(status);
+    bubble.appendChild(bar);
+
+    // Per-op outcomes, rendered after Apply.
+    const resultsEl = document.createElement('div');
+    resultsEl.className = 'so-lb-results';
+    bubble.appendChild(resultsEl);
+
+    // Surface any blocks we couldn't parse — never silently drop them.
+    if (errors.length) {
+        const e = document.createElement('div');
+        e.className = 'so-lb-parse-errors so-hint-error';
+        e.textContent = `另有 ${errors.length} 处改动无法解析（已忽略）：` + errors.map((x) => x.error).join('；');
+        bubble.appendChild(e);
+    }
+
+    if (!ops.length) {
+        btn.disabled = true;
+        status.classList.add('so-hint-error');
+        status.textContent = errors.length
+            ? '这次的改动没能解析出来。让我「把刚才的改动严格按格式重发一次」即可，或把改动拆小一点再试。'
+            : '没有检测到可应用的改动。';
+        scrollToBottom();
+        return;
+    }
+
+    status.textContent = `待应用：${lbSummaryOf(ops)}`;
+    scrollToBottom();
+
+    const renderResults = (results) => {
+        resultsEl.innerHTML = '';
+        for (const r of results) {
+            const line = document.createElement('div');
+            line.className = 'so-lb-result ' + (r.ok ? 'so-lb-ok' : 'so-lb-skip');
+            line.textContent = (r.ok ? '✓ ' : '⤫ ') + r.label + (r.ok ? '' : `（跳过：${r.reason}）`);
+            resultsEl.appendChild(line);
+        }
+    };
+
+    let snapshots = null;
+    btn.addEventListener('click', async () => {
+        status.classList.remove('so-hint-error');
+        if (snapshots) {
+            // currently applied -> undo
+            btn.disabled = true;
+            status.textContent = '正在还原…';
+            try {
+                await undoLorebookOps(snapshots);
+                snapshots = null;
+                resultsEl.innerHTML = '';
+                btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> 将改动应用到世界书';
+                status.textContent = `已还原。待应用：${lbSummaryOf(ops)}`;
+            } catch (e) {
+                status.textContent = '还原失败：' + (e?.message || e);
+                status.classList.add('so-hint-error');
+            }
+            btn.disabled = false;
+            return;
+        }
+        btn.disabled = true;
+        status.textContent = '正在应用…';
+        try {
+            const res = await applyLorebookOps(ops);
+            renderResults(res.results);
+            if (res.applied > 0) {
+                snapshots = res.snapshots;
+                btn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> 撤销';
+                status.textContent = `已应用：${res.summary}。世界书已保存。`;
+            } else {
+                snapshots = null;
+                status.textContent = '没有任何改动被应用（全部跳过，见下方原因）。';
+                status.classList.add('so-hint-error');
+            }
+        } catch (e) {
+            status.textContent = '应用失败：' + (e?.message || e);
+            status.classList.add('so-hint-error');
+        }
+        btn.disabled = false;
+        scrollToBottom();
+    });
+}
+
 // Typing-dots indicator placed inside an assistant bubble until the first token.
 function showTyping(contentEl) {
     const dots = document.createElement('span');
@@ -2251,44 +3306,95 @@ function scrollToBottom() {
 /* ------------------------------------------------------------------ *
  * Window dragging + resize persistence
  * ------------------------------------------------------------------ */
+// Clamp the window into the viewport on first open, sized so it always fits the
+// screen (so phones never get a window wider/taller than the display). On a small
+// screen with no saved position, drop it near the top, horizontally centered.
+function applyInitialGeometry(s) {
+    const margin = 8;
+    const w = Math.max(300, Math.min(s.winWidth || 380, window.innerWidth - margin * 2));
+    const h = Math.max(320, Math.min(s.winHeight || 540, window.innerHeight - margin * 2));
+    win.style.width = `${w}px`;
+    win.style.height = `${h}px`;
+    if (s.winLeft != null && s.winTop != null) {
+        win.style.left = `${Math.max(0, Math.min(window.innerWidth - 60, s.winLeft))}px`;
+        win.style.top = `${Math.max(0, Math.min(window.innerHeight - 40, s.winTop))}px`;
+        win.style.right = 'auto';
+    } else if (window.innerWidth < 600) {
+        win.style.left = `${Math.max(margin, Math.round((window.innerWidth - w) / 2))}px`;
+        win.style.top = '56px';
+        win.style.right = 'auto';
+    } // else: desktop keeps the CSS default (top:70px right:20px)
+}
+
+// Drag the window by its header. Pointer events cover mouse + touch + pen in one
+// path; pointer capture keeps tracking even when the finger leaves the header.
 function makeDraggable(panel, handle) {
-    let sx, sy, sl, st, dragging = false;
-    handle.addEventListener('mousedown', (e) => {
-        if (e.target.closest('.so-iconbtn')) return;
-        dragging = true;
+    let sx, sy, sl, st, pid = null;
+    handle.style.touchAction = 'none';   // stop the page scrolling under a drag
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button') || e.target.closest('.so-iconbtn')) return; // let buttons tap
+        if (e.button != null && e.button > 0) return;       // primary / touch only
+        pid = e.pointerId;
         const r = panel.getBoundingClientRect();
         sx = e.clientX; sy = e.clientY; sl = r.left; st = r.top;
         panel.style.right = 'auto';
         document.body.style.userSelect = 'none';
+        try { handle.setPointerCapture(pid); } catch (_) { /* ignore */ }
     });
-    window.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
+    handle.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== pid) return;
         const nl = Math.max(0, Math.min(window.innerWidth - 60, sl + e.clientX - sx));
         const nt = Math.max(0, Math.min(window.innerHeight - 40, st + e.clientY - sy));
         panel.style.left = `${nl}px`;
         panel.style.top = `${nt}px`;
     });
-    window.addEventListener('mouseup', () => {
-        if (!dragging) return;
-        dragging = false;
+    const end = (e) => {
+        if (pid == null || (e && e.pointerId !== pid)) return;
+        try { handle.releasePointerCapture(pid); } catch (_) { /* ignore */ }
+        pid = null;
         document.body.style.userSelect = '';
         const s = getSettings();
         s.winLeft = parseInt(panel.style.left, 10);
         s.winTop = parseInt(panel.style.top, 10);
         save();
-    });
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
 }
 
-function observeResize() {
-    let t;
-    const ro = new ResizeObserver(() => {
-        clearTimeout(t);
-        t = setTimeout(() => {
-            const s = getSettings();
-            s.winWidth = win.offsetWidth;
-            s.winHeight = win.offsetHeight;
-            save();
-        }, 400);
+// Resize the window by dragging the bottom-right grip — same pointer-capture
+// approach, so it works with a finger. Clamped to the viewport so the size we
+// store never exceeds the screen.
+function makeResizable(panel, grip) {
+    if (!grip) return;
+    let sx, sy, sw, sh, left, top, pid = null;
+    grip.addEventListener('pointerdown', (e) => {
+        if (e.button != null && e.button > 0) return;
+        pid = e.pointerId;
+        const r = panel.getBoundingClientRect();
+        sx = e.clientX; sy = e.clientY; sw = r.width; sh = r.height; left = r.left; top = r.top;
+        document.body.style.userSelect = 'none';
+        try { grip.setPointerCapture(pid); } catch (_) { /* ignore */ }
+        e.preventDefault();
     });
-    ro.observe(win);
+    grip.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== pid) return;
+        const minW = 300, minH = 320;
+        const maxW = Math.max(minW, window.innerWidth - left - 6);
+        const maxH = Math.max(minH, window.innerHeight - top - 6);
+        panel.style.width = `${Math.max(minW, Math.min(maxW, sw + e.clientX - sx))}px`;
+        panel.style.height = `${Math.max(minH, Math.min(maxH, sh + e.clientY - sy))}px`;
+    });
+    const end = (e) => {
+        if (pid == null || (e && e.pointerId !== pid)) return;
+        try { grip.releasePointerCapture(pid); } catch (_) { /* ignore */ }
+        pid = null;
+        document.body.style.userSelect = '';
+        const s = getSettings();
+        s.winWidth = panel.offsetWidth;
+        s.winHeight = panel.offsetHeight;
+        save();
+    };
+    grip.addEventListener('pointerup', end);
+    grip.addEventListener('pointercancel', end);
 }
