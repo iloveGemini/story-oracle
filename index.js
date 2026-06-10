@@ -2432,6 +2432,20 @@ function buildTranscript(ctx, s) {
     return buildTranscriptTurns(ctx, s).map((l) => `${l.name}: ${l.text}`).join('\n\n');
 }
 
+// v1.13.4 修复：用户预设里常带「每条回复末尾必须输出 <UpdateVariable>」的输出
+// 契约（MVU 卡），忠实组装会让神谕也继承它——于是神谕的回复尾巴上挂出一个对
+// 主聊天毫无意义的机制区块（"Variables remain unchanged"之类）。主聊天里这
+// 些区块由 MVU 自己的管线消化隐藏，神谕没有那条管线，所以原样可见，还会写进
+// 神谕历史让后续回合越锁越死。普通聊天模式下从显示与历史两头剥掉它；诊断模
+// 式绝不剥（读这些区块正是诊断的本职），世界书模式不动（不在该症状路径上）。
+function stripMechanismBlocks(text) {
+    let out = String(text || '');
+    out = out.replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '');
+    // 被截断、没闭合的尾部区块也剥掉（开标签一路到结尾）。
+    out = out.replace(/<UpdateVariable>[\s\S]*$/i, '');
+    return out.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // Run a finished Oracle reply through the enabled AI_OUTPUT regex.
 //   forPrompt=true  -> prompt stage (what ST feeds back into context); used for
 //                      the copy stored in history, so the Oracle doesn't
@@ -2744,6 +2758,21 @@ async function generateReply() {
                 : '(空回复) — 多半是「最大 token 数」太小、或被模型思考占满了。到设置里调大它再试。';
             contentEl.classList.add('so-error');
         } else {
+            // Strip main-chat mechanism blocks (<UpdateVariable>) the preset's
+            // output contract may have coaxed out of the model — display AND
+            // history, normal chat mode only (see stripMechanismBlocks).
+            const mechStrip = !diagnoseMode && !lorebookMode;
+            let cleanText = finalText;
+            if (mechStrip) {
+                cleanText = stripMechanismBlocks(finalText);
+                if (!cleanText) {
+                    // The whole reply was mechanism block(s) — show why instead
+                    // of a blank bubble, and keep history non-empty (some APIs
+                    // reject empty message content on the next turn).
+                    cleanText = '（这条回复只包含主聊天的机制区块（如 <UpdateVariable>），已自动隐藏。）';
+                }
+                if (cleanText !== finalText) contentEl.textContent = cleanText;
+            }
             // When a curated preset drives the output AND regex is on, mirror main
             // chat: RENDER the reply through ST's own formatter (so display-stage
             // regex, markdown, and HTML/CSS widgets actually render instead of
@@ -2752,16 +2781,16 @@ async function generateReply() {
             // Never for the plain textarea prompt, never in Diagnose mode (which
             // needs the raw <UpdateVariable> block intact).
             const useOutputRegex = !diagnoseMode && !lorebookMode && presetCurationActive(s) && s.applyRegex;
-            let historyText = finalText;
+            let historyText = cleanText;
             if (useOutputRegex) {
-                historyText = applyOutputRegex(finalText, /*forPrompt*/ true);
-                const html = renderReplyHtml(finalText);
+                historyText = applyOutputRegex(cleanText, /*forPrompt*/ true);
+                const html = renderReplyHtml(cleanText);
                 if (html != null) {
                     contentEl.innerHTML = html;
                     contentEl.classList.add('so-rendered');
                     contentEl.style.whiteSpace = 'normal';
                 } else {
-                    contentEl.textContent = finalText;
+                    contentEl.textContent = cleanText;
                 }
             }
             aEntry.content = historyText;
