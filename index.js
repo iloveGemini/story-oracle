@@ -330,6 +330,10 @@ const defaults = {
     personaId: 'plain',        // 说话人格皮肤；见 PERSONAS。普通 = 不叠加任何皮肤
     contextDepth: 30,          // last N non-system messages; -1 = entire chat; 0 = none
     includeCard: true,
+    // 普通模式附带 MVU 实时变量状态（stat_data）。这是数值问题的唯一权威来源：
+    // 没有它，模型会从剧情里的状态栏残影 / 自身想象中自信地编出数值（v1.14.6）。
+    // 大状态卡 + 频繁提问会吃 token，可在设置里关掉（关掉后会改为如实拒答数值）。
+    chatIncludeStat: true,
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
     worldInfoMode: 'off',      // 'off' | 'st' (constant + keyword) | 'all' (every entry)
     sendTemperature: true,     // include temperature in the request (some models reject it)
@@ -397,6 +401,7 @@ let lbBookNames = [];       // names of the books included in the current contex
 let advisorMode = false;
 let advStatData = '';       // stringified current MVU stat_data for advisor sends
                             // (computed fresh in generateReply, '' when no MVU)
+let chatStatData = '';      // same, for NORMAL mode (gated by s.chatIncludeStat)
 let planBarEl = null;       // the ONE plan strip element — lives inside the window
                             // OR reparented into the floating container (never both)
 let planFloat = null;       // floating container shown when window closed + plan active
@@ -1466,6 +1471,7 @@ function buildWindow() {
                 <input id="so-adv-depth" type="number" step="1" min="0">
             </label>
             <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
+            <label class="so-check"><input id="so-stat" type="checkbox"><span>附带变量状态（MVU stat_data，普通模式）—— 数值问题的权威来源；关掉则如实拒答数值</span></label>
             <label class="so-check"><input id="so-regex" type="checkbox"><span>应用剧情正则（剥离思维链 / 状态栏、使用总结）—— 与主聊天保持一致</span></label>
 
             <label class="so-row"><span>世界书 / 知识库</span>
@@ -1696,6 +1702,7 @@ function bindControls() {
     // otherwise the setting silently applies only on the next chat switch.
     win.querySelector('#so-adv-depth').addEventListener('input', () => applyPlanInjection());
     bind('#so-card', 'includeCard');
+    bind('#so-stat', 'chatIncludeStat');
     bind('#so-regex', 'applyRegex');
     bind('#so-wi', 'worldInfoMode');
     bind('#so-sendtemp', 'sendTemperature');
@@ -1741,6 +1748,7 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-depth').value = s.contextDepth;
     win.querySelector('#so-adv-depth').value = s.advisorDepth;
     win.querySelector('#so-card').checked = !!s.includeCard;
+    win.querySelector('#so-stat').checked = !!s.chatIncludeStat;
     win.querySelector('#so-regex').checked = !!s.applyRegex;
     win.querySelector('#so-wi').value = s.worldInfoMode;
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
@@ -2845,6 +2853,8 @@ function buildSystemPrompt() {
         parts.push('=== 世界书 / 设定 ===\n' + worldInfoBlock);
     }
 
+    parts.push(buildChatStatSection());
+
     const transcript = buildTranscript(ctx, s);
     if (transcript) {
         parts.push('=== 故事对话记录（最新的在最后）===\n' + transcript);
@@ -2852,6 +2862,18 @@ function buildSystemPrompt() {
 
     const full = parts.filter(Boolean).join('\n\n');
     try { return ctx.substituteParams(full); } catch (e) { return full; }
+}
+
+// 普通模式的变量数值纪律（v1.14.6）。两种姿态、绝无中间态：
+// 有权威状态 -> 给全量数值 + 「剧情里的旧数值一律以此为准」（状态栏残影免疫）；
+// 无权威状态 -> 明令如实拒答具体数值。LLM 被问数值时默认编一个像样的，
+// 这一段就是把「编」这条路堵死。
+function buildChatStatSection() {
+    if (chatStatData) {
+        return '=== 当前变量状态（stat_data —— 唯一权威数值）===\n' + chatStatData +
+            '\n（用户问数值时以上方为准；剧情文字 / 状态栏里出现的任何数值都可能是旧的，一律不要采信。）';
+    }
+    return '（注意：你看不到实时变量数值（好感度、金钱等状态数据）。用户问具体数值时，如实说明无法查看精确数值，建议用诊断或剧情参谋模式查询；可以根据剧情做定性判断（关系变暖 / 资源吃紧），但绝不要编造具体数字。）';
 }
 
 function buildDiagnosePrompt(ctx, s) {
@@ -3114,6 +3136,9 @@ function expandMarker(out, identifier, ctx, s) {
             pushMsg(out, 'system', subst(ctx, card.mesExamples || ''));
             break;
         case 'chatHistory': {
+            // Authoritative variable state (or the honest-refusal caveat) rides
+            // just ahead of the story context — same discipline as plain mode.
+            pushMsg(out, 'system', buildChatStatSection());
             // Story context first, then the Oracle's own Q&A — as real turns.
             for (const t of buildTranscriptTurns(ctx, s)) {
                 pushMsg(out, t.role, t.text);
@@ -3300,6 +3325,14 @@ async function generateReply() {
         worldInfoBlock = ''; // legacy single-block path unused while preset is active
     } else {
         worldInfoBlock = await buildWorldInfo(); // empty string when mode is 'off'
+    }
+
+    // Normal chat mode only: fetch the authoritative variable state (or leave ''
+    // so the prompt builders emit the honest-refusal caveat instead).
+    chatStatData = '';
+    if (!diagnoseMode && !lorebookMode && !advisorMode && s.chatIncludeStat) {
+        const st = await getMvuStatData();
+        chatStatData = st ? JSON.stringify(st, null, 2) : '';
     }
 
     const messages = buildMessages();
