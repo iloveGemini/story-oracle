@@ -895,3 +895,277 @@
     background: color-mix(in srgb, var(--so-accent) 22%, transparent);
 }
 #so-sysprompt-preset-recurate { flex: 0 0 auto; width: 32px; height: 32px; }
+
+/* ---------- advisor mode (剧情参谋, experimental) ---------- */
+/* A cool teal tint distinguishes advisor mode from diagnose (theme accent) and
+ * lorebook (parchment gold) at a glance, while still blending with the theme. */
+#so-window { --so-adv-accent: color-mix(in srgb, var(--so-accent) 45%, #4fb0a5 55%); }
+
+#so-advisor-btn.so-adv-active {
+    color: var(--so-adv-accent);
+    background-color: color-mix(in srgb, var(--so-adv-accent) 16%, transparent);
+    opacity: 1;
+}
+
+#so-adv-pill {
+    display: none;
+    margin-left: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 0.6em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    vertical-align: middle;
+    color: #fff;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-adv-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-adv-accent) 78%, black 6%));
+}
+#so-window.so-adv-on #so-adv-pill { display: inline-block; }
+
+#so-window.so-adv-on #so-header {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--so-adv-accent) 22%, transparent),
+        transparent);
+}
+
+#so-adv-bar {
+    display: none;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    background: color-mix(in srgb, var(--so-adv-accent) 7%, transparent);
+}
+#so-window.so-adv-on #so-adv-bar { display: flex; }
+#so-window.so-settings-open #so-adv-bar { display: none; }
+
+.so-adv-check {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    cursor: pointer;
+    font-size: 0.82em;
+    opacity: 0.8;
+}
+.so-adv-check:hover { opacity: 1; }
+.so-adv-preset-warn { line-height: 1.45; }
+
+/* ---------- active plan strip (visible in EVERY mode while a plan steers) ---------- */
+#so-plan-bar {
+    display: none;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 12px;
+    border-bottom: 1px solid color-mix(in srgb, var(--so-adv-accent) 45%, transparent);
+    background: color-mix(in srgb, var(--so-adv-accent) 10%, transparent);
+}
+#so-window.so-plan-on #so-plan-bar { display: flex; }
+#so-window.so-settings-open #so-plan-bar { display: none; }
+
+.so-plan-head {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    min-width: 0;
+}
+.so-plan-icon { color: var(--so-adv-accent); flex: 0 0 auto; align-self: center; }
+.so-plan-label {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 0.62em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: #fff;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-adv-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-adv-accent) 78%, black 6%));
+}
+#so-plan-goal {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 0.85em;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.so-plan-intensity { display: flex; gap: 4px; flex-wrap: wrap; }
+.so-plan-int {
+    cursor: pointer;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-family: inherit;
+    font-size: 0.78em;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    transition: filter 0.15s;
+}
+.so-plan-int:hover { filter: brightness(1.15); }
+.so-plan-int.active {
+    color: #fff;
+    border-color: transparent;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-adv-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-adv-accent) 78%, black 6%));
+}
+
+.so-plan-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.so-plan-spacer { flex: 1 1 auto; }
+.so-plan-mini {
+    cursor: pointer;
+    padding: 3px 9px;
+    border-radius: 7px;
+    font-family: inherit;
+    font-size: 0.76em;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+}
+.so-plan-mini:hover { filter: brightness(1.15); }
+.so-plan-done { border-color: color-mix(in srgb, var(--so-adv-accent) 60%, transparent); }
+.so-plan-drop { border-color: color-mix(in srgb, var(--crimson70a, #e07c7c) 60%, transparent); }
+
+#so-plan-directive {
+    display: none;
+    margin: 2px 0 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 0.74em;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.35));
+    border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    max-height: 180px;
+    overflow-y: auto;
+}
+#so-plan-directive.open { display: block; }
+
+/* ---------- plan adopt cards (under an advisor reply) ---------- */
+.so-plan-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+}
+.so-plan-card {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 9px 11px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--so-adv-accent) 40%, transparent);
+    background: color-mix(in srgb, var(--so-adv-accent) 8%, transparent);
+}
+.so-plan-card.so-plan-adopted {
+    border-color: var(--so-adv-accent);
+    box-shadow: 0 0 0 1px var(--so-adv-accent) inset;
+}
+.so-plan-card .so-apply-btn {
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-adv-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-adv-accent) 78%, black 6%));
+    box-shadow: 0 3px 10px -3px color-mix(in srgb, var(--so-adv-accent) 60%, transparent);
+}
+.so-plan-card-title { font-size: 0.9em; font-weight: 600; line-height: 1.4; }
+.so-plan-card-line { font-size: 0.82em; line-height: 1.5; overflow-wrap: anywhere; }
+.so-plan-card-dim { opacity: 0.72; }
+.so-plan-card-caption { line-height: 1.4; }
+.so-plan-card-actions { display: flex; margin-top: 2px; }
+
+/* ---------- bridge chip (chat-mode discussion -> advisor plans) ---------- */
+.so-bridge { padding-top: 0; }
+.so-bridge-chip {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 13px;
+    border-radius: 999px;
+    font-family: inherit;
+    font-size: 0.95em;
+    color: #fff;
+    border: 1px solid transparent;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--so-adv-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-adv-accent) 78%, black 6%));
+    box-shadow: 0 3px 10px -3px color-mix(in srgb, var(--so-adv-accent) 60%, transparent);
+    transition: filter 0.15s, transform 0.1s;
+}
+.so-bridge-chip:hover { filter: brightness(1.08); }
+.so-bridge-chip:active { transform: scale(0.96); }
+
+/* ---------- floating plan strip (window closed, plan still steering) ---------- */
+#so-plan-float {
+    /* the accent vars are scoped to #so-window — re-declare for the float */
+    --so-accent: var(--SmartThemeQuoteColor, #8ab4f8);
+    --so-adv-accent: color-mix(in srgb, var(--so-accent) 45%, #4fb0a5 55%);
+
+    position: fixed;
+    top: 64px;
+    right: 12px;
+    z-index: 2999;
+    display: none;
+    flex-direction: column;
+    width: min(420px, calc(100vw - 16px));
+    overflow: hidden;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    font-size: calc(var(--mainFontSize, 15px) * 0.95);
+    border: 1px solid color-mix(in srgb, var(--so-adv-accent) 50%, transparent);
+    border-radius: 12px;
+    background: var(--SmartThemeBlurTintColor, rgba(22, 24, 28, 0.96));
+    box-shadow: 0 10px 28px -10px rgba(0, 0, 0, 0.6),
+        0 0 0 1px color-mix(in srgb, var(--so-adv-accent) 12%, transparent) inset;
+}
+
+#so-plan-float-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    cursor: grab;
+    user-select: none;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--so-adv-accent) 20%, transparent),
+        transparent);
+}
+#so-plan-float-head:active { cursor: grabbing; }
+#so-plan-float-head .fa-compass { color: var(--so-adv-accent); }
+.so-plan-float-title { font-weight: 600; font-size: 0.88em; letter-spacing: 0.04em; }
+#so-plan-float-open {
+    cursor: pointer;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    opacity: 0.75;
+}
+#so-plan-float-open:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
+
+/* the strip's in-window display rule is scoped to #so-window — float version */
+#so-plan-float #so-plan-bar { display: flex; border-bottom: none; }
+
+/* ---------- collapsed float: tiny 「🧭 引导中」 pill ---------- */
+#so-plan-float.so-collapsed {
+    width: auto;
+    border-radius: 999px;
+}
+#so-plan-float.so-collapsed #so-plan-float-slot { display: none; }
+#so-plan-float.so-collapsed #so-plan-float-head {
+    border-bottom: none;
+    border-radius: 999px;
+    padding: 5px 8px 5px 11px;
+}
+#so-plan-float.so-collapsed .so-plan-float-title { font-size: 0.8em; }
+/* keep the pill minimal: expand first, then open the oracle from the full head */
+#so-plan-float.so-collapsed #so-plan-float-open { display: none; }

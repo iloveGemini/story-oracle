@@ -146,13 +146,64 @@ uid: 7
 `;
 
 /* ------------------------------------------------------------------ *
+ * 剧情参谋（Story Advisor）—— 实验性。
+ *
+ * 戏外的剧情顾问：通读整段故事，与用户一起构思接下来的走向；当提出可落地的
+ * 具体方案时，以 <StoryPlan> 区块输出，面板将其渲染为可一键「开始引导」的卡片。
+ * 采用后，方案会作为幕后指令注入主聊天的提示词（setExtensionPrompt），
+ * 悄悄引导主线 AI ——详见下方 plan 机制一节。
+ * ------------------------------------------------------------------ */
+const ADVISOR_SYSTEM_PROMPT =
+`你是「故事神谕」的剧情参谋——一个为正在进行的角色扮演/故事服务的"戏外"剧情顾问。
+下方提供了完整的故事上下文（角色信息、世界观设定与整段对话记录）。你的工作是帮用户构思"接下来可以怎么走"：找出沉睡的伏笔、未兑现的线索、人物弧光的下一步，提出真正贴合这个故事的剧情走向。
+
+职责：
+- 与用户讨论剧情方向时，先基于已有剧情给出有据可依的分析（哪些线索可以回收、哪些关系到了转折点），再提出建议。绝不凭空编造文中没有的设定或事件。
+- 若上下文里带有「当前变量状态」，把这些数值当作剧情的【硬事实】：方案必须与现状自洽（好感度、金钱、时间、地点、状态标记等），可以利用数值制造张力（差一点到阈值、资源见底），但绝不能与之矛盾。
+- 当讨论收敛到一个或几个【可落地的具体走向】时，在回复末尾用 <StoryPlan> 区块把它们正式列出来（通常 1~3 个），供用户一键采用。每个区块独立、格式如下：
+
+<StoryPlan>
+title: 方案的短标题（4~10 字）
+goal: 一句话写明故事应当走向的【结果】（这句话会被原样注入主聊天作为引导目标，务必写成结果式、单句、不含台词或分步脚本，例如"青璃的旧门派幸存者在暗中开始跟踪她"）
+seed: 这个走向最初显露的迹象（一个具体、轻巧的画面或细节）
+why: 为什么贴合当前故事（呼应了哪条伏笔 / 哪段关系）
+</StoryPlan>
+
+- goal 是整个机制的核心：它必须是【单句、结果式、可执行】的——不写过程、不写台词、不写"先…然后…"。写不成一句话，说明方案还没想清楚，先继续和用户讨论。
+- 只在用户确实想要具体方案时才输出 <StoryPlan> 区块；纯讨论、闲聊、分析现状时不要输出任何区块。
+- 如果上下文里带有「当前已采用的引导方案」，说明主聊天正被它引导。用户问起进度时（例如"检查进度"），请对照最近的剧情如实评估：铺垫是否已出现、推进到了哪一步、强度是否合适、是否可以完成或该调整方向。
+- 全程使用简体中文作答。除非用户要求展开，否则保持简明。`;
+
+// 强度三档：label 用于按钮、caption 用于界面说明、directive 拼进注入指令。
+// label 即指令的浓缩版——界面承诺与注入现实保持一致。
+const ADVISOR_INTENSITIES = {
+    seed: {
+        label: '只铺垫',
+        caption: '只埋伏笔与暗示，暂不让事件正面发生',
+        directive: '目前只埋伏笔与暗示（异样的细节、巧合、欲言又止），不让事件正面发生，也不揭示任何真相。',
+    },
+    normal: {
+        label: '自然推进',
+        caption: '每个场景向目标靠近一小步，时机成熟时自然引发',
+        directive: '每个场景让事态向目标靠近一小步，铺垫成熟时自然引发，不必拖延也不必急于求成。',
+    },
+    push: {
+        label: '尽快引爆',
+        caption: '在接下来一两个场景内让事件正面发生',
+        directive: '在接下来一至两个场景内让事件正面发生；仍须立足于已有铺垫，使其显得必然而非突兀。',
+    },
+};
+
+/* ------------------------------------------------------------------ *
  * 说话人格（voice personas）。
  *
  * 这些只是叠加在系统提示词之上的"语气皮肤"，不替换它、也不改变神谕的职责。
  * PERSONA_FRAME 一次性声明守则（默认仍是戏外分析者、谈剧情时须准确有据、不杜
  * 撰、不代入剧情角色；但用户只想和人格闲聊时不必拉回剧情；并放开"简明直接"以允
  * 许文采），每个 persona.voice
- * 只需描述说话风格本身。仅在普通模式生效——诊断模式始终保持冷静精确，不套人格。
+ * 只需描述说话风格本身。普通模式直接生效；参谋 / 世界书模式下叠加时会追加
+ * 「职责调整 + 结构保护」（见 PERSONA_MODE_OVERRIDES）——诊断模式始终保持冷
+ * 静精确，不套人格。
  * ------------------------------------------------------------------ */
 const PERSONA_FRAME =
 `=== 表达风格（人格皮肤）===
@@ -203,12 +254,41 @@ const PERSONAS = [
     },
 ];
 
-function buildPersonaBlock(personaId) {
+/* ------------------------------------------------------------------ *
+ * 人格的模式职责调整（v1.14.1）。
+ *
+ * PERSONA_FRAME 把人格的本职定为「戏外的故事分析者」，并明令「不要擅自续写剧
+ * 情」——这在普通模式是保护性的，但与参谋模式（本职就是构思未来剧情）直接冲
+ * 突，也没涵盖世界书管家的职责。不动经过实战检验的 FRAME 本体，改为在对应模
+ * 式下【追加】一段职责调整：只重新指派岗位，人格契约的其余条款（准确、不杜
+ * 撰、对用户知无不言）原样继承。再叠一层结构保护，凌驾于人格之上。
+ * ------------------------------------------------------------------ */
+const PERSONA_MODE_OVERRIDES = {
+    advisor:
+`=== 本次职责调整 ===
+此刻你不是普通的剧情问答分析者，而是【剧情参谋】：与用户一起构思【未来】剧情的走向、提出可落地的方案，正是你此次的本职——为尚未发生的剧情出谋划策不算「擅自续写」，而是用户请你做的事。但依然不替用户在正文中扮演、不直接撰写故事正文；你给的是方向与方案，不是成稿。`,
+    lorebook:
+`=== 本次职责调整 ===
+此刻你的本职是【世界书管家】：帮用户阅读、梳理与修改世界书条目。按用户要求提出改动正是你的工作，不算越界。`,
+};
+
+const PERSONA_STRUCT_GUARD =
+`=== 结构与正文保护（凌驾于人格之上）===
+人格只改变你说话的语气与口吻。以下两点绝不受人格影响：
+① 结构化区块（<LorebookEdit> / <StoryPlan>）的格式与键名必须严格保持、确保机器可读；
+② 写入围栏内的条目正文须沿用该世界书既有的风格与措辞，绝不带入人格腔调——人格属于你，不属于世界书。`;
+
+// mode（可选）：'advisor' | 'lorebook' —— 追加对应的职责调整与结构保护。
+// 不传时与旧行为逐字节一致（普通模式）。
+function buildPersonaBlock(personaId, mode) {
     const p = PERSONAS.find((x) => x.id === personaId);
     if (!p || !p.voice) return '';
     let block = PERSONA_FRAME + '\n' + p.voice;
     if (p.example) {
         block += '\n\n下面是这种腔调的对话示例（仅供学习语气与行文结构，不要照搬其中的具体内容）：\n' + p.example;
+    }
+    if (mode && PERSONA_MODE_OVERRIDES[mode]) {
+        block += '\n\n' + PERSONA_MODE_OVERRIDES[mode] + '\n\n' + PERSONA_STRUCT_GUARD;
     }
     return block;
 }
@@ -218,6 +298,11 @@ function buildPersonaBlock(personaId) {
 // (manual checklist + drag-reorder), and Story Oracle assembles a faithful,
 // role-preserving, marker-aware prompt from that frozen curated copy.
 const ENABLE_SYSPROMPT_PRESET = true;
+
+// 剧情参谋总开关（v1.14.2）：false = 完全隐藏参谋模式——🧭 按钮、注入深度设置
+// 项不显示，注入与方案条、提醒一律停用；代码全部保留。要启用：把它改成 true
+// 即可，无其它步骤。当前关闭：先自测，再放给社区。
+const ENABLE_ADVISOR_MODE = false;
 
 const defaults = {
     mode: 'direct',            // 'direct' | 'profile'
@@ -259,6 +344,18 @@ const defaults = {
     // when the model needs the preset's jailbreak to do the edit. The preset's
     // extra content can pull attention off the editing task.
     lorebookUsePreset: false,
+    // Advisor mode (experimental): depth at which the adopted plan's directive
+    // is injected into the MAIN chat prompt (in-chat, system role). ~4 reads as
+    // "ambient narrative intent" — too shallow railroads, too deep gets buried.
+    advisorDepth: 4,
+    // Whether advisor mode runs THROUGH the curated preset (directive layered on
+    // top, RP markers skipped) — same opt-in pattern as lorebookUsePreset.
+    advisorUsePreset: false,
+    // Floating plan strip position (when the oracle window is closed while a
+    // plan is steering). null = default top-right docking until first drag.
+    planFloatLeft: null,
+    planFloatTop: null,
+    planFloatCollapsed: false,  // float folded down to a tiny 「🧭 引导中」 pill
     // window geometry
     winLeft: null,
     winTop: null,
@@ -293,6 +390,17 @@ let mvuApi = null;          // cached window.Mvu
 let lorebookMode = false;
 let lbContextText = '';     // structured "book -> entries" listing, built in onSend
 let lbBookNames = [];       // names of the books included in the current context
+// Advisor mode state (experimental). The ACTIVE PLAN itself is NOT module state —
+// it lives in per-chat metadata (single source of truth); the injection text is
+// always derived from it at registration time, so clearing the metadata provably
+// kills the steering.
+let advisorMode = false;
+let advStatData = '';       // stringified current MVU stat_data for advisor sends
+                            // (computed fresh in generateReply, '' when no MVU)
+let planBarEl = null;       // the ONE plan strip element — lives inside the window
+                            // OR reparented into the floating container (never both)
+let planFloat = null;       // floating container shown when window closed + plan active
+let planFloatSlot = null;
 // Per-entry selection for a single targeted book: { [bookName]: Set<uid> }.
 // A book absent here (or null) means "send every entry" (the default).
 let lbEntryFilter = {};
@@ -335,6 +443,22 @@ function init() {
     injectWandButton();
     buildWindow();
     loadRegexEngine(); // warm the cache so it's ready by first send
+
+    // Advisor plan lifecycle: re-register (or clear) the injection whenever a
+    // chat loads, and run the staleness check as the main chat grows. These are
+    // the extension's only event listeners — everything else stays pull-based.
+    try {
+        const ctx = getCtx();
+        const et = ctx.eventTypes || ctx.event_types || {};
+        if (ctx.eventSource && typeof ctx.eventSource.on === 'function') {
+            ctx.eventSource.on(et.CHAT_CHANGED || 'chat_id_changed', onChatChanged);
+            ctx.eventSource.on(et.MESSAGE_RECEIVED || 'message_received', checkPlanReminder);
+        }
+    } catch (e) {
+        console.warn('[Story Oracle] event wiring failed (plan injection will only refresh on reload):', e);
+    }
+    // Cover the chat that may already be loaded by the time the extension inits.
+    onChatChanged();
 }
 
 /**
@@ -1001,6 +1125,176 @@ async function undoLorebookOps(snapshots) {
 /* ------------------------------------------------------------------ *
  * MVU (MagVarUpdate via JS-Slash-Runner) integration for Diagnose mode
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * 剧情参谋 plan 机制（实验性）。
+ *
+ * 单一目标方案，存于【当前聊天】的 chatMetadata（随聊天持久化、随聊天切换）。
+ * 注入文本永远在注册那一刻从 metadata 现场推导（buildDirective），绝不另存——
+ * 因此「清掉 metadata + 重新注册」就能确凿地终止引导，不存在第二份真相。
+ * setExtensionPrompt 是全局的，所以切到没有方案的聊天时必须用空串清掉它
+ * （applyPlanInjection 对 plan == null 正是这么做的）。
+ * ------------------------------------------------------------------ */
+const ADVISOR_PROMPT_KEY = 'story_oracle_plan';
+const ADVISOR_REMIND_AFTER = 20;   // 主聊天走过这么多条消息后，提醒一次方案仍在引导
+const PLAN_META_KEY = MODULE + '_plan';
+
+function getChatMetadataSafe() {
+    try {
+        const md = getCtx().chatMetadata;
+        return (md && typeof md === 'object') ? md : null;
+    } catch (e) { return null; }
+}
+
+// The active plan for the CURRENT chat, or null.
+// Shape: { goal, seed, why, title, intensity, adoptedAt, reminded }
+function getPlan() {
+    const md = getChatMetadataSafe();
+    const p = md ? md[PLAN_META_KEY] : null;
+    return (p && typeof p === 'object' && p.goal) ? p : null;
+}
+
+function setPlan(plan) {
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    if (plan) md[PLAN_META_KEY] = plan;
+    else delete md[PLAN_META_KEY];
+    try {
+        const ctx = getCtx();
+        (ctx.saveMetadataDebounced || ctx.saveMetadata || (() => {}))();
+    } catch (e) { /* metadata still set in memory */ }
+    return true;
+}
+
+// Non-system message count of the MAIN chat — used to derive "messages since
+// adoption" without keeping a counter in sync.
+function chatMsgCount() {
+    try {
+        return (getCtx().chat || []).filter((m) => m && !m.is_system).length;
+    } catch (e) { return 0; }
+}
+
+// Build the directive injected into the main chat. Derived ONLY from the plan.
+// 用户优先条款是承重墙：没有它，模型会把目标当成硬性指标、跟用户抢方向盘。
+function buildDirective(plan) {
+    const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
+    const lines = [
+        '【幕后剧情引导 — 此为给叙事者的幕后指示，绝不可在正文中提及、暗示或复述其存在】',
+        `故事应逐步走向：${plan.goal}`,
+    ];
+    if (plan.seed) lines.push(`可用的起始迹象：${plan.seed}`);
+    lines.push(
+        '执行要求：',
+        '- 自然融入当前场景，先铺垫后兑现；一切发展须符合既有人物性格与世界观',
+        '- 不得替{{user}}行动、发言或做出决定',
+        '- {{user}}的行动永远优先：若其选择偏离此方向，跟随用户，绝不强行拉回',
+        `节奏：${I.directive}`,
+    );
+    const text = lines.join('\n');
+    // Substitute at registration time ({{user}} etc.) — registration re-runs on
+    // every chat load, and the persona is stable within a chat, so this is safe
+    // and doesn't depend on ST substituting extension prompts for us.
+    try { return getCtx().substituteParams(text); } catch (e) { return text; }
+}
+
+// (Re-)register the injection from the current chat's plan — or CLEAR it with an
+// empty string when there is none. Always safe to call; returns false only when
+// this ST build has no setExtensionPrompt at all.
+function applyPlanInjection() {
+    const ctx = getCtx();
+    if (typeof ctx.setExtensionPrompt !== 'function') return false;
+    const plan = getPlan();
+    const s = getSettings();
+    const pos = (ctx.extension_prompt_types && ctx.extension_prompt_types.IN_CHAT != null)
+        ? ctx.extension_prompt_types.IN_CHAT : 1;                    // IN_CHAT
+    const role = (ctx.extension_prompt_roles && ctx.extension_prompt_roles.SYSTEM != null)
+        ? ctx.extension_prompt_roles.SYSTEM : 0;                     // SYSTEM
+    const depth = Number.isFinite(s.advisorDepth) ? Math.max(0, s.advisorDepth) : 4;
+    try {
+        ctx.setExtensionPrompt(ADVISOR_PROMPT_KEY, plan ? buildDirective(plan) : '', pos, depth, false, role);
+        return true;
+    } catch (e) {
+        console.warn('[Story Oracle] setExtensionPrompt failed:', e);
+        return false;
+    }
+}
+
+// Adopt a plan (single-goal rule: replaces any existing one, with a note).
+function adoptPlan(p, intensity) {
+    const prev = getPlan();
+    const plan = {
+        goal: String(p.goal || '').trim(),
+        seed: String(p.seed || '').trim(),
+        why: String(p.why || '').trim(),
+        title: String(p.title || '').trim(),
+        intensity: ADVISOR_INTENSITIES[intensity] ? intensity : 'normal',
+        adoptedAt: chatMsgCount(),
+        reminded: false,
+    };
+    if (!plan.goal) return;
+    if (!setPlan(plan)) {
+        addSystemNote('无法保存引导方案：当前似乎没有打开任何聊天。');
+        return;
+    }
+    const ok = applyPlanInjection();
+    renderPlanBar();
+    addSystemNote(
+        (prev ? `已替换原方案『${prev.title || prev.goal}』。` : '') +
+        (ok
+            ? '已开始引导：主聊天的 AI 会逐步把剧情推向这个方向（你正常进行 RP 即可）。随时可在上方的方案条里调整强度、查看注入内容、或停止引导。'
+            : '方案已保存，但当前 SillyTavern 不支持注入接口（setExtensionPrompt）——引导不会生效，请更新 ST 版本。'),
+    );
+}
+
+// End the active plan (done=true 完成 / false 放弃). Tears down metadata first,
+// then re-registers (which clears the prompt) — main chat is provably back to
+// the extension's usual zero-side-effect state.
+function endPlan(done) {
+    const plan = getPlan();
+    if (!plan) return;
+    setPlan(null);
+    applyPlanInjection();
+    renderPlanBar();
+    addSystemNote(done
+        ? `方案『${plan.title || plan.goal}』已标记完成，引导已停止——主聊天恢复原状。`
+        : `方案『${plan.title || plan.goal}』已放弃，引导已停止——主聊天恢复原状。`);
+}
+
+// Change intensity on the fly: metadata updated, directive rebuilt, re-registered.
+function setPlanIntensity(intensity) {
+    const plan = getPlan();
+    if (!plan || !ADVISOR_INTENSITIES[intensity]) return;
+    plan.intensity = intensity;
+    setPlan(plan);
+    applyPlanInjection();
+    renderPlanBar();
+}
+
+// One-time staleness ping: a silent perpetual injection is how "the AI keeps
+// obsessing about the festival" reports happen. adoptedAt vs current length —
+// derived, nothing to keep in sync.
+function checkPlanReminder() {
+    const plan = getPlan();
+    if (!plan || plan.reminded) return;
+    const n = chatMsgCount() - (plan.adoptedAt || 0);
+    if (n >= ADVISOR_REMIND_AFTER) {
+        plan.reminded = true;
+        setPlan(plan);
+        addSystemNote(`引导方案『${plan.title || plan.goal}』已持续 ${n} 条消息——剧情推进到了吗？可以在剧情参谋模式里问我「检查进度」，或在上方方案条里完成 / 调整它。`);
+    }
+}
+
+// Chat switched (or first chat loaded): re-register from THIS chat's metadata —
+// registers its plan, or clears any previous chat's injection. The extension's
+// only event-driven side effect; everything else stays pull-based.
+function onChatChanged() {
+    applyPlanInjection();
+    if (win) renderPlanBar();
+    checkPlanReminder();
+}
+
+/* ------------------------------------------------------------------ *
+ * MVU（MagVarUpdate）集成 —— 诊断模式用。
+ * ------------------------------------------------------------------ */
 async function getMvu() {
     if (mvuApi) return mvuApi;
     if (window.Mvu) { mvuApi = window.Mvu; return mvuApi; }
@@ -1106,8 +1400,9 @@ function buildWindow() {
 
     win.innerHTML = `
         <div id="so-header">
-            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span><span id="so-lb-pill">世界书</span></div>
+            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span><span id="so-lb-pill">世界书</span><span id="so-adv-pill">参谋</span></div>
             <div id="so-header-btns">
+                <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋（实验性）—— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
                 <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
                 <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量"><i class="fa-solid fa-stethoscope"></i></div>
                 <div class="so-iconbtn" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i></div>
@@ -1167,6 +1462,9 @@ function buildWindow() {
             <label class="so-field"><span>上下文深度（消息条数，-1 = 全部，0 = 不带）</span>
                 <input id="so-depth" type="number" step="1" min="-1">
             </label>
+            <label class="so-field"><span>剧情引导注入深度（参谋模式：方案指令插入主聊天的深度）</span>
+                <input id="so-adv-depth" type="number" step="1" min="0">
+            </label>
             <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
             <label class="so-check"><input id="so-regex" type="checkbox"><span>应用剧情正则（剥离思维链 / 状态栏、使用总结）—— 与主聊天保持一致</span></label>
 
@@ -1184,7 +1482,7 @@ function buildWindow() {
             <label class="so-row"><span>说话人格</span>
                 <select id="so-persona"></select>
             </label>
-            <div class="so-hint">给神谕套一层“说话腔调”，只改变语气与文采，不改变其分析职责。选「普通」即关闭人格（默认）。使用预设时，人格默认关闭、以免与预设自带的角色声线冲突；若选择某个人格，它会叠加在预设之上。诊断模式下不生效。</div>
+            <div class="so-hint">给神谕套一层“说话腔调”，只改变语气与文采，不改变其分析职责。选「普通」即关闭人格（默认）。使用预设时，人格默认关闭、以免与预设自带的角色声线冲突；若选择某个人格，它会叠加在预设之上。参谋 / 世界书模式下同样叠加（人格只改语气，方案与条目正文的格式不受影响）。诊断模式下不生效。</div>
 
             <div id="so-sysprompt-preset-wrap">
             <label class="so-row"><span>系统提示词来源（补全预设）</span>
@@ -1229,6 +1527,28 @@ function buildWindow() {
             <div class="so-hint" id="so-lb-hint"></div>
         </div>
 
+        <div id="so-adv-bar">
+            <label class="so-check so-adv-check"><input id="so-adv-preset" type="checkbox"><span>套用我的补全预设（参谋指令叠加其上）</span></label>
+            <div class="so-hint so-adv-preset-warn">⚠ 仅在确实需要预设里的越狱时才勾选：预设的额外内容会分散模型注意力。未整理过预设时勾它不报错，会自动退回内置参谋提示词。</div>
+        </div>
+
+        <div id="so-plan-bar">
+            <div class="so-plan-head">
+                <i class="fa-solid fa-compass so-plan-icon"></i>
+                <span class="so-plan-label">引导中</span>
+                <span id="so-plan-goal"></span>
+            </div>
+            <div class="so-plan-intensity" id="so-plan-intensity"></div>
+            <div class="so-hint" id="so-plan-caption"></div>
+            <div class="so-plan-actions">
+                <button type="button" class="so-plan-mini" id="so-plan-show">▸ 查看注入内容</button>
+                <span class="so-plan-spacer"></span>
+                <button type="button" class="so-plan-mini so-plan-done" id="so-plan-done" title="目标已达成，停止引导">完成</button>
+                <button type="button" class="so-plan-mini so-plan-drop" id="so-plan-drop" title="不再需要，停止引导">放弃</button>
+            </div>
+            <pre id="so-plan-directive"></pre>
+        </div>
+
         <div id="so-messages"></div>
 
         <div id="so-footer">
@@ -1257,9 +1577,11 @@ function buildWindow() {
 
     bindControls();
     loadSettingsIntoForm();
+    planBarEl = win.querySelector('#so-plan-bar');
     makeDraggable(win, win.querySelector('#so-header'));
     makeResizable(win, win.querySelector('#so-resize-grip'));
     renderEmptyState();
+    renderPlanBar();
 }
 
 function bindControls() {
@@ -1269,6 +1591,32 @@ function bindControls() {
     win.querySelector('#so-clear-btn').addEventListener('click', clearConversation);
     win.querySelector('#so-diagnose-btn').addEventListener('click', toggleDiagnose);
     win.querySelector('#so-lorebook-btn').addEventListener('click', toggleLorebook);
+    win.querySelector('#so-advisor-btn').addEventListener('click', toggleAdvisor);
+    win.querySelector('#so-adv-preset').addEventListener('change', (e) => {
+        const s2 = getSettings();
+        s2.advisorUsePreset = e.target.checked;
+        save();
+        if (e.target.checked) {
+            addSystemNote(presetCurationActive(s2)
+                ? '已开启「套用补全预设」：剧情参谋指令会叠加在你的补全预设之上。注意预设可能分散模型注意力——仅在需要越狱时使用。'
+                : '已勾选「套用补全预设」，但目前还没有整理好的补全预设。请先到设置（齿轮）里选定并整理一个补全预设；在此之前，参谋模式仍用内置提示词。');
+        }
+    });
+    // Live depth change re-registers the active injection — wired AFTER the
+    // generic bind() below so the new value is already persisted when it runs.
+    win.querySelector('#so-plan-show').addEventListener('click', () => {
+        // Query through planBarEl, not win — the strip may have been reparented
+        // into the floating container by the time this fires.
+        const pre = planBarEl.querySelector('#so-plan-directive');
+        const open = pre.classList.toggle('open');
+        planBarEl.querySelector('#so-plan-show').textContent = open ? '▾ 收起注入内容' : '▸ 查看注入内容';
+        if (open) {
+            const plan = getPlan();
+            pre.textContent = plan ? buildDirective(plan) : '';
+        }
+    });
+    win.querySelector('#so-plan-done').addEventListener('click', () => endPlan(true));
+    win.querySelector('#so-plan-drop').addEventListener('click', () => endPlan(false));
     win.querySelector('#so-lb-refresh').addEventListener('click', () => populateLorebookBooks(true));
     win.querySelector('#so-lb-book').addEventListener('change', (e) => {
         const s2 = getSettings();
@@ -1343,6 +1691,10 @@ function bindControls() {
     bind('#so-temp', 'temperature', (v) => parseFloat(v));
     bind('#so-maxtok', 'maxTokens', (v) => parseInt(v, 10));
     bind('#so-depth', 'contextDepth', (v) => parseInt(v, 10));
+    bind('#so-adv-depth', 'advisorDepth', (v) => parseInt(v, 10));
+    // After bind() has written the new depth, re-register the active injection —
+    // otherwise the setting silently applies only on the next chat switch.
+    win.querySelector('#so-adv-depth').addEventListener('input', () => applyPlanInjection());
     bind('#so-card', 'includeCard');
     bind('#so-regex', 'applyRegex');
     bind('#so-wi', 'worldInfoMode');
@@ -1387,12 +1739,14 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-temp').value = s.temperature;
     win.querySelector('#so-maxtok').value = s.maxTokens;
     win.querySelector('#so-depth').value = s.contextDepth;
+    win.querySelector('#so-adv-depth').value = s.advisorDepth;
     win.querySelector('#so-card').checked = !!s.includeCard;
     win.querySelector('#so-regex').checked = !!s.applyRegex;
     win.querySelector('#so-wi').value = s.worldInfoMode;
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
     win.querySelector('#so-lb-story').checked = !!s.lorebookIncludeStory;
     win.querySelector('#so-lb-preset').checked = !!s.lorebookUsePreset;
+    win.querySelector('#so-adv-preset').checked = !!s.advisorUsePreset;
     updateWiHint();
     populatePersonas();
     win.querySelector('#so-sysprompt').value = s.systemPrompt;
@@ -2077,18 +2431,44 @@ function toggleWindow(show) {
         void win.offsetWidth; // force reflow so the animation restarts
         win.classList.add('so-opening');
         inputEl.focus();
+        checkPlanReminder(); // natural opportunity for the 20-message staleness ping
     }
+    placePlanBar(); // strip moves home (window) or out (float) with visibility
+}
+
+/* ------------------------------------------------------------------ *
+ * 模式切换。四种互斥模式：chat / diagnose / lorebook / advisor。
+ * setOracleMode 是唯一的写入口（booleans、CSS 类、按钮高亮、输入框占位符
+ * 都在这里统一处理）——各 toggle 只负责自己的进入/退出提示。
+ * ------------------------------------------------------------------ */
+const MODE_PLACEHOLDERS = {
+    chat: '就当前剧情提问…（Enter 发送，Shift+Enter 换行）',
+    diagnose: '描述哪里看起来不对，或让我检查最新一次更新 / 审计当前状态…',
+    lorebook: '问问这本世界书，或让我改写 / 新增 / 删除某个条目…',
+    advisor: '聊聊剧情接下来可以怎么走…（出方案后可一键开始引导）',
+};
+
+function currentOracleMode() {
+    return diagnoseMode ? 'diagnose' : (lorebookMode ? 'lorebook' : (advisorMode ? 'advisor' : 'chat'));
+}
+
+function setOracleMode(target) {
+    diagnoseMode = target === 'diagnose';
+    lorebookMode = target === 'lorebook';
+    advisorMode = target === 'advisor';
+    win.classList.toggle('so-diag-on', diagnoseMode);
+    win.classList.toggle('so-lb-on', lorebookMode);
+    win.classList.toggle('so-adv-on', advisorMode);
+    win.querySelector('#so-diagnose-btn').classList.toggle('so-diag-active', diagnoseMode);
+    win.querySelector('#so-lorebook-btn').classList.toggle('so-lb-active', lorebookMode);
+    win.querySelector('#so-advisor-btn').classList.toggle('so-adv-active', advisorMode);
+    inputEl.placeholder = MODE_PLACEHOLDERS[target] || MODE_PLACEHOLDERS.chat;
 }
 
 function toggleDiagnose() {
-    diagnoseMode = !diagnoseMode;
-    if (diagnoseMode && lorebookMode) setLorebookMode(false); // mutually exclusive
-    win.classList.toggle('so-diag-on', diagnoseMode);
-    win.querySelector('#so-diagnose-btn').classList.toggle('so-diag-active', diagnoseMode);
-    inputEl.placeholder = diagnoseMode
-        ? '描述哪里看起来不对，或让我检查最新一次更新 / 审计当前状态…'
-        : '就当前剧情提问…（Enter 发送，Shift+Enter 换行）';
-    if (diagnoseMode) {
+    const entering = !diagnoseMode;
+    setOracleMode(entering ? 'diagnose' : 'chat');
+    if (entering) {
         addSystemNote('诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。');
     } else {
         addSystemNote('已返回普通聊天模式。');
@@ -2096,33 +2476,164 @@ function toggleDiagnose() {
     inputEl.focus();
 }
 
-// Centralized lorebook-mode setter so toggleDiagnose can flip it off without
-// re-running the note/placeholder side effects.
-function setLorebookMode(on) {
-    lorebookMode = on;
-    win.classList.toggle('so-lb-on', on);
-    win.querySelector('#so-lorebook-btn').classList.toggle('so-lb-active', on);
-}
-
 function toggleLorebook() {
-    const next = !lorebookMode;
-    if (next && diagnoseMode) {
-        // turn diagnose off cleanly first
-        diagnoseMode = false;
-        win.classList.remove('so-diag-on');
-        win.querySelector('#so-diagnose-btn').classList.remove('so-diag-active');
-    }
-    setLorebookMode(next);
-    inputEl.placeholder = next
-        ? '问问这本世界书，或让我改写 / 新增 / 删除某个条目…'
-        : '就当前剧情提问…（Enter 发送，Shift+Enter 换行）';
-    if (next) {
+    const entering = !lorebookMode;
+    setOracleMode(entering ? 'lorebook' : 'chat');
+    if (entering) {
         populateLorebookBooks();
         addSystemNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
     } else {
         addSystemNote('已返回普通聊天模式。');
     }
     inputEl.focus();
+}
+
+function toggleAdvisor() {
+    const entering = !advisorMode;
+    setOracleMode(entering ? 'advisor' : 'chat');
+    if (entering) {
+        addSystemNote('⚠️ 剧情参谋是实验性功能，行为可能随版本调整。\n剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
+            + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : ''));
+        // 桥接：从普通模式聊到一半切过来时（侧聊有内容、且还没有方案在引导），
+        // 给一个一键把刚才的讨论正式化成方案的入口。出现时机是确定性的——
+        // 只在这一刻、只在这个条件下，绝不靠关键词探测。
+        if (convo.length > 0 && !getPlan()) addBridgeChip();
+    } else {
+        addSystemNote('已返回普通聊天模式。');
+    }
+    inputEl.focus();
+}
+
+// One-tap chip: fills the input with the canned formalize request and sends it.
+// The advisor sees the whole prior side-chat (convo is shared across modes), so
+// it can turn an informal discussion into adoptable <StoryPlan> cards.
+function addBridgeChip() {
+    const wrap = document.createElement('div');
+    wrap.className = 'so-note so-bridge';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'so-bridge-chip';
+    btn.innerHTML = '<i class="fa-solid fa-compass"></i> 把刚才的讨论整理成方案';
+    btn.addEventListener('click', () => {
+        if (isGenerating) return;
+        wrap.remove();
+        inputEl.value = '把我们刚才讨论的剧情走向，整理成可以采用的方案吧。';
+        onSend();
+    });
+    wrap.appendChild(btn);
+    messagesEl.appendChild(wrap);
+    scrollToBottom();
+}
+
+/* ------------------------------------------------------------------ *
+ * 方案条（active plan strip）。只要当前聊天存在已采用的方案就显示——
+ * 不论神谕处于哪个模式，因为引导作用的是主聊天，必须显眼到没法被遗忘。
+ *
+ * v1.14.3：同一个方案条元素在两个家之间【搬家】（reparent），绝不复制——
+ * 神谕窗口打开时住在窗口顶部；窗口关闭而方案仍在引导时，搬进一个独立的
+ * 可拖动悬浮容器，常驻在 ST 界面上。单一 DOM 节点 = 单一真相：强度按钮、
+ * 展开器、完成/放弃在两处都是同一批监听器，无需任何同步。
+ * ------------------------------------------------------------------ */
+function renderPlanBar() {
+    if (!planBarEl) return;
+    const plan = getPlan();
+    if (win) win.classList.toggle('so-plan-on', !!plan);
+    if (!plan) {
+        const pre0 = planBarEl.querySelector('#so-plan-directive');
+        pre0.classList.remove('open');
+        planBarEl.querySelector('#so-plan-show').textContent = '▸ 查看注入内容';
+        placePlanBar();
+        return;
+    }
+    planBarEl.querySelector('#so-plan-goal').textContent = plan.title ? `${plan.title}：${plan.goal}` : plan.goal;
+    // Intensity segmented control — rebuilt each render; label IS the compressed
+    // directive, the caption underneath is its one-line expansion.
+    const seg = planBarEl.querySelector('#so-plan-intensity');
+    seg.innerHTML = '';
+    for (const [key, I] of Object.entries(ADVISOR_INTENSITIES)) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'so-plan-int' + (plan.intensity === key ? ' active' : '');
+        b.textContent = I.label;
+        b.addEventListener('click', () => setPlanIntensity(key));
+        seg.appendChild(b);
+    }
+    const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
+    planBarEl.querySelector('#so-plan-caption').textContent = I.caption;
+    const pre = planBarEl.querySelector('#so-plan-directive');
+    if (pre.classList.contains('open')) pre.textContent = buildDirective(plan);
+    placePlanBar();
+}
+
+// Lazy-build the floating home for the strip.
+function ensurePlanFloat() {
+    if (planFloat) return;
+    planFloat = document.createElement('div');
+    planFloat.id = 'so-plan-float';
+    planFloat.innerHTML = `
+        <div id="so-plan-float-head">
+            <i class="fa-solid fa-compass"></i>
+            <span class="so-plan-float-title">剧情引导</span>
+            <span class="so-plan-spacer"></span>
+            <div class="so-iconbtn" id="so-plan-float-collapse" title="收起成小标签 / 展开"><i class="fa-solid fa-chevron-up"></i></div>
+            <div class="so-iconbtn" id="so-plan-float-open" title="打开故事神谕"><i class="fa-solid fa-moon"></i></div>
+        </div>
+        <div id="so-plan-float-slot"></div>`;
+    document.body.appendChild(planFloat);
+    planFloatSlot = planFloat.querySelector('#so-plan-float-slot');
+    planFloat.querySelector('#so-plan-float-open').addEventListener('click', () => toggleWindow(true));
+    planFloat.querySelector('#so-plan-float-collapse').addEventListener('click', () => {
+        const s2 = getSettings();
+        s2.planFloatCollapsed = !s2.planFloatCollapsed;
+        save();
+        applyPlanFloatCollapsed();
+    });
+    makeDraggable(planFloat, planFloat.querySelector('#so-plan-float-head'),
+        { left: 'planFloatLeft', top: 'planFloatTop' });
+    // Restore the saved position, clamped to the current viewport.
+    const s = getSettings();
+    if (Number.isFinite(s.planFloatLeft) && Number.isFinite(s.planFloatTop)) {
+        planFloat.style.left = Math.max(0, Math.min(window.innerWidth - 60, s.planFloatLeft)) + 'px';
+        planFloat.style.top = Math.max(0, Math.min(window.innerHeight - 40, s.planFloatTop)) + 'px';
+        planFloat.style.right = 'auto';
+    }
+    applyPlanFloatCollapsed(); // restore persisted collapsed state
+}
+
+// Collapsed = head-only pill 「🧭 引导中」: tiny footprint (mobile!), still an
+// unmissable signal that steering is active. Strip stays parented in the hidden
+// slot, so expanding is pure CSS — no re-render, no listener churn.
+function applyPlanFloatCollapsed() {
+    if (!planFloat) return;
+    const collapsed = !!getSettings().planFloatCollapsed;
+    planFloat.classList.toggle('so-collapsed', collapsed);
+    const icon = planFloat.querySelector('#so-plan-float-collapse i');
+    icon.className = collapsed ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-up';
+    planFloat.querySelector('.so-plan-float-title').textContent = collapsed ? '引导中' : '剧情引导';
+    // Collapsed pill: hovering (desktop) shows the goal it stands for.
+    const plan = getPlan();
+    planFloat.querySelector('#so-plan-float-head').title =
+        collapsed && plan ? (plan.title ? `${plan.title}：${plan.goal}` : plan.goal) : '';
+}
+
+// Decide where the strip lives right now. Rules: no plan -> hidden (and parked
+// back in the window); plan + window visible -> inside the window (the float
+// hides); plan + window closed -> inside the float, always on screen.
+function placePlanBar() {
+    if (!planBarEl || !win) return;
+    const plan = getPlan();
+    const winVisible = win.style.display !== 'none';
+    if (plan && !winVisible) {
+        ensurePlanFloat();
+        if (planBarEl.parentElement !== planFloatSlot) planFloatSlot.appendChild(planBarEl);
+        planFloat.style.display = 'flex';
+        applyPlanFloatCollapsed(); // refresh pill tooltip (plan may have changed)
+    } else {
+        if (planFloat) planFloat.style.display = 'none';
+        if (planBarEl.parentElement !== win) {
+            win.insertBefore(planBarEl, win.querySelector('#so-messages'));
+        }
+    }
 }
 
 // Fill the book dropdown: "all active" + every known book (active ones marked).
@@ -2319,6 +2830,7 @@ function buildSystemPrompt() {
 
     if (diagnoseMode) return buildDiagnosePrompt(ctx, s);
     if (lorebookMode) return buildLorebookPrompt(ctx, s);
+    if (advisorMode) return buildAdvisorPrompt(ctx, s);
 
     const parts = [resolveSystemPrompt(s)];
 
@@ -2367,6 +2879,11 @@ function buildDiagnosePrompt(ctx, s) {
 function buildLorebookPrompt(ctx, s) {
     const parts = [LOREBOOK_SYSTEM_PROMPT];
 
+    // 说话人格（仅当用户主动选了某个人格时）：管家指令之上叠一层语气皮肤，
+    // 附带职责调整 + 结构保护（区块格式与围栏正文不受人格影响）。
+    const personaBlock = buildPersonaBlock(s.personaId, 'lorebook');
+    if (personaBlock) parts.push(personaBlock);
+
     parts.push('=== 当前世界书内容 ===\n' +
         (lbContextText || '（未读取到世界书 —— 请检查上方的选择。）'));
 
@@ -2379,6 +2896,51 @@ function buildLorebookPrompt(ctx, s) {
     // has no macros, so no further substitution is needed (and would risk
     // mangling literal braces inside entry content).
     return parts.filter(Boolean).join('\n\n');
+}
+
+// 参谋模式提示词：参谋指令 + 人格（若选）+ 当前引导方案（若有，供“检查进度”
+// 用）+ 角色卡 + 世界书 + 【整段】对话记录。无论全局上下文深度设成多少，参谋
+// 都看全史——只看最近十几条提出的方案会漏掉长线伏笔。
+function buildAdvisorPrompt(ctx, s) {
+    const parts = [ADVISOR_SYSTEM_PROMPT];
+
+    // 说话人格（仅当用户主动选了某个人格时）：参谋指令之上叠语气皮肤，附带
+    // 职责调整（构思未来剧情正是本职，不算「擅自续写」）+ 结构保护。
+    const personaBlock = buildPersonaBlock(s.personaId, 'advisor');
+    if (personaBlock) parts.push(personaBlock);
+
+    const plan = getPlan();
+    if (plan) {
+        const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
+        const since = Math.max(0, chatMsgCount() - (plan.adoptedAt || 0));
+        parts.push('=== 当前已采用的引导方案（正在引导主聊天）===\n' +
+            `${plan.title ? `标题：${plan.title}\n` : ''}目标：${plan.goal}\n` +
+            (plan.seed ? `起始迹象：${plan.seed}\n` : '') +
+            `强度：${I.label}（${I.caption}）\n` +
+            `已持续：${since} 条主聊天消息`);
+    }
+
+    if (s.includeCard) parts.push(buildCardSection(ctx));
+
+    // 变量状态：剧情的硬事实层。有 MVU 时给出，方案必须与数值现状自洽
+    //（好感度还没到的别提结婚，钱包空的别提一掷千金）；无 MVU 卡时整段省略，
+    // 不显示“不可用”占位——这对参谋是可选情报，不是诊断那样的必需输入。
+    if (advStatData) {
+        parts.push('=== 当前变量状态（stat_data，来自 MVU —— 剧情推进到此刻的实时数值）===\n' + advStatData);
+    }
+
+    if (worldInfoBlock) {
+        parts.push('=== 世界书 / 设定 ===\n' + worldInfoBlock);
+    }
+
+    // Full history, regardless of the shared contextDepth setting.
+    const transcript = buildTranscript(ctx, { ...s, contextDepth: -1 });
+    if (transcript) {
+        parts.push('=== 完整故事对话记录（最新的在最后）===\n' + transcript);
+    }
+
+    const full = parts.filter(Boolean).join('\n\n');
+    try { return ctx.substituteParams(full); } catch (e) { return full; }
 }
 
 function buildCardSection(ctx) {
@@ -2432,12 +2994,13 @@ function buildTranscript(ctx, s) {
     return buildTranscriptTurns(ctx, s).map((l) => `${l.name}: ${l.text}`).join('\n\n');
 }
 
-// v1.13.4 修复：用户预设里常带「每条回复末尾必须输出 <UpdateVariable>」的输出
+// v1.14.1 修复：用户预设里常带「每条回复末尾必须输出 <UpdateVariable>」的输出
 // 契约（MVU 卡），忠实组装会让神谕也继承它——于是神谕的回复尾巴上挂出一个对
-// 主聊天毫无意义的机制区块（"Variables remain unchanged"之类）。主聊天里这
+// 主聊天毫无意义的机制区块（“Variables remain unchanged”之类）。主聊天里这
 // 些区块由 MVU 自己的管线消化隐藏，神谕没有那条管线，所以原样可见，还会写进
-// 神谕历史让后续回合越锁越死。普通聊天模式下从显示与历史两头剥掉它；诊断模
-// 式绝不剥（读这些区块正是诊断的本职），世界书模式不动（不在该症状路径上）。
+// 神谕历史让后续回合越锁越死。普通 / 参谋模式下从显示与历史两头剥掉它；诊断
+// 模式绝不剥（读这些区块正是诊断的本职），世界书模式不动（不在该症状路径上，
+// 且求稳不碰 <LorebookEdit> 周边的文本处理）。
 function stripMechanismBlocks(text) {
     let out = String(text || '');
     out = out.replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '');
@@ -2488,7 +3051,10 @@ function buildMessages() {
     if (lorebookMode && s.lorebookUsePreset && presetCurationActive(s)) {
         return buildLorebookPresetMessages(s);
     }
-    if (!diagnoseMode && !lorebookMode && presetCurationActive(s)) {
+    if (advisorMode && s.advisorUsePreset && presetCurationActive(s)) {
+        return buildAdvisorPresetMessages(s);
+    }
+    if (!diagnoseMode && !lorebookMode && !advisorMode && presetCurationActive(s)) {
         return buildPresetMessages(s);
     }
     return [{ role: 'system', content: buildSystemPrompt() }, ...convo];
@@ -2625,6 +3191,42 @@ function buildLorebookPresetMessages(s) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Advisor mode THROUGH a curated preset (opt-in: s.advisorUsePreset).
+ * Same skeleton as buildLorebookPresetMessages: keep the preset's TEXT blocks
+ * (jailbreak / formatting / framing), skip the RP markers (the advisor block
+ * already carries card + WI + full transcript itself), and drop the advisor
+ * directive + side-chat Q&A where the chat history would sit, so a post-history
+ * jailbreak block still lands last.
+ * ------------------------------------------------------------------ */
+function buildAdvisorPresetMessages(s) {
+    const ctx = getCtx();
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    const items = (snap && snap.items) || [];
+    const out = [];
+
+    const advBlock = buildAdvisorPrompt(ctx, s);  // directive + plan + card + WI + full transcript
+    let placed = false;
+    const placeAdv = () => {
+        if (placed) return;
+        pushMsg(out, 'system', advBlock);
+        for (const m of convo) pushMsg(out, m.role, m.content);
+        placed = true;
+    };
+
+    for (const it of items) {
+        if (it.kind === 'marker') {
+            if (it.identifier === 'chatHistory') placeAdv();
+            // every other marker is skipped in advisor mode
+        } else {
+            pushMsg(out, it.role || 'system', subst(ctx, it.content));
+        }
+    }
+    placeAdv(); // no chatHistory marker in the curation -> append at the end
+
+    return out.length ? out : [{ role: 'system', content: advBlock }, ...convo];
+}
+
+/* ------------------------------------------------------------------ *
  * Sending
  * ------------------------------------------------------------------ */
 async function onSend() {
@@ -2676,6 +3278,14 @@ async function generateReply() {
         // Read the selected world book(s) fresh so the model sees the current
         // state, and remember which books are in scope for the apply step.
         await buildLorebookContext();
+    } else if (advisorMode) {
+        // Advisor sees world info per the user's setting (off by default), and
+        // builds its own full-history transcript inside buildAdvisorPrompt.
+        worldInfoBlock = await buildWorldInfo();
+        // Live MVU variable state (好感度 / 时间 / 资源…) — hard story facts the
+        // proposed beats must not contradict. Silently absent for non-MVU cards.
+        const stat = await getMvuStatData();
+        advStatData = stat ? JSON.stringify(stat, null, 2) : '';
     } else if (presetCurationActive(s)) {
         // Faithful assembly needs WI split into the Before/After-Char-Defs slots.
         const split = await buildWorldInfoSplit();
@@ -2690,7 +3300,7 @@ async function generateReply() {
     // Snapshot the exact prompt for the debug viewer (both modes).
     lastPrompt = messages.map((m) => ({ role: m.role, content: m.content }));
     lastPromptMeta = {
-        mode: diagnoseMode ? '诊断' : (lorebookMode ? '世界书' : '聊天'),
+        mode: diagnoseMode ? '诊断' : (lorebookMode ? '世界书' : (advisorMode ? '参谋' : '聊天')),
         target: s.mode === 'direct' ? (s.model || '直连') : '配置文件',
         chars: lastPrompt.reduce((n, m) => n + (m.content ? m.content.length : 0), 0),
         time: new Date().toLocaleTimeString(),
@@ -2760,7 +3370,7 @@ async function generateReply() {
         } else {
             // Strip main-chat mechanism blocks (<UpdateVariable>) the preset's
             // output contract may have coaxed out of the model — display AND
-            // history, normal chat mode only (see stripMechanismBlocks).
+            // history, chat/advisor modes only (see stripMechanismBlocks).
             const mechStrip = !diagnoseMode && !lorebookMode;
             let cleanText = finalText;
             if (mechStrip) {
@@ -2779,8 +3389,9 @@ async function generateReply() {
             // showing as raw text), and STORE the prompt-stage regex'd copy in
             // history (clean text for re-feeding — no widget markup looping back).
             // Never for the plain textarea prompt, never in Diagnose mode (which
-            // needs the raw <UpdateVariable> block intact).
-            const useOutputRegex = !diagnoseMode && !lorebookMode && presetCurationActive(s) && s.applyRegex;
+            // needs the raw <UpdateVariable> block intact), never in Advisor mode
+            // (the raw <StoryPlan> blocks must survive for the adopt cards).
+            const useOutputRegex = !diagnoseMode && !lorebookMode && !advisorMode && presetCurationActive(s) && s.applyRegex;
             let historyText = cleanText;
             if (useOutputRegex) {
                 historyText = applyOutputRegex(cleanText, /*forPrompt*/ true);
@@ -2801,6 +3412,9 @@ async function generateReply() {
             } else if (lorebookMode) {
                 const parsed = parseLorebookBlocks(finalText);
                 if (parsed.ops.length || parsed.errors.length) addLorebookApplyControls(assistantEl, parsed);
+            } else if (advisorMode) {
+                const plans = parseStoryPlans(cleanText);
+                if (plans.length) addPlanControls(assistantEl, plans);
             }
         }
     } catch (err) {
@@ -3324,6 +3938,118 @@ function addLorebookApplyControls(assistantEl, parsed) {
     });
 }
 
+/* ------------------------------------------------------------------ *
+ * 参谋方案区块的解析与「开始引导」卡片。
+ * <StoryPlan> 用「键: 值」逐行解析（容错中英文键名与全角冒号）；解析不出 goal
+ * 的区块直接忽略——卡片是加分项而非硬依赖，模型不出区块时回复照常显示。
+ * ------------------------------------------------------------------ */
+function parseStoryPlans(text) {
+    const out = [];
+    const re = /<StoryPlan>([\s\S]*?)<\/StoryPlan>/gi;
+    let m;
+    while ((m = re.exec(String(text || ''))) !== null) {
+        const inner = m[1];
+        const get = (keys) => {
+            for (const k of keys) {
+                const r = new RegExp('^\\s*' + k + '\\s*[:：]\\s*(.+)$', 'mi');
+                const mm = inner.match(r);
+                if (mm && mm[1].trim()) return mm[1].trim();
+            }
+            return '';
+        };
+        const goal = get(['goal', '目标']);
+        if (!goal) continue;
+        out.push({
+            goal,
+            title: get(['title', '标题', '方案']),
+            seed: get(['seed', '起始迹象', '种子']),
+            why: get(['why', '契合点', '理由']),
+        });
+    }
+    return out;
+}
+
+// Render one adopt card per parsed plan under the advisor reply. Third instance
+// of the parse-block -> action-button pattern (after Diagnose / Lorebook), and
+// the simplest: adoption is metadata + one setExtensionPrompt call, no ST write
+// APIs with failure modes.
+function addPlanControls(assistantEl, plans) {
+    const bubble = assistantEl.querySelector('.so-bubble');
+    const wrap = document.createElement('div');
+    wrap.className = 'so-plan-cards';
+
+    for (const p of plans) {
+        const card = document.createElement('div');
+        card.className = 'so-plan-card';
+        let intensity = 'normal';
+
+        const head = document.createElement('div');
+        head.className = 'so-plan-card-title';
+        head.textContent = p.title || p.goal;
+        card.appendChild(head);
+
+        if (p.title) {
+            const goalEl = document.createElement('div');
+            goalEl.className = 'so-plan-card-line';
+            goalEl.textContent = '目标：' + p.goal;
+            card.appendChild(goalEl);
+        }
+        if (p.why) {
+            const whyEl = document.createElement('div');
+            whyEl.className = 'so-plan-card-line so-plan-card-dim';
+            whyEl.textContent = '契合点：' + p.why;
+            card.appendChild(whyEl);
+        }
+        if (p.seed) {
+            const seedEl = document.createElement('div');
+            seedEl.className = 'so-plan-card-line so-plan-card-dim';
+            seedEl.textContent = '起始迹象：' + p.seed;
+            card.appendChild(seedEl);
+        }
+
+        const seg = document.createElement('div');
+        seg.className = 'so-plan-intensity';
+        const caption = document.createElement('div');
+        caption.className = 'so-hint so-plan-card-caption';
+        const renderSeg = () => {
+            seg.innerHTML = '';
+            for (const [key, I] of Object.entries(ADVISOR_INTENSITIES)) {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'so-plan-int' + (intensity === key ? ' active' : '');
+                b.textContent = I.label;
+                b.addEventListener('click', () => { intensity = key; renderSeg(); });
+                seg.appendChild(b);
+            }
+            caption.textContent = (ADVISOR_INTENSITIES[intensity] || ADVISOR_INTENSITIES.normal).caption;
+        };
+        renderSeg();
+        card.appendChild(seg);
+        card.appendChild(caption);
+
+        const actions = document.createElement('div');
+        actions.className = 'so-plan-card-actions';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'so-apply-btn';
+        btn.innerHTML = '<i class="fa-solid fa-compass"></i> 开始引导';
+        btn.addEventListener('click', () => {
+            adoptPlan(p, intensity);
+            // Mark this card as the adopted one; others stay usable (clicking
+            // another replaces the plan, with an explicit note — single-goal rule).
+            wrap.querySelectorAll('.so-plan-card').forEach((c) => c.classList.remove('so-plan-adopted'));
+            card.classList.add('so-plan-adopted');
+        });
+        actions.appendChild(btn);
+        card.appendChild(actions);
+
+        wrap.appendChild(card);
+    }
+
+    bubble.appendChild(wrap);
+    scrollToBottom();
+}
+
 // Typing-dots indicator placed inside an assistant bubble until the first token.
 function showTyping(contentEl) {
     const dots = document.createElement('span');
@@ -3392,7 +4118,7 @@ function applyInitialGeometry(s) {
 
 // Drag the window by its header. Pointer events cover mouse + touch + pen in one
 // path; pointer capture keeps tracking even when the finger leaves the header.
-function makeDraggable(panel, handle) {
+function makeDraggable(panel, handle, keys = { left: 'winLeft', top: 'winTop' }) {
     let sx, sy, sl, st, pid = null;
     handle.style.touchAction = 'none';   // stop the page scrolling under a drag
     handle.addEventListener('pointerdown', (e) => {
@@ -3418,8 +4144,8 @@ function makeDraggable(panel, handle) {
         pid = null;
         document.body.style.userSelect = '';
         const s = getSettings();
-        s.winLeft = parseInt(panel.style.left, 10);
-        s.winTop = parseInt(panel.style.top, 10);
+        s[keys.left] = parseInt(panel.style.left, 10);
+        s[keys.top] = parseInt(panel.style.top, 10);
         save();
     };
     handle.addEventListener('pointerup', end);
