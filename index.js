@@ -496,6 +496,49 @@ async function loadWorldInfoModule() {
     return worldInfoModule;
 }
 
+let scriptCore = null; // '/script.js' module, lazily imported (false = unavailable)
+async function loadScriptCore() {
+    if (scriptCore !== null) return scriptCore;
+    try {
+        scriptCore = await import('/script.js');
+    } catch (e) {
+        console.warn('[Story Oracle] Could not load /script.js for context size.', e);
+        scriptCore = false;
+    }
+    return scriptCore;
+}
+
+/*
+ * The token budget the ST world-info scan gets to spend. Inside checkWorldInfo
+ * the budget is `世界信息 Context% × maxContext` (capped by the budget cap), and
+ * once it overflows ST silently drops every remaining entry in order-descending
+ * priority — CONSTANT (blue) ENTRIES INCLUDED.
+ *
+ * getContext().maxContext is the *text-completion* context slider. For
+ * chat-completion users (the normal case) that's a stale default (2048+) with
+ * no relation to the real context size, so passing it collapses the budget and
+ * the scan sheds low-order entries that the main chat keeps. Main generation
+ * derives its scan budget from getMaxPromptTokens(), so we mirror that, and
+ * fall back to "effectively unlimited" rather than risk starving the Oracle's
+ * view of the books.
+ */
+async function getWiScanBudget() {
+    const ctx = getCtx();
+    const sc = await loadScriptCore();
+    const candidates = [
+        () => (sc && typeof sc.getMaxPromptTokens === 'function') ? sc.getMaxPromptTokens() : 0,
+        () => (sc && typeof sc.getMaxContextTokens === 'function') ? sc.getMaxContextTokens() : 0,
+        () => (typeof ctx.getMaxContextSize === 'function') ? ctx.getMaxContextSize() : 0,
+    ];
+    for (const get of candidates) {
+        try {
+            const v = Number(get());
+            if (v > 0) return v;
+        } catch (e) { /* try the next source */ }
+    }
+    return 1048576;
+}
+
 /**
  * Build the world-info / lorebook block for the system prompt.
  *   'st'  -> faithful ST scan: constant (blue) entries always, keyword (green)
@@ -539,7 +582,7 @@ async function buildWorldInfo(forceMode) {
             trigger: 'normal',
         };
 
-        const budget = Number(ctx.maxContext) > 0 ? Number(ctx.maxContext) : 1048576;
+        const budget = await getWiScanBudget();
         const res = await ctx.getWorldInfoPrompt(chatForWI, budget, /*isDryRun*/ true, globalScanData);
 
         // getWorldInfoPrompt buckets the activated entries by insertion position.
@@ -601,7 +644,7 @@ async function buildWorldInfoSplit(forceMode) {
             trigger: 'normal',
         };
 
-        const budget = Number(ctx.maxContext) > 0 ? Number(ctx.maxContext) : 1048576;
+        const budget = await getWiScanBudget();
         const res = await ctx.getWorldInfoPrompt(chatForWI, budget, /*isDryRun*/ true, globalScanData);
 
         const beforeParts = [];
