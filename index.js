@@ -557,10 +557,12 @@ async function buildWorldInfo(forceMode) {
             const mod = await loadWorldInfoModule();
             if (!mod || !mod.getSortedEntries) return '';
             const entries = await mod.getSortedEntries();
-            return (entries || [])
+            const allBlock = (entries || [])
                 .filter((e) => e && !e.disable && typeof e.content === 'string' && e.content.trim())
                 .map((e) => e.content.trim())
                 .join('\n\n');
+            // Mechanism rules are Diagnose-only; see stripMvuRuleContents.
+            return await stripMvuRuleContents(allBlock);
         }
 
         // 'st' mode — replicate ST's scan input.
@@ -602,7 +604,8 @@ async function buildWorldInfo(forceMode) {
         for (const e of (res?.worldInfoExamples || [])) push(typeof e === 'string' ? e : e?.content); // 5/6 Example Messages
         for (const arr of Object.values(res?.outletEntries || {})) (arr || []).forEach(push);          // 7  Outlet
 
-        return parts.join('\n\n').trim();
+        // Mechanism rules are Diagnose-only; see stripMvuRuleContents.
+        return await stripMvuRuleContents(parts.join('\n\n').trim());
     } catch (e) {
         console.warn('[Story Oracle] World info build failed:', e);
         return '';
@@ -659,7 +662,11 @@ async function buildWorldInfoSplit(forceMode) {
         for (const e of (res?.worldInfoExamples || [])) push(afterParts, typeof e === 'string' ? e : e?.content);
         for (const arr of Object.values(res?.outletEntries || {})) (arr || []).forEach((e) => push(afterParts, e));
 
-        return { before: beforeParts.join('\n\n').trim(), after: afterParts.join('\n\n').trim() };
+        // Mechanism rules are Diagnose-only; see stripMvuRuleContents.
+        return {
+            before: await stripMvuRuleContents(beforeParts.join('\n\n').trim()),
+            after: await stripMvuRuleContents(afterParts.join('\n\n').trim()),
+        };
     } catch (e) {
         console.warn('[Story Oracle] World info split failed:', e);
         return { before: '', after: '' };
@@ -667,24 +674,33 @@ async function buildWorldInfoSplit(forceMode) {
 }
 
 /*
- * Collect the card's [mvu_update] rule entries straight from the stored
- * world books, bypassing the live WI scan.
+ * [mvu_update] rule entries — the card's variable-update mechanism rules
+ * (update rules / output format contracts). Matching mirrors MVU's own
+ * UPDATE_REGEX exactly: /[mvu_update]/i on the comment. Constant-only and
+ * enabled-only.
  *
- * Why this is needed: MagVarUpdate, in "extra-model-parsing" update mode,
- * strips pure [mvu_update] entries from the lore arrays on the
- * `worldinfo_entries_loaded` event. That event fires inside getSortedEntries,
- * upstream of BOTH getWorldInfoPrompt ('st') and getSortedEntries ('all'),
- * so neither scan mode can see those entries. loadWorldInfo() reads the raw
- * cached book data, which MVU never mutates, so it always sees them.
+ * These entries are read straight from the stored world books via
+ * loadWorldInfo(), bypassing the live WI scan, because MagVarUpdate in
+ * "extra-model-parsing" update mode strips them from the lore arrays on the
+ * `worldinfo_entries_loaded` event — which fires inside getSortedEntries,
+ * upstream of BOTH getWorldInfoPrompt ('st') and getSortedEntries ('all').
+ * On cards where MVU is NOT in that mode, the entries flow through the scan
+ * untouched. The raw books see them either way.
  *
- * Matching mirrors MVU's own UPDATE_REGEX exactly: /[mvu_update]/i on the
- * comment. Constant-only and enabled-only, per the Diagnose use case.
- * `existingBlock` is the already-built scan block, used to dedupe so we don't
- * repeat an entry the scan already included (e.g. on a non-extra-parsing card).
+ * Policy: only Diagnose mode wants these mechanism rules (it audits variable
+ * updates against them). Chat / advisor / preset prompts should NOT carry
+ * them — they're noise there, and worse, the output-format contract is what
+ * coaxes models into emitting <UpdateVariable> blocks in oracle replies (the
+ * leakage stripMechanismBlocks exists to clean up). So buildWorldInfo /
+ * buildWorldInfoSplit strip them from every block, and Diagnose re-injects
+ * them via collectMvuUpdateRules. Untagged variable entries (e.g. threshold
+ * explanations) are not touched.
  */
 const MVU_UPDATE_TAG = /\[mvu_update\]/i;
 
-async function collectMvuUpdateRules(existingBlock) {
+// Enumerate every enabled, constant [mvu_update] entry from the raw active
+// books. Returns substituted content strings, deduped, sorted by entry order.
+async function collectMvuRuleContents() {
     const ctx = getCtx();
     const mod = await loadWorldInfoModule();
     if (!mod || typeof mod.getSortedEntries !== 'function' || typeof mod.loadWorldInfo !== 'function') {
@@ -702,7 +718,6 @@ async function collectMvuUpdateRules(existingBlock) {
         return [];
     }
 
-    const seen = existingBlock || '';
     const collected = [];
     for (const name of names) {
         let book;
@@ -715,7 +730,6 @@ async function collectMvuUpdateRules(existingBlock) {
             try { content = ctx.substituteParams(content); } catch (_) { /* leave raw */ }
             content = content.trim();
             if (!content) continue;
-            if (seen.includes(content)) continue;                 // already in the scan block
             if (collected.some((c) => c.content === content)) continue; // dupe across books
             collected.push({ order: Number(e.order) || 0, content });
         }
@@ -723,6 +737,34 @@ async function collectMvuUpdateRules(existingBlock) {
 
     collected.sort((a, b) => a.order - b.order);
     return collected.map((c) => c.content);
+}
+
+// Diagnose-mode recovery: the [mvu_update] rules that are NOT already in the
+// built block (buildWorldInfo strips them by design; MVU may also have hidden
+// them from the scan). Diagnose appends these so its audit always has the
+// authoritative path/type/check rules.
+async function collectMvuUpdateRules(existingBlock) {
+    const seen = existingBlock || '';
+    const contents = await collectMvuRuleContents();
+    return contents.filter((c) => !seen.includes(c));
+}
+
+// Remove [mvu_update] mechanism-rule content from a built world-info block.
+// The scan returns joined strings (not entries), so removal is content-based:
+// the same substituted content the scan would have inserted is matched and
+// cut out, then leftover blank lines are collapsed. No-op on cards without
+// [mvu_update] entries.
+async function stripMvuRuleContents(text) {
+    if (!text || typeof text !== 'string') return text || '';
+    let contents;
+    try { contents = await collectMvuRuleContents(); } catch (e) { return text; }
+    if (!contents.length) return text;
+    let out = text;
+    for (const c of contents) {
+        if (!c || !out.includes(c)) continue;
+        out = out.split(c).join('');
+    }
+    return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 /* ------------------------------------------------------------------ *
@@ -3338,9 +3380,10 @@ async function generateReply() {
         // (keep 'all' if the user chose it). Also pull live state + the raw
         // latest <UpdateVariable> block (un-stripped from the stored message).
         worldInfoBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
-        // MVU may strip [mvu_update] rule entries from the scan (extra-model-
-        // parsing mode). Recover them from the raw books so Diagnose has the
-        // authoritative path/type/check rules it's told to rely on.
+        // buildWorldInfo strips [mvu_update] mechanism rules by design (chat/
+        // advisor don't want them), and MVU itself may hide them from the scan
+        // (extra-model-parsing mode). Diagnose is the one mode that NEEDS them,
+        // so recover them from the raw books and append.
         const mvuRules = await collectMvuUpdateRules(worldInfoBlock);
         if (mvuRules.length) {
             worldInfoBlock = [worldInfoBlock, ...mvuRules].filter(Boolean).join('\n\n');
