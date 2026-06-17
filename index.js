@@ -104,16 +104,20 @@ content>>>
 </LorebookEdit>
 
 · patch（局部修改已有条目）—— 修改已有条目时【优先用它】，不必重发整条：
-用 anchor 圈出要替换的范围：开头 3-4 个字 +「 || 」+ 结尾 3-4 个字；新文本放进 <<<replace … replace>>>。要在某处「插入」而非整段覆盖，就把锚定的那一小段连同新内容一起写进 replace（即在新文本里把开头、结尾那几个字也照抄上）。
+anchor 用来定位要替换的原文；新文本放进 <<<replace … replace>>>。anchor 有两种写法，【优先用单锚点】：
+· 单锚点（首选）：要替换的是一段【连续】原文时，把这段原文【一字不差】地照抄进 anchor 就行——改名、替换词句、改写短句几乎都用它。例：把「红色斗篷」改成「蓝色斗篷」，anchor 写 红色斗篷，replace 写 蓝色斗篷。
+· 区间锚点（start || end）：仅当要替换的范围【很长】、整段照抄不便时才用——范围【开头】3-4 个字 +「 || 」+ 范围【结尾】3-4 个字，圈出从开头到结尾（含首尾）的整段。开头与结尾这两小段【必须互不相同、互不重叠】：绝不能写成同一段文字，也不能让结尾那几个字落在开头那几个字之内，否则锚点会对不上。
+· 每个 patch 只替换【第一处】匹配；同一条目里多处要改就写多个 patch，它们按先后依次生效（所以同一个词重复出现、要全部替换时，写几个相同的单锚点 patch 即可逐处替换掉）。
 <LorebookEdit>
 action: patch
 book: 世界书名
 uid: 12
-anchor: 开头几个字 || 结尾几个字
+anchor: 红色斗篷
 <<<replace
-（用来替换 anchor 所圈范围的新文本）
+蓝色斗篷
 replace>>>
 </LorebookEdit>
+要在某处「插入」而非整段覆盖，就把锚定的那一小段连同新内容一起写进 replace（即在新文本里把首尾那几个字也照抄上）。
 
 · edit（整条覆盖）—— 仅在条目很短、或确实要整条重写时才用：
 <LorebookEdit>
@@ -1001,8 +1005,27 @@ async function buildLorebookContext() {
     }
 
     lbContextText = blocks.join('\n\n') || '（未能读取到任何世界书条目。）';
-    // Macros inside entry content (e.g. {{user}}) — resolve for readability.
-    try { lbContextText = ctx.substituteParams(lbContextText); } catch (e) { /* leave raw */ }
+    // Show entry content VERBATIM — do NOT substituteParams it. The lore manager EDITS
+    // these books, and macros ({{user}}/{{char}} …) are stored literally. The old
+    // behavior expanded them "for readability", so the model anchored on the persona /
+    // char NAME (e.g. "Chris") while storage still held "{{user}}" → patch 锚点未找到 on
+    // apply (lbFuzzyReplace matches the literal content loadWorldInfo returns), and it
+    // risked baking the name into the book. Instead, keep it literal and prepend a small
+    // legend giving the macro values, so chat stays readable without touching content.
+    if (lbContextText.indexOf('{{') !== -1) {
+        const pairs = [];
+        try {
+            const u = ctx.substituteParams('{{user}}');
+            const c = ctx.substituteParams('{{char}}');
+            if (u && u !== '{{user}}') pairs.push(`{{user}} = 「${u}」`);
+            if (c && c !== '{{char}}') pairs.push(`{{char}} = 「${c}」`);
+        } catch (e) { /* no ctx — skip the name mapping, keep the literal-macro note */ }
+        const names = pairs.length ? `当前 ${pairs.join('、')}。` : '';
+        lbContextText = '（说明：下列条目正文按【原样】显示，含 {{user}}、{{char}} 等宏，未做替换。' + names +
+            '聊天作答可用真名以便阅读；但【编辑】时，anchor 锚点与 replace / content 正文都必须照抄字面的 ' +
+            '{{user}} / {{char}} 等宏，不要替换成真名——否则锚点对不上当前存储，还会把名字写死进世界书。）\n\n' +
+            lbContextText;
+    }
 }
 
 // Convert a fenced body the model wrote with literal "\n" (out of JSON habit)
@@ -1169,9 +1192,23 @@ function lbFuzzyReplace(content, anchor, replace) {
                 const sM = norm.match(lbFuzzyRegex(startA));
                 if (!sM) return { result: src, matched: false };
                 const afterIdx = sM.index + sM[0].length;
-                const eM = norm.slice(afterIdx).match(lbFuzzyRegex(endA));
-                if (!eM) return { result: src, matched: false };
-                const end = afterIdx + eM.index + eM[0].length;
+                // Primary: the end segment lies strictly AFTER the start match (a normal
+                // disjoint span). Fallback: models frequently write a degenerate or
+                // overlapping span — start === end ("桜丘也不例外 || 桜丘也不例外"), end a
+                // suffix of start ("…入读桜丘 || 入读桜丘"), or a shared run between the two
+                // ("特待生身份入读 || 入读桜丘"). The strict search can never find such an end
+                // (its chars were already consumed by the start match) → 锚点未找到. So
+                // re-search the end from the START of the start match, then clamp the span
+                // to cover at least the start anchor (never shorter than start matched).
+                let eM = norm.slice(afterIdx).match(lbFuzzyRegex(endA));
+                let end;
+                if (eM) {
+                    end = afterIdx + eM.index + eM[0].length;
+                } else {
+                    eM = norm.slice(sM.index).match(lbFuzzyRegex(endA));
+                    if (!eM) return { result: src, matched: false };
+                    end = Math.max(afterIdx, sM.index + eM.index + eM[0].length);
+                }
                 return { result: src.slice(0, sM.index) + repl + src.slice(end), matched: true };
             }
         }
@@ -3493,6 +3530,7 @@ function buildWindow() {
                 <div class="so-lb-entries-tools">
                     <button type="button" class="so-lb-mini" id="so-lb-all">全选</button>
                     <button type="button" class="so-lb-mini" id="so-lb-none">全不选</button>
+                    <button type="button" class="so-lb-mini" id="so-lb-filtered" disabled title="只选中当前筛选 / 搜索结果里的条目（先在下方筛选框输入关键词）">全选筛选</button>
                     <button type="button" class="so-lb-mini so-lb-mini-blue" id="so-lb-blue" title="只选常驻（蓝灯）条目，不含已禁用">仅蓝灯</button>
                     <button type="button" class="so-lb-mini so-lb-mini-green" id="so-lb-green" title="只选关键词触发（绿灯）条目，不含已禁用">仅绿灯</button>
                     <button type="button" class="so-lb-mini so-lb-mini-off" id="so-lb-disabled" title="只选已禁用条目">仅禁用</button>
@@ -3752,6 +3790,7 @@ function bindControls() {
     });
     win.querySelector('#so-lb-all').addEventListener('click', () => setAllLbEntries(true));
     win.querySelector('#so-lb-none').addEventListener('click', () => setAllLbEntries(false));
+    win.querySelector('#so-lb-filtered').addEventListener('click', () => selectFilteredLbEntries());
     win.querySelector('#so-lb-blue').addEventListener('click', () => setLbEntriesByType('blue'));
     win.querySelector('#so-lb-green').addEventListener('click', () => setLbEntriesByType('green'));
     win.querySelector('#so-lb-disabled').addEventListener('click', () => setLbEntriesByType('off'));
@@ -5324,6 +5363,31 @@ function filterLbEntries(q) {
             .some((r) => (r.dataset.book || '') === book && r.style.display !== 'none');
         head.style.display = (headMatches || anyRowVisible) ? '' : 'none';
     }
+    updateLbFilteredBtn();
+}
+
+// 「全选筛选」：把选择设为【当前筛选 / 搜索后仍可见】的那些条目（每本书各自计算）；
+// 被筛掉（隐藏）的条目一律不选 —— 于是结果恰好等于你眼前筛出来的这些。无筛选时＝全选。
+function selectFilteredLbEntries() {
+    const perBook = new Map();   // book -> Set of visible uids
+    for (const row of win.querySelectorAll('#so-lb-entries-list .so-lb-ent')) {
+        const book = row.dataset.book || '';
+        if (!perBook.has(book)) perBook.set(book, new Set());
+        const box = row.querySelector('input[type="checkbox"]');
+        const visible = row.style.display !== 'none';
+        if (box) box.checked = visible;
+        if (visible && box) perBook.get(book).add(Number(box.dataset.uid));
+    }
+    for (const [book, sel] of perBook) lbEntryFilter[book] = sel;   // exactly the visible set (refresh collapses full→null)
+    refreshLbEntriesSummary();
+}
+
+// 「全选筛选」只在有筛选词时才有意义（否则就等于「全选」）—— 没筛选时禁用它。
+function updateLbFilteredBtn() {
+    const btn = win.querySelector('#so-lb-filtered');
+    if (!btn) return;
+    const f = win.querySelector('#so-lb-entries-filter');
+    btn.disabled = !(f && f.value && f.value.trim());
 }
 
 // Build / refresh the entry checklist. A specific target -> just that book's
@@ -5416,6 +5480,7 @@ async function populateLorebookEntries() {
     const f = win.querySelector('#so-lb-entries-filter');
     if (f && f.value) filterLbEntries(f.value);
     refreshLbEntriesSummary();
+    updateLbFilteredBtn();
 }
 
 function formatPrompt(msgs) {

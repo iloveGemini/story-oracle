@@ -635,6 +635,8 @@
     transition: background-color 0.15s;
 }
 .so-lb-mini:hover { background: color-mix(in srgb, var(--so-lb-accent) 22%, transparent); }
+.so-lb-mini:disabled { opacity: 0.4; cursor: default; }
+.so-lb-mini:disabled:hover { background: color-mix(in srgb, var(--so-lb-accent) 10%, transparent); }
 .so-lb-mini-blue::before, .so-lb-mini-green::before, .so-lb-mini-off::before {
     content: ''; width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
 }
