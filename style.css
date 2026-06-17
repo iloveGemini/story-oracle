@@ -668,6 +668,22 @@
 .so-lb-ent-uid { opacity: 0.5; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .so-lb-ent-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .so-lb-ent-empty { font-size: 0.8em; opacity: 0.55; padding: 4px 2px; }
+/* per-book header shown when editing "all active books" (grouped entry picker) */
+.so-lb-book-head {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 0.78em; font-weight: 600; opacity: 0.85;
+    padding: 6px 3px 3px; margin-top: 3px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.so-lb-book-head:first-child { border-top: none; margin-top: 0; padding-top: 2px; }
+.so-lb-book-head .fa-book { opacity: 0.55; flex: 0 0 auto; color: var(--so-lb-accent); }
+.so-lb-book-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.so-lb-book-count {
+    flex: 0 0 auto; font-size: 0.92em; opacity: 0.7; font-variant-numeric: tabular-nums;
+    background: color-mix(in srgb, var(--so-lb-accent) 18%, transparent);
+    border-radius: 9px; padding: 0 7px;
+}
+.so-lb-ent-empty-sub { padding-left: 16px; opacity: 0.45; }
 
 /* per-op apply results + parse-error notice (lorebook) */
 .so-lb-results { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
@@ -951,7 +967,13 @@
 
 #so-adv-bar {
     display: none;
-    flex: 0 0 auto;
+    /* 0 1 auto + min-height:0 + overflow-y:auto: a tall arc form (esp. blind, ~9 fields)
+       scrolls inside the bar instead of overflowing the window's clipped edge — the
+       window itself never scrolls, so without this the lower fields were unreachable. */
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
     flex-direction: column;
     gap: 6px;
     padding: 9px 12px;
@@ -1175,7 +1197,7 @@
 /* the strip's in-window display rule is scoped to #so-window — float version */
 #so-plan-float #so-plan-bar { display: flex; border-bottom: none; }
 
-/* ---------- collapsed float: tiny 「🧭 引导中」 pill ---------- */
+/* ---------- collapsed float: a single 🧭 compass button (no words) ---------- */
 #so-plan-float.so-collapsed {
     width: auto;
     border-radius: 999px;
@@ -1184,8 +1206,355 @@
 #so-plan-float.so-collapsed #so-plan-float-head {
     border-bottom: none;
     border-radius: 999px;
-    padding: 5px 8px 5px 11px;
+    padding: 3px;
+    gap: 0;
 }
-#so-plan-float.so-collapsed .so-plan-float-title { font-size: 0.8em; }
-/* keep the pill minimal: expand first, then open the oracle from the full head */
+/* fold to the compass alone: hide the decorative compass, the words, the spacer and
+   the open(moon) button — the collapse toggle now carries the compass icon and is the
+   whole pill (tap it to expand; the oracle opens from the full head once expanded). */
+#so-plan-float.so-collapsed #so-plan-float-head > .fa-compass,
+#so-plan-float.so-collapsed .so-plan-float-title,
+#so-plan-float.so-collapsed .so-plan-spacer,
 #so-plan-float.so-collapsed #so-plan-float-open { display: none; }
+#so-plan-float.so-collapsed #so-plan-float-collapse {
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 1;
+    color: var(--so-adv-accent);
+    font-size: 1.15em;
+}
+
+/* arc system is experimental — give its in-form notice a subtle amber emphasis */
+.so-arc-exp-warn { color: color-mix(in srgb, #e0a23a 72%, var(--SmartThemeBodyColor, #e6e6e6)); }
+
+/* compiling a beat (CoT) can take a while — spin the compass wherever it shows
+   (in-window plan bar / float head / collapsed compass pill) as a universal,
+   provider-agnostic "working" signal that pairs with the elapsed-time progress line.
+   Reuses the existing so-spin keyframe. */
+.so-arc-busy .fa-compass { animation: so-spin 1.1s linear infinite; }
+
+/* 「📡 实时输出」查看器：独立浮窗，诊断「在流式生成 vs 卡死」 */
+#so-live {
+    --so-accent: var(--SmartThemeQuoteColor, #8ab4f8);
+    --so-adv-accent: color-mix(in srgb, var(--so-accent) 45%, #4fb0a5 55%);
+    position: fixed;
+    top: 80px;
+    left: 12px;
+    z-index: 3001;
+    display: none;
+    flex-direction: column;
+    width: min(520px, calc(100vw - 16px));
+    height: min(60vh, 460px);
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    border: 1px solid color-mix(in srgb, var(--so-adv-accent) 50%, transparent);
+    border-radius: 12px;
+    background: var(--SmartThemeBlurTintColor, rgba(22, 24, 28, 0.97));
+    box-shadow: 0 12px 32px -10px rgba(0, 0, 0, 0.65);
+    overflow: hidden;
+}
+#so-live-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    cursor: grab;
+    user-select: none;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--so-adv-accent) 18%, transparent), transparent);
+}
+#so-live-head:active { cursor: grabbing; }
+#so-live-head .fa-satellite-dish { color: var(--so-adv-accent); }
+#so-live-title { font-weight: 600; }
+.so-live-status { font-size: 0.82em; opacity: 0.85; }
+#so-live-body {
+    flex: 1;
+    margin: 0;
+    padding: 10px 12px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.85em;
+    line-height: 1.5;
+    font-family: var(--monoFontFamily, ui-monospace, monospace);
+}
+
+/* ---------- arc system (剧情参谋弧线 — layer 2 骨架) ---------- */
+/* waypoint progress line above the goal */
+#so-plan-progress {
+    font-size: 0.78em;
+    opacity: 0.7;
+    line-height: 1.4;
+    font-variant-numeric: tabular-nums;
+}
+
+/* manual arc-creation entry + form, inside the advisor toolbar */
+#so-arc-new { align-self: flex-start; }
+#so-arc-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--so-adv-accent) 40%, transparent);
+    background: color-mix(in srgb, var(--so-adv-accent) 8%, transparent);
+}
+#so-arc-form .so-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.82em; }
+#so-arc-form .so-field > span { opacity: 0.72; }
+#so-arc-form input,
+#so-arc-form textarea,
+#so-arc-form select {
+    width: 100%;
+    box-sizing: border-box;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+    border-radius: 8px;
+    padding: 6px 9px;
+    font-family: inherit;
+}
+#so-arc-form input:focus,
+#so-arc-form textarea:focus,
+#so-arc-form select:focus { outline: none; border-color: var(--so-adv-accent); }
+#so-arc-form textarea { resize: vertical; line-height: 1.4; }
+.so-arc-form-actions { display: flex; gap: 6px; justify-content: flex-end; }
+#so-arc-blind-fields { display: flex; flex-direction: column; gap: 8px; }
+
+/* ---------- blind arc (盲盒) plan bar ---------- */
+/* difficulty badge — pill colored by 赌注 amplitude (calm/normal/stark) */
+.so-arc-diff-badge {
+    flex: 0 0 auto;
+    align-self: center;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 0.62em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    color: #fff;
+    background: color-mix(in srgb, var(--so-adv-accent) 80%, black 6%);
+}
+.so-arc-diff-badge[data-difficulty="calm"]   { background: color-mix(in srgb, #5fae8c 78%, black 6%); }
+.so-arc-diff-badge[data-difficulty="normal"] { background: color-mix(in srgb, var(--so-adv-accent) 80%, black 6%); }
+.so-arc-diff-badge[data-difficulty="stark"]  { background: color-mix(in srgb, var(--crimson70a, #d96b6b) 82%, black 6%); }
+
+/* spoiler mask on the directive viewer: blurred until one tap (soft secrecy — the
+   blind goal is intentionally peekable, never truly hidden). Only the blind branch of
+   renderArcBarBody adds .so-spoiler; the tap toggles .peek. */
+#so-plan-directive.so-spoiler {
+    filter: blur(5px);
+    cursor: pointer;
+    user-select: none;
+    transition: filter 0.18s ease;
+}
+#so-plan-directive.so-spoiler.peek {
+    filter: none;
+    user-select: text;
+    cursor: auto;
+}
+
+/* arc-shaping (弧线节奏) control row — layer 6; reuses .so-plan-int pill styling */
+.so-arc-shaping-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.so-arc-shaping-label { font-size: 0.72em; opacity: 0.7; flex: 0 0 auto; }
+
+/* ============================================================== *
+ * 用户功能请求（自动诊断 / 持久侧聊 / 运行概要） —— 2026-06-14
+ * ============================================================== */
+#so-window { --so-auto-red: color-mix(in srgb, var(--crimson70a, #d9534f) 88%, #ff5b52 12%); }
+
+/* ---------- 自动诊断：诊断按钮的红色 AUTO 态 ---------- */
+/* AUTO 标签：平时藏起，自动模式开启时显示在听诊器图标旁。 */
+#so-diagnose-btn .so-auto-tag {
+    display: none;
+    margin-left: 3px;
+    font-size: 0.5em;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    line-height: 1;
+    vertical-align: middle;
+}
+/* 红色覆盖普通诊断的蓝色高亮（本块在 #so-diagnose-btn.so-diag-active 之后，源序更高）。 */
+#so-diagnose-btn.so-diag-auto {
+    color: #fff;
+    background-color: var(--so-auto-red, #d9534f);
+    opacity: 1;
+}
+#so-diagnose-btn.so-diag-auto .so-auto-tag { display: inline; }
+/* 自动模式给标题栏一抹红，呼应按钮（红优先于 .so-diag-on 的蓝标题栏）。仅在【确实处于
+   诊断窗口模式】时染红——这样重载后 AUTO 仍开、但窗口停在聊天模式时，只有按钮红、标题栏不红。 */
+#so-window.so-diag-auto-on.so-diag-on #so-header {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--so-auto-red, #d9534f) 22%, transparent),
+        transparent);
+}
+
+/* 自动诊断留在侧聊框里的修复记录（持久 note 气泡）：左对齐、可读、补丁可滚动。
+   即便诊断那一刻窗口是关着的，记录也留得下，重载后仍在（用户功能请求）。 */
+.so-note-record {
+    text-align: left;
+    opacity: 0.9;
+    font-size: 0.78em;
+    line-height: 1.45;
+    margin: 4px 10px;
+    padding: 6px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-radius: 6px;
+    border-left: 2px solid var(--so-auto-red, #d9534f);
+    background: color-mix(in srgb, var(--so-auto-red, #d9534f) 10%, transparent);
+}
+/* 文本部分单独滚动，撤销按钮始终在补丁下方可见（补丁很长时也不会被裹进滚动区盖掉） */
+.so-note-record-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow: auto;
+}
+/* 撤销按钮条：复用 .so-apply-bar/.so-apply-btn/.so-apply-status（手动诊断同款），仅留点上间距 */
+.so-note-undo { margin-top: 2px; }
+
+/* 概要图标的「有内容」小红点 */
+#so-summary-btn { position: relative; }
+#so-summary-btn.so-has-summary::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--so-accent);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+/* ---------- 运行概要编辑器（叠层，仿 #so-debug） ---------- */
+#so-summary {
+    display: none;
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    flex-direction: column;
+    border-radius: var(--so-radius);
+    background-color: var(--SmartThemeBlurTintColor, rgba(18, 18, 20, 0.985));
+    backdrop-filter: blur(calc(var(--SmartThemeBlurStrength, 10px) + 6px));
+}
+#so-summary.open { display: flex; }
+#so-summary-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 9px 10px 9px 12px;
+    font-weight: 600;
+    font-size: 0.9em;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--so-accent) 12%, transparent), transparent);
+}
+#so-summary-sub {
+    flex: 0 0 auto;
+    padding: 10px 12px 6px;
+    font-size: 0.78em;
+    opacity: 0.62;
+    line-height: 1.5;
+}
+#so-summary-text {
+    flex: 1 1 auto;
+    min-height: 0;
+    margin: 0 12px;
+    padding: 10px;
+    resize: none;
+    box-sizing: border-box;
+    border-radius: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    background-color: rgba(0, 0, 0, 0.22);
+    color: var(--SmartThemeBodyColor, #ddd);
+    font-family: inherit;
+    font-size: 0.86em;
+    line-height: 1.55;
+}
+#so-summary-foot {
+    flex: 0 0 auto;
+    padding: 6px 12px 12px;
+    font-size: 0.74em;
+    opacity: 0.7;
+    text-align: right;
+}
+
+/* ---------- 自动诊断首开警告弹窗（居中卡片，仿 #so-curate） ---------- */
+#so-autowarn {
+    display: none;
+    position: absolute;
+    inset: 0;
+    z-index: 60;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    box-sizing: border-box;
+    background: rgba(8, 9, 12, 0.84);
+    backdrop-filter: blur(4px);
+}
+#so-autowarn.open { display: flex; }
+#so-autowarn-card {
+    width: 100%;
+    max-width: 440px;
+    box-sizing: border-box;
+    border-radius: 12px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    background-color: #1b1d23;
+    background-image: linear-gradient(180deg, color-mix(in srgb, var(--so-auto-red, #d9534f) 12%, transparent), transparent 120px);
+    box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.7);
+    padding: 16px 18px;
+}
+#so-autowarn-head {
+    font-weight: 700;
+    font-size: 1.02em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+#so-autowarn-head > i { color: var(--so-auto-red, #d9534f); }
+#so-autowarn-body { font-size: 0.84em; line-height: 1.6; }
+#so-autowarn-body p { margin: 0 0 9px; }
+#so-autowarn-body .so-autowarn-danger {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--so-auto-red, #d9534f) 55%, transparent);
+    background: color-mix(in srgb, var(--so-auto-red, #d9534f) 14%, transparent);
+}
+#so-autowarn-body .so-autowarn-note { opacity: 0.68; }
+.so-autowarn-check {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 6px 0 14px;
+    font-size: 0.84em;
+    cursor: pointer;
+}
+.so-autowarn-check input { cursor: pointer; }
+#so-autowarn-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+#so-autowarn-btns button {
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--SmartThemeBodyColor, #ddd);
+    cursor: pointer;
+    font-size: 0.86em;
+}
+#so-autowarn-btns button:hover { background: rgba(255, 255, 255, 0.12); }
+#so-autowarn-ok {
+    background: var(--so-auto-red, #d9534f) !important;
+    border-color: var(--so-auto-red, #d9534f) !important;
+    color: #fff !important;
+    font-weight: 600;
+}

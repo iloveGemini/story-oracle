@@ -194,6 +194,14 @@ const ADVISOR_INTENSITIES = {
     },
 };
 
+// 篇幅感（spanFeel）→ 人类可读标签 + 大致拍数区间。喂给编译器，让「medium」这种不透明 token 真正校准
+// 压缩 / 扩展决策（#8）；也是 buildArc 校验 spanFeel 的单一来源。未来「路标自动起草」按区间定路标数（设计 §8）。
+const SPAN_FEEL = {
+    short:  { label: '短篇', range: '约 3-5 拍',  min: 3, max: 5 },
+    medium: { label: '中篇', range: '约 5-9 拍',  min: 5, max: 9 },
+    long:   { label: '长篇', range: '约 8-15 拍', min: 8, max: 15 },
+};
+
 /* ------------------------------------------------------------------ *
  * 说话人格（voice personas）。
  *
@@ -299,6 +307,65 @@ function buildPersonaBlock(personaId, mode) {
 // role-preserving, marker-aware prompt from that frozen curated copy.
 const ENABLE_SYSPROMPT_PRESET = true;
 
+// 剧情参谋「弧线系统」总开关（实验性大改动；完整设计见 _ADVISOR-ARC-DESIGN.md）。
+// 关掉时参谋彻底退回 v1.14.x 单拍行为：getActiveConstruct 忽略任何弧线元数据，弧线入口不出现。
+const ENABLE_ARC = true;
+
+// 自动诊断总开关（用户功能请求；实验性——它是唯一会【自动写入 MVU 游戏状态】的功能，故配真正的杀死开关）。
+// === 出问题时的一键回退：把这一行改成 false ===（无需动其它代码）。关掉时：
+//   · 诊断按钮退回原始两态（关 ↔ 诊断，AUTO 不可达）；· 后台 message_received 监听器空转、绝不调用模型、
+//   · 绝不自动写 MVU；· 按钮的红色 AUTO 视觉不出现；· 若历史上有人开过 AUTO，下次点按钮会顺手清掉残留的
+//   s.autoDiagnoseEnabled。手动诊断模式完全不受影响。被 toggleDiagnose / updateDiagButtonVisual /
+//   maybeAutoDiagnose 实读（非装饰；constants-meta 元测试守它确实被引用，避免 ENABLE_ADVISOR_MODE 式空开关）。
+const ENABLE_AUTO_DIAGNOSE = true;
+
+// 自动诊断【写回 / 状态栏刷新】开关。auto 诊断走 Mvu.replaceMvuData，它【不发】VARIABLE_UPDATE_ENDED
+// （官方更新走 MVU 更新引擎才发），故前端状态栏不会自己刷新。true（默认）= 确有改动后把结果反映到消息 / 状态栏：
+//   · 衍生（乙，原回复【没有】内联 <UpdateVariable>）：把推导出的更新块【写回该 AI 消息】+ saveChat + 重渲染——
+//     与官方 MVU 更新（行内 / 额外模型解析）一致：消息携带更新记录、状态栏刷新。
+//   · 核验（甲，原回复【已有】块）：只【重渲染】该消息刷新状态栏，不动消息正文（避免出现两个更新块）。
+// false = 只经 MVU 写变量，既不碰消息正文也不重渲染（旧行为）。某卡写回 / 重渲染出问题时可一键关掉而保留诊断本身。
+// runAutoDiagnose 实读（constants-meta 守）。
+const AUTO_DIAGNOSE_WRITE_BACK = true;
+
+// MVU 的状态栏占位符——【硬编码常量】，不是按卡而异：MVU 的 handleVariablesInMessage 会给每条 AI 消息无条件
+// 追加它（MagVarUpdate beta `src/function/update_variables.ts:1478`；函数调用路径 `function_call.ts:247` 同样追加），
+// 卡片的显示正则再把它渲染成状态栏；MVU 还会自己把它从发给 AI 的提示词里剥掉（`filter_prompts.ts`）。auto 诊断
+// 衍生写回时照样补上它（见 writeUpdateBlockToMessage），令状态栏像官方更新那样出现——与官方行为一致，对任何 MVU 卡都安全。
+const STATUS_PLACEHOLDER = '<StatusPlaceHolderImpl/>';
+
+// 编译器上下文模式开关（无 UI、纯代码——改这一行即可整体切换）：
+//   true  = 全量匹配：每次过渡都喂【全史 + 角色卡 + 世界书】（与剧情参谋同级），写拍 / 核验信息最全，
+//           但每次调用最贵（长对话 + 世界书扫描；高消息量 RP 下 token / 延迟显著上升，注意上下文窗口上限）。
+//   false = 有界 clamp：最近 8..40 条 + 弧线结构 + stat（无卡 / 无世界书），省 token，= 原行为。
+// 作用于过渡调用（编译 buildCompilerMessages / 核验 buildCheckMessages / 合并达成 buildAchieveMessages）
+// 以及【路标自动起草 callWaypointDrafter】——开时连骨架都按真实 RP + 世界书起草，关时各自退回精简形态。
+const COMPILER_FULL_CONTEXT = true;
+
+// 过渡 LLM 调用（编译 / 合并达成 / 路标起草 / 末路标核验）的 max_tokens 下限。给思维链（CoT）留足空间：总预算
+// 8192 ≈ 思考 ≤4096（由 CoT 内硬性「思维预算」规则约束）+ 结构化输出 ≥4096。CoT 必须在结构块【之前】，故
+// <ArcBeat> / <Waypoints> / <ArcCheck> 等产物排在最后——预算不足会直接把真正的产物截断。四类过渡调用统一用它
+//（核验调用也要跑判定 CoT，故不再走原来的 512 小上限）。用户把 maxTokens 设得更高则尊重更高值（取 max）。
+const ARC_CALL_MAX_TOKENS = 8192;
+
+// 【实验·盲盒 stage-B 行为】(2026-06-16；可一键回退) ✓ 核验判 unsure/no 且尚未进 stage B 时，如何"再推一步"：
+//   true（实验） = 重拟（evolve）：让模型写【新的 goal + seed + objective】（仍服务【同一路标】、把故事朝它【再推近一步】），
+//                 据此【重建注入】（buildCompiledBeat），叙事者被重新导向更贴近的幕后结果。仍只一次（置 stage='B'，
+//                 下一次 unsure 仍静默前进、不困住玩家），仍【绝不揭晓】（守"不确定不揭晓"信任机制）。
+//   false（原行为·锁定 goal） = 保留当前 goal / seed / 注入不变，只把玩家任务换成 objectiveB（arcCommitStageB）。
+// 回退：把这一行设 false——逻辑（提交）与措辞（buildAchieveMessages / buildTransitionDirectives /
+// ACHIEVE_SYSTEM_PROMPT）会一并回到"保持同一 goal"。被 arcAchieveMerged / arcMarkAchieved / achievePlan /
+// buildAchieveMessages / buildTransitionDirectives / ACHIEVE_SYSTEM_PROMPT 实读（constants-meta 守它非空摆设）。
+const STAGE_B_EVOLVE_GOAL = true;
+
+// 【实验·类型轮换】(2026-06-16；可一键回退) 是否把"尽量换一种 objective 类型、避开最近几拍"的要求喂给编译 / 达成调用。
+//   false（实验·移除） = 不再把最近几拍类型喂回；编译 / 盲盒附录 / 达成里"避开最近几拍 / 尽量换类"的措辞一并消失，
+//                       模型只按【最自然】写、不受类型轮换牵制（<ArcBeat> 的 type 字段仍照常标注，纯记录、不再约束）。
+//   true（原行为·round-7 软轮换） = buildTransitionDirectives 把最近类型喂回 +三处 prompt 的"尽量换类（自然第一）"在场。
+// 回退：把这一行设 true。被 buildTransitionDirectives + COMPILER_SYSTEM_PROMPT + BLIND_COMPILER_ADDENDUM +
+// ACHIEVE_SYSTEM_PROMPT 实读（constants-meta 守）。
+const ENABLE_TYPE_ROTATION = false;
+
 // 各模式可在设置里查看 / 修改的系统提示词。剧情参谋（advisor）暂不纳入——它仍是
 // 实验性功能，提示词保持内置、不开放修改。
 // chat 沿用旧行为：提示词正文直接存在 `systemPrompt` 里。
@@ -349,6 +416,12 @@ const defaults = {
     // 大状态卡 + 频繁提问会吃 token，可在设置里关掉（关掉后会改为如实拒答数值）。
     chatIncludeStat: true,
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
+    // 自动诊断（用户功能请求）：开启后，每收到一条新的主聊天 AI 回复，就在后台跑一次诊断
+    // 并自动应用修复（见 maybeAutoDiagnose / runAutoDiagnose）。autoDiagnoseWarned 记录「不再
+    // 提示」那次警告。delayMs 给 MVU 先处理完该回复的更新、再读取权威状态的缓冲时间。
+    autoDiagnoseEnabled: false,
+    autoDiagnoseWarned: false,
+    autoDiagnoseDelayMs: 1200,
     worldInfoMode: 'off',      // 'off' | 'st' (constant + keyword) | 'all' (every entry)
     sendTemperature: true,     // include temperature in the request (some models reject it)
     // Lorebook mode: which book(s) to load. '' = every currently-active book;
@@ -472,6 +545,12 @@ function init() {
         if (ctx.eventSource && typeof ctx.eventSource.on === 'function') {
             ctx.eventSource.on(et.CHAT_CHANGED || 'chat_id_changed', onChatChanged);
             ctx.eventSource.on(et.MESSAGE_RECEIVED || 'message_received', checkPlanReminder);
+            // 用户功能请求：自动诊断 —— 每条新回复后台诊断 + 自动修复（仅在自动模式开启时动作）。
+            // 必须「即发即忘」：ST 的 eventSource.emit 会 await 监听器，直接挂上 async 的
+            // maybeAutoDiagnose 会让每条回复都卡住整个诊断往返。包一层、不把 promise 交回去。
+            ctx.eventSource.on(et.MESSAGE_RECEIVED || 'message_received', (id) => {
+                Promise.resolve(maybeAutoDiagnose(id)).catch((e) => console.warn('[Story Oracle] 自动诊断调度失败：', e));
+            });
         }
     } catch (e) {
         console.warn('[Story Oracle] event wiring failed (plan injection will only refresh on reload):', e);
@@ -559,8 +638,12 @@ async function getWiScanBudget() {
  *            entries only when their keys match the chat/card. Uses a dry run so
  *            it never disturbs the main chat's sticky/cooldown state.
  *   'all' -> every non-disabled entry from the active books, regardless of keys.
+ * extraScanText (optional, 'st' mode only): extra text folded into the scan so
+ * keyword (green) entries whose keys appear in it activate even when recent chat
+ * never mentioned them — used by the arc calls to surface lore about the arc's
+ * own subject (throughline / waypoints / direction; see arcScanText).
  */
-async function buildWorldInfo(forceMode) {
+async function buildWorldInfo(forceMode, extraScanText) {
     const ctx = getCtx();
     const s = getSettings();
     const mode = forceMode || s.worldInfoMode;
@@ -585,6 +668,15 @@ async function buildWorldInfo(forceMode) {
         const chatForWI = coreChat
             .map((m) => `${m.name || (m.is_user ? ctx.name1 : ctx.name2)}: ${m.mes}`)
             .reverse(); // most-recent first, as ST does
+
+        // 把调用方传入的【额外扫描文本】（弧线自身的贯穿线 / 路标 / 方向）并进最近一条消息所在的
+        // 扫描格——它深度无关地一定被扫到，既不挤占 world_info_depth 窗口里的真实消息，又能让以这些
+        // 词为关键词的绿条即便最近聊天没提到也照常激活（见 arcScanText）。仅 'st' 扫描有意义。
+        if (extraScanText && String(extraScanText).trim()) {
+            const inj = String(extraScanText).trim();
+            if (chatForWI.length) chatForWI[0] = inj + '\n' + chatForWI[0];
+            else chatForWI.push(inj);
+        }
 
         let card = {};
         try { card = ctx.getCharacterCardFields() || {}; } catch (e) { /* group/no char */ }
@@ -892,10 +984,11 @@ async function buildLorebookContext() {
         let entries = Object.values(data.entries)
             .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
         const total = entries.length;
-        // Per-entry selection only applies to a single targeted book. A Set (even
-        // empty) means "send exactly these"; null/absent means "send all". Apply
-        // still re-reads the whole book, so editing any uid keeps working.
-        const sel = s.lorebookTarget ? lbEntryFilter[name] : null;
+        // Per-entry selection works in BOTH single-book and all-active mode — the
+        // filter is keyed by book name either way. A Set (even empty) means "send
+        // exactly these"; null/absent means "send all". Apply still re-reads the
+        // whole book, so editing any uid keeps working.
+        const sel = lbEntryFilter[name];
         const filtered = (sel instanceof Set);
         if (filtered) entries = entries.filter((e) => sel.has(e.uid));
         const body = entries.length
@@ -1241,6 +1334,13 @@ async function undoLorebookOps(snapshots) {
 const ADVISOR_PROMPT_KEY = 'story_oracle_plan';
 const ADVISOR_REMIND_AFTER = 20;   // 主聊天走过这么多条消息后，提醒一次方案仍在引导
 const PLAN_META_KEY = MODULE + '_plan';
+// 弧线元数据键（layer-2+）。每个聊天「单拍 plan 异或 弧线 arc」，二者互斥（见 getActiveConstruct）。
+const ARC_META_KEY = MODULE + '_arc';
+// 用户功能请求 —— 都按【当前聊天】持久化，与 plan/arc 同风格（随聊天保存、随切换刷新）：
+//   _convo   持久化的侧聊问答历史（原本仅在内存里、刷新即丢）
+//   _summary 用户粘贴的运行总结 / 前情提要
+const CONVO_META_KEY = MODULE + '_convo';
+const SUMMARY_META_KEY = MODULE + '_summary';
 
 function getChatMetadataSafe() {
     try {
@@ -1269,6 +1369,66 @@ function setPlan(plan) {
     return true;
 }
 
+/* ------------------------------------------------------------------ *
+ * 用户功能请求：按【当前聊天】持久化侧聊历史 + 运行概要（与 plan/arc 同风格——
+ * 随聊天保存、随切换刷新、只在手动清空时清掉）。
+ * ------------------------------------------------------------------ */
+// 写元数据后触发 ST 的持久化（与 setPlan/setArc 内联那段同款的安全封装）。
+function saveChatMetadata() {
+    try {
+        const ctx = getCtx();
+        (ctx.saveMetadataDebounced || ctx.saveMetadata || (() => {}))();
+    } catch (e) { /* metadata still set in memory */ }
+}
+
+// 纯函数：剥掉 _el（DOM 链接）等运行期字段，只留可持久化的 {id, role, content}。也保留自动诊断
+// 的 note 记录（用户功能请求：把自动诊断的回复留在侧聊框里、跨重载存活）。可单测。
+function serializeConvo(list) {
+    return (Array.isArray(list) ? list : [])
+        .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'note') && typeof m.content === 'string')
+        .map((m) => ({ id: m.id, role: m.role, content: m.content }));
+}
+
+// 发往模型的对话历史：只取真正的问答轮（user/assistant）。自动诊断等 note 条目只在侧聊框里
+// 展示 + 持久化，绝不能作为一轮对话回灌给模型（否则会污染问答上下文，甚至把非法 role 发出去）。
+// 默认取当前全局 convo；传显式数组即可单测。所有「把 convo 拼进 messages」的地方都改走这里。
+function convoForPrompt(list = convo) {
+    return (Array.isArray(list) ? list : []).filter((m) => m && (m.role === 'user' || m.role === 'assistant'));
+}
+
+// 读取本聊天保存的侧聊历史（始终回数组）。
+function getConvoMeta() {
+    const md = getChatMetadataSafe();
+    const arr = md ? md[CONVO_META_KEY] : null;
+    return Array.isArray(arr) ? arr : [];
+}
+
+// 把当前 convo 写回本聊天的元数据（空则删键，保持元数据干净）。每次 convo 变动后调用。
+function persistConvo() {
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    const arr = serializeConvo(convo);
+    if (arr.length) md[CONVO_META_KEY] = arr; else delete md[CONVO_META_KEY];
+    saveChatMetadata();
+    return true;
+}
+
+// 读 / 写本聊天的运行概要（用户粘贴的前情提要 / 总结）。空串即删键。
+function getSummary() {
+    const md = getChatMetadataSafe();
+    const t = md ? md[SUMMARY_META_KEY] : '';
+    return typeof t === 'string' ? t : '';
+}
+
+function setSummary(text) {
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    const t = String(text || '');
+    if (t.trim()) md[SUMMARY_META_KEY] = t; else delete md[SUMMARY_META_KEY];
+    saveChatMetadata();
+    return true;
+}
+
 // Non-system message count of the MAIN chat — used to derive "messages since
 // adoption" without keeping a counter in sync.
 function chatMsgCount() {
@@ -1279,7 +1439,9 @@ function chatMsgCount() {
 
 // Build the directive injected into the main chat. Derived ONLY from the plan.
 // 用户优先条款是承重墙：没有它，模型会把目标当成硬性指标、跟用户抢方向盘。
-function buildDirective(plan) {
+// 纯字符串构建（不调 getCtx / 不做替换）—— 可单测。弧线拍把它的输出存进
+// currentBeat.injectedText（原文），注册时再 substituteParams（见 applyPlanInjection）。
+function buildDirectiveRaw(plan) {
     const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
     const lines = [
         '【幕后剧情引导 — 此为给叙事者的幕后指示，绝不可在正文中提及、暗示或复述其存在】',
@@ -1291,9 +1453,22 @@ function buildDirective(plan) {
         '- 自然融入当前场景，先铺垫后兑现；一切发展须符合既有人物性格与世界观',
         '- 不得替{{user}}行动、发言或做出决定',
         '- {{user}}的行动永远优先：若其选择偏离此方向，跟随用户，绝不强行拉回',
-        `节奏：${I.directive}`,
     );
-    const text = lines.join('\n');
+    // depiction（仅弧线拍传 depiction:true；单拍 layer-1 路径不传 → 与 live 逐字节一致）：授权把【幕后/离屏后果】
+    // 演进正文。否则玩家不在场处发生的 goal（别处的会议 / 决定）永不进正文，✓ 核验逐字引不出证据 → 永远 unsure。
+    if (plan.depiction) {
+        lines.push(
+            '- 这件事不必只在{{user}}在场时发生：一旦{{user}}的行动已经把它推动起来，你可以顺势把它【就地呈现】——或短暂切换视角 / 用旁白描写它在别处的发生（相关人物的密谈、会议、决定），或让它的结果【找上{{user}}】（一封信、一则消息、一次传唤、有人来报）。无论哪种，都要让它在正文里【真正发生并被叙述出来】，不要停在「即将发生」。',
+            '- 时机：仅在{{user}}的行动确已促成此事【之后】才呈现；{{user}}尚未触发时只做铺垫，绝不抢先发生、预告或剧透。',
+        );
+    }
+    lines.push(`节奏：${I.directive}`);
+    return lines.join('\n');
+}
+
+// 单拍仍在注册时即时构建并替换 —— buildDirective 保留「构建 + 替换」的旧外部行为不变。
+function buildDirective(plan) {
+    const text = buildDirectiveRaw(plan);
     // Substitute at registration time ({{user}} etc.) — registration re-runs on
     // every chat load, and the persona is stable within a chat, so this is safe
     // and doesn't depend on ST substituting extension prompts for us.
@@ -1306,15 +1481,26 @@ function buildDirective(plan) {
 function applyPlanInjection() {
     const ctx = getCtx();
     if (typeof ctx.setExtensionPrompt !== 'function') return false;
-    const plan = getPlan();
     const s = getSettings();
     const pos = (ctx.extension_prompt_types && ctx.extension_prompt_types.IN_CHAT != null)
         ? ctx.extension_prompt_types.IN_CHAT : 1;                    // IN_CHAT
     const role = (ctx.extension_prompt_roles && ctx.extension_prompt_roles.SYSTEM != null)
         ? ctx.extension_prompt_roles.SYSTEM : 0;                     // SYSTEM
     const depth = Number.isFinite(s.advisorDepth) ? Math.max(0, s.advisorDepth) : 4;
+    // Register the ACTIVE construct's injection — an arc's current beat OR a single
+    // plan — or clear it with '' when neither exists. The arc beat's text is stored
+    // raw and substituted here; a single plan rebuilds via buildDirective (which
+    // substitutes internally). Either way, substitution happens at registration.
+    const active = getActiveConstruct();
+    let text = '';
+    if (active && active.type === 'arc' && active.arc.currentBeat) {
+        const raw = active.arc.currentBeat.injectedText || '';
+        try { text = ctx.substituteParams(raw); } catch (e) { text = raw; }
+    } else if (active && active.type === 'plan') {
+        text = buildDirective(active.plan);
+    }
     try {
-        ctx.setExtensionPrompt(ADVISOR_PROMPT_KEY, plan ? buildDirective(plan) : '', pos, depth, false, role);
+        ctx.setExtensionPrompt(ADVISOR_PROMPT_KEY, text, pos, depth, false, role);
         return true;
     } catch (e) {
         console.warn('[Story Oracle] setExtensionPrompt failed:', e);
@@ -1377,8 +1563,23 @@ function setPlanIntensity(intensity) {
 // obsessing about the festival" reports happen. adoptedAt vs current length —
 // derived, nothing to keep in sync.
 function checkPlanReminder() {
-    const plan = getPlan();
-    if (!plan || plan.reminded) return;
+    const active = getActiveConstruct();
+    if (!active) return;
+    if (active.type === 'arc') {
+        // Per-beat staleness: a beat that never resolves just sits with a stale
+        // injection. Same 20-message threshold, spoiler-safe phrasing.
+        const b = active.arc.currentBeat;
+        if (!b || b.reminded) return;
+        const n = chatMsgCount() - (b.beatAdoptedAt || 0);
+        if (n >= ADVISOR_REMIND_AFTER) {
+            b.reminded = true;
+            setArc(active.arc);
+            addSystemNote(`当前这一拍已持续 ${n} 条消息——推进了吗？可在方案条里「完成」进入下一拍、「换个思路」换条路线，或问我「检查进度」。`);
+        }
+        return;
+    }
+    const plan = active.plan;
+    if (plan.reminded) return;
     const n = chatMsgCount() - (plan.adoptedAt || 0);
     if (n >= ADVISOR_REMIND_AFTER) {
         plan.reminded = true;
@@ -1394,6 +1595,1395 @@ function onChatChanged() {
     applyPlanInjection();
     if (win) renderPlanBar();
     checkPlanReminder();
+    loadConvoForChat();   // 用户功能请求：把本聊天保存的侧聊历史载入窗口（per-chat 持久化）
+    refreshSummaryUI();   // 用户功能请求：刷新本聊天的运行概要编辑器
+}
+
+/* ------------------------------------------------------------------ *
+ * 剧情参谋「弧线系统」—— layer 2 骨架（确定性、无 LLM；完整设计见 _ADVISOR-ARC-DESIGN.md）。
+ *
+ * 「单拍 plan 异或 弧线 arc」，每个聊天只有一个 active 构件。纯函数层（buildArc /
+ * stubCompileBeat / arcAdvance / arcReroll / arcSetIntensity）把时钟 now（主聊天消息数）作为
+ * 参数注入、不调 getCtx，所以可在 jsdom 里确定性单测；元数据 / 注入 / 渲染等副作用留在集成函数里。
+ * stubCompileBeat 是 layer-3 LLM 编译器的确定性替身，到时整体替换为异步 compileBeat。
+ * ------------------------------------------------------------------ */
+
+// ---- 元数据读写（同 getPlan/setPlan 风格）----
+function getArc() {
+    const md = getChatMetadataSafe();
+    const a = md ? md[ARC_META_KEY] : null;
+    return (a && typeof a === 'object' && a.mode && Array.isArray(a.waypoints)) ? a : null;
+}
+
+function setArc(arc) {
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    if (arc) md[ARC_META_KEY] = arc; else delete md[ARC_META_KEY];
+    try {
+        const ctx = getCtx();
+        (ctx.saveMetadataDebounced || ctx.saveMetadata || (() => {}))();
+    } catch (e) { /* metadata still set in memory */ }
+    return true;
+}
+
+// 当前聊天的 active 构件：弧线优先于单拍（采用任一会清掉另一，见 adoptArc）。ENABLE_ARC
+// 关闭时彻底忽略弧线元数据 —— kill switch 让参谋干净退回单拍行为。
+function getActiveConstruct() {
+    const arc = ENABLE_ARC ? getArc() : null;
+    if (arc) return { type: 'arc', arc };
+    const plan = getPlan();
+    if (plan) return { type: 'plan', plan };
+    return null;
+}
+
+// ---- 纯函数层（可单测；时钟 now 由调用方注入）----
+
+// layer-3 LLM 编译器的确定性替身：把一个路标编成一拍。variant>0 = 「换个思路」后的不同路线。
+function stubCompileBeat(arc, waypoint, variant, now) {
+    const v = Number(variant) || 0;
+    const inherit = (arc.currentBeat && arc.currentBeat.intensity) || 'normal';
+    const intensity = ADVISOR_INTENSITIES[inherit] ? inherit : 'normal';
+    const goal = v > 0 ? `${waypoint.intent}（路线 ${v + 1}）` : waypoint.intent;
+    return {
+        waypointId: waypoint.id,
+        title: waypoint.intent,
+        goal,
+        seed: '',
+        why: `推进路标「${waypoint.intent}」`,
+        type: '',                                  // #3 类型由真编译器填；stub 不分类（保形状与 buildCompiledBeat 一致）
+        objective: arc.mode === 'blind' ? waypoint.intent : null,  // 盲盒玩家可见任务（layer-4 精化）
+        intensity,
+        injectedText: buildDirectiveRaw({ goal, seed: '', intensity, depiction: true }),
+        variant: v,
+        stage: null,
+        objectiveB: null,
+        beatAdoptedAt: Number(now) || 0,
+        reminded: false,
+    };
+}
+
+function cloneArc(arc) {
+    return JSON.parse(JSON.stringify(arc));
+}
+
+function arcActiveWaypoint(arc) {
+    return (arc && Array.isArray(arc.waypoints)) ? (arc.waypoints[arc.cursor] || null) : null;
+}
+
+function isArcComplete(arc) {
+    return !!arc && !arc.currentBeat;
+}
+
+// 把一份已解决的拍压进揭晓日志的记录。
+function arcResolvedRecord(beat, outcome) {
+    return {
+        waypointId: beat.waypointId,
+        title: beat.title,
+        goal: beat.goal,
+        objective: beat.objective,
+        seed: beat.seed,
+        why: beat.why,
+        type: beat.type || '',          // #3 类型轮换：揭晓记录也带类型，供 recentBeatTypes 喂回编译器
+        injectedText: beat.injectedText,
+        outcome,
+    };
+}
+
+// 从规格构建一条新弧线，并把第一拍编好。
+//   spec: { mode, throughline, spanFeel, waypoints:[intent…], consent? }
+function buildArc(spec, now) {
+    const mode = (spec && spec.mode === 'blind') ? 'blind' : 'transparent';
+    const waypoints = ((spec && spec.waypoints) || [])
+        .map((intent, i) => ({ id: i + 1, intent: String(intent == null ? '' : intent).trim(), status: 'pending' }))
+        .filter((w) => w.intent);
+    if (waypoints.length) waypoints[0].status = 'active';
+    const arc = {
+        mode,
+        throughline: String((spec && spec.throughline) || '').trim(),
+        spanFeel: (SPAN_FEEL[spec && spec.spanFeel] ? spec.spanFeel : 'medium'),  // #8 校验 + 单一来源
+        waypoints,
+        cursor: 0,
+        consent: mode === 'blind' ? ((spec && spec.consent) || null) : null,
+        currentBeat: null,
+        revealed: [],
+        adoptedAt: Number(now) || 0,
+        shaping: null,
+    };
+    if (waypoints.length) arc.currentBeat = stubCompileBeat(arc, waypoints[0], 0, now);
+    return arc;
+}
+
+// 下一个 pending 路标（跳过 skipped），没有则 null。纯函数。
+function arcPeekNext(arc) {
+    if (!arc || !Array.isArray(arc.waypoints)) return null;
+    let ni = arc.cursor + 1;
+    while (ni < arc.waypoints.length && arc.waypoints[ni].status === 'skipped') ni++;
+    return ni < arc.waypoints.length ? arc.waypoints[ni] : null;
+}
+
+// 把一个【已编好的】beat 装进「推进」结果：标记当前路标 done、压入 revealed、把游标移到 beat
+// 所属路标、装上该 beat。纯函数（beat 由 stub 或真编译器产出，二者形状一致）。
+function arcCommitAdvance(arc, beat, outcome) {
+    const next = cloneArc(arc);
+    const cur = next.waypoints[next.cursor];
+    if (cur) cur.status = 'done';
+    if (arc.currentBeat) next.revealed.push(arcResolvedRecord(arc.currentBeat, outcome || 'done'));
+    const ni = next.waypoints.findIndex((w) => w.id === beat.waypointId);
+    if (ni >= 0) { next.cursor = ni; next.waypoints[ni].status = 'active'; }
+    next.currentBeat = beat;
+    return next;
+}
+
+// 把一个【已编好的】beat 作为「换路线」结果装上（同路标、不动游标）。纯函数。
+function arcCommitReroll(arc, beat) {
+    const next = cloneArc(arc);
+    next.currentBeat = beat;
+    return next;
+}
+
+// 重构待办尾段（living-skeleton，仅盲盒、贯穿线神圣、漂移显著时由编译器触发——设计 §8）：把【当前 active 之后
+// 的全部 pending 路标】标记 skipped（保留审计；arcPeekNext / live 计数 / 显示标签早已支持 skipped），再把模型重拟
+// 的新尾段作为 pending 追加在末尾，id 单调续号（绝不复用 → 护住 revealed / currentBeat 的 id 引用）。done / active
+// 路标与 cursor 一律不动；末端锚定的形状角色因此自动落到新尾段（新尾段最后一个 = 高潮）。纯函数、不改入参、可单测。
+// newTailIntents 为空 / 全空白 → 原样返回（绝不把骨架清空）。
+function arcReviseTail(arc, newTailIntents) {
+    const intents = (Array.isArray(newTailIntents) ? newTailIntents : [])
+        .map((s) => String(s == null ? '' : s).trim()).filter(Boolean);
+    if (!arc || !Array.isArray(arc.waypoints) || !intents.length) return arc;
+    const next = cloneArc(arc);
+    for (let i = next.cursor + 1; i < next.waypoints.length; i++) {
+        if (next.waypoints[i].status === 'pending') next.waypoints[i].status = 'skipped';
+    }
+    let maxId = 0;
+    for (const w of next.waypoints) maxId = Math.max(maxId, Number(w.id) || 0);
+    for (const intent of intents) next.waypoints.push({ id: ++maxId, intent, status: 'pending' });
+    return next;
+}
+
+// 玩家当前实际看到的任务：stage B 时是 objectiveB（延伸任务），否则 objective。纯函数。
+function arcVisibleObjective(beat) {
+    if (!beat) return '';
+    return (beat.stage === 'B' && beat.objectiveB) ? beat.objectiveB : (beat.objective || '');
+}
+
+// 形状角色标签（端锚定的弧线曲线：早期铺垫→中期升温→倒数第二最艰难→末拍高潮）。喂给编译 / 达成调用，让
+// 「这一拍在弧线里扮演什么」由【显式角色】传达，而非让模型从一个会因跳过 / 重构而漂移的原始序号里自己反推。
+const ARC_SHAPE_ROLES = {
+    setup:   '早期铺垫（低赌注，埋线与暗示）',
+    rising:  '中期升温（赌注与张力渐升）',
+    hardest: '倒数第二拍 —— 全弧最艰难的抉择',
+    climax:  '末拍 —— 高潮收束，让贯穿线在此落地',
+};
+
+// 活跃路标序列（排除 skipped）。形状 / 位置一律按它算，不受被跳过 / 重构掉的路标干扰。纯函数。
+function arcLiveWaypoints(arc) {
+    return (arc && Array.isArray(arc.waypoints)) ? arc.waypoints.filter((w) => w && w.status !== 'skipped') : [];
+}
+
+// 某一拍在弧线形状里的【位置 + 角色】，全部按 live 序列、【末端锚定】算（末=高潮、倒数第二=最艰难），所以跳过 /
+// 重构早段路标都不会让承重角色漂移；末路标不可变（贯穿线神圣）更保证锚点稳。这把「drafter 把曲线烤进序列」与
+// 「compiler 从序号反推曲线」两套独立断言合一：不再各算各的，统一从 live 序列末端派生。纯函数、可单测。
+//   返回 { index, total, role }：index/total = 1-based live 位置（不含 skipped）；role ∈ setup|rising|hardest|climax。
+function arcShapePosition(arc, waypoint) {
+    const live = arcLiveWaypoints(arc);
+    const total = live.length;
+    const i = live.findIndex((w) => w && waypoint && w.id === waypoint.id);
+    const index = i < 0 ? 0 : i + 1;
+    let role;
+    if (total <= 1 || index >= total) role = 'climax';                  // 末拍（或独拍）：高潮收束
+    else if (index === total - 1) role = 'hardest';                     // 倒数第二：最艰难抉择
+    else if (index > 0 && index <= Math.round(total / 4)) role = 'setup'; // 前 ~1/4：低赌注铺垫（短弧也保住中段升温）
+    else role = 'rising';                                               // 中段：升温
+    return { index, total, role };
+}
+
+// 置信门控决策（layer-4 细化）：玩家点了「✓ 达成」+ 核验判定 verdict（yes|unsure|no），决定怎么走。
+// 纯函数（不调 LLM、不落副作用），故可确定性单测。守住「不确定一律不揭晓」与「不把玩家困在同一拍」。
+//   yes                      → 'reveal-advance'（揭晓 + 编下一拍 / 收束）
+//   非 yes 且当前非 stage B   → 'stage-b'（同一幕后 goal，换一个更直接的玩家任务；不揭晓、不前进）
+//   非 yes 且已 stage B       → 'quiet-advance'（编下一拍并推进，但不揭晓）
+function arcDecideOnAchieve(arc, verdict) {
+    if (verdict === 'yes') return 'reveal-advance';
+    const stage = (arc && arc.currentBeat && arc.currentBeat.stage) || 'A';
+    return stage === 'B' ? 'quiet-advance' : 'stage-b';
+}
+
+// 置 stage B：保持当前拍的幕后 goal / 注入 / stage-A objective 不变，只把新的玩家任务挂为 objectiveB
+// 并标 stage='B'。纯函数（newObjective 来自真编译器的 beat.objective）。
+function arcCommitStageB(arc, newObjective) {
+    const next = cloneArc(arc);
+    if (next.currentBeat) {
+        next.currentBeat.stage = 'B';
+        const o = String(newObjective == null ? '' : newObjective).trim();
+        next.currentBeat.objectiveB = o || next.currentBeat.objective || null;
+    }
+    return next;
+}
+
+// STAGE_B_EVOLVE_GOAL=true 的 stage-B 提交：用一条【已编好的】新拍（新 goal / seed / objective + 重建注入）整体替换
+// 当前拍，停在【同一路标】、不前进（beat 由 buildCompiledBeat 据同一 active 路标产出 → waypointId 不变，故揭晓 / 下次
+// 核验始终对准【最新】幕后 goal）。标 stage='B'（一程上限：下一次 unsure 仍走 quiet-advance、不困住玩家）。纯函数、不改入参。
+function arcCommitStageBEvolve(arc, beat) {
+    const next = cloneArc(arc);
+    next.currentBeat = Object.assign({}, beat, { stage: 'B' });
+    return next;
+}
+
+// 完成当前拍 → 推进到下一路标并用 stub 编下一拍；没有更多路标则弧线结束（currentBeat=null →
+// isArcComplete）。返回新弧线对象（不改入参）。这是【确定性 stub 路径】——单测与离线兜底用；
+// 线上 arcComplete 走真编译器（见 runCompileTransition）。
+function arcAdvance(arc, now, outcome) {
+    const nextWp = arcPeekNext(arc);
+    if (!nextWp) {
+        const done = cloneArc(arc);
+        const cur = done.waypoints[done.cursor];
+        if (cur) cur.status = 'done';
+        if (arc.currentBeat) done.revealed.push(arcResolvedRecord(arc.currentBeat, outcome || 'done'));
+        done.cursor = done.waypoints.length;   // past the end
+        done.currentBeat = null;               // throughline resolved -> arc complete
+        return done;
+    }
+    return arcCommitAdvance(arc, stubCompileBeat(arc, nextWp, 0, now), outcome);
+}
+
+// 「换个思路」stub 路径：同一路标重编一条不同路线（variant++）。返回新弧线对象（不改入参）。
+function arcReroll(arc, now) {
+    const wp = arc.waypoints[arc.cursor];
+    if (!wp) return cloneArc(arc);
+    const variant = ((arc.currentBeat && arc.currentBeat.variant) || 0) + 1;
+    return arcCommitReroll(arc, stubCompileBeat(arc, wp, variant, now));
+}
+
+// 逐拍切换强度（仅透明用）：改 currentBeat.intensity 并重建 injectedText。返回新弧线对象。
+function arcSetIntensity(arc, intensity) {
+    if (!arc || !arc.currentBeat || !ADVISOR_INTENSITIES[intensity]) return arc;
+    const next = cloneArc(arc);
+    next.currentBeat.intensity = intensity;
+    next.currentBeat.injectedText = buildDirectiveRaw({
+        goal: next.currentBeat.goal, seed: next.currentBeat.seed, intensity, depiction: true,
+    });
+    return next;
+}
+
+// 弧线塑形（layer 6）：设软性节奏意图。非法值回落 null（= 自动）。纯函数——不动 currentBeat /
+// 注入，shaping 只着色【未来】的编译过渡（见 buildCompilerMessages）。返回新弧线对象。
+function arcSetShaping(arc, shaping) {
+    if (!arc) return arc;
+    const next = cloneArc(arc);
+    next.shaping = (shaping === 'building' || shaping === 'climaxing') ? shaping : null;
+    return next;
+}
+
+// ---- 集成层（副作用：元数据 + 注入 + 渲染 + 提示）----
+
+// 采用一条弧线（XOR：清掉任何单拍方案）。先用 stub 第一拍立刻显示方案条，再让真编译器把第一拍
+// 升级为编译版（失败则保留 stub 第一拍 + 留「重试」）。
+function adoptArc(spec) {
+    if (!ENABLE_ARC) return;
+    if (getPlan()) setPlan(null);                 // 互斥：弧线取代单拍
+    const arc = buildArc(spec, chatMsgCount());
+    if (!arc.waypoints.length) { addSystemNote('弧线至少需要一个路标。'); return; }
+    if (!setArc(arc)) { addSystemNote('无法保存弧线：当前似乎没有打开任何聊天。'); return; }
+    const ok = applyPlanInjection();
+    renderPlanBar();
+    if (!ok) { addSystemNote('弧线已保存，但当前 SillyTavern 不支持注入接口——引导不会生效。'); return; }
+    addSystemNote(`已创建${arc.mode === 'blind' ? '盲盒' : '透明'}弧（⚠ 弧线系统仍是实验性功能）。正在编译第一拍…`);
+    runCompileTransition({
+        arc, waypoint: arc.waypoints[arc.cursor], kind: 'first',
+        toast: '正在编译第一拍…',
+        onBeat: (a, beat) => arcCommitReroll(a, beat),
+        // 盲盒安全：第一拍就绪提示只露玩家可见 objective，绝不露幕后 goal（透明时 objective 为空 → 回落 goal）。
+        okNote: (beat) => `第一拍就绪：${arcVisibleObjective(beat) || beat.goal}`,
+    });
+}
+
+// 盲盒留空路标 → 先按篇幅暗中起草整条骨架，成功后照常采用；失败则提示用户手填 / 查连接。
+async function adoptArcWithDraftedWaypoints(spec) {
+    if (!ENABLE_ARC) return;
+    addSystemNote('路标留空——正在按篇幅为这条盲盒弧暗中拟定路标…');
+    const tt = arcToast('正在拟定弧线骨架…');   // ST 通知（与「编译一拍」一致——此前唯独起草骨架这步没在酒馆里提示）
+    let wps = null;
+    try { wps = await draftWaypoints(spec); } catch (e) { wps = null; }
+    arcClearToast(tt);
+    if (!wps || !wps.length) {
+        addSystemNote('自动拟定路标没成功（可能连不上模型或没解析出来）。可在弧线表单里手填至少一个路标，或检查连接后再试。');
+        return;
+    }
+    adoptArc({ ...spec, waypoints: wps });
+}
+
+// 「完成」当前拍 → 真编译器编下一拍后推进；走完贯穿线则整条结束并拆卸（无需编译）。
+async function arcComplete() {
+    const arc = getArc();
+    if (!arc || arcCompiling) return;
+    const nextWp = arcPeekNext(arc);
+    if (!nextWp) {
+        setArc(null);
+        applyPlanInjection();   // clears the injection
+        clearArcRetry();
+        renderPlanBar();
+        addSystemNote('这条弧线的贯穿线已走完——引导停止，主聊天恢复原状。');
+        return;
+    }
+    await runCompileTransition({
+        arc, waypoint: nextWp, kind: 'advance',
+        toast: '正在编译下一拍…',
+        onBeat: (a, beat) => arcCommitAdvance(a, beat, 'done'),
+        okNote: (beat) => `这一拍落地了，推进到下一拍：${beat.goal}`,
+    });
+}
+
+// 「换个思路」：真编译器为同一路标编一条不同路线。
+async function arcRerollBeat() {
+    const arc = getArc();
+    if (!arc || arcCompiling) return;
+    const wp = arc.waypoints[arc.cursor];
+    if (!wp) return;
+    const variant = ((arc.currentBeat && arc.currentBeat.variant) || 0) + 1;
+    await runCompileTransition({
+        arc, waypoint: wp, kind: 'reroll', variant,
+        toast: '正在换条路线…',
+        onBeat: (a, beat) => arcCommitReroll(a, beat),
+        okNote: (beat) => `换了条路线：${beat.goal}`,
+    });
+}
+
+// 逐拍强度切换（透明）。
+function arcSetActiveIntensity(intensity) {
+    const arc = getArc();
+    if (!arc) return;
+    const next = arcSetIntensity(arc, intensity);
+    setArc(next);
+    applyPlanInjection();
+    renderPlanBar();
+}
+
+// 弧线节奏切换（透明 + 盲盒）。只落元数据 + 重渲染——不调 applyPlanInjection（shaping 不动当前注入，
+// 只影响下一次编译过渡）。
+function arcSetActiveShaping(shaping) {
+    const arc = getArc();
+    if (!arc) return;
+    setArc(arcSetShaping(arc, shaping));
+    renderPlanBar();
+}
+
+// 硬退出整条弧线：清元数据 + 清注入 + 主聊天恢复原状（确认对话框在 layer-2 UI 层）。
+function arcExit() {
+    const arc = getArc();
+    if (!arc) return;
+    setArc(null);
+    applyPlanInjection();
+    clearArcRetry();
+    renderPlanBar();
+    addSystemNote('已退出弧线——引导停止，主聊天恢复原状。');
+}
+
+/* ---- 盲盒模式生命周期（layer 4）：玩家只见 objective；✓ 揭晓 + 推进，✗ 失败吸收，🚫 换任务 ---- */
+
+// 揭晓一拍的幕后（事后「原来背后在做这个」时刻）。仅在确实推进 / 收束时调用。
+function arcReveal(beat) {
+    if (!beat) return;
+    const lines = ['🎭 揭晓 —— 这一拍的幕后：'];
+    if (beat.objective) lines.push(`· 你看到的任务：${beat.objective}`);
+    lines.push(`· 我幕后在推动的：${beat.goal}`);
+    if (beat.seed) lines.push(`· 起始迹象：${beat.seed}`);
+    if (beat.why) lines.push(`· 为什么这样安排：${beat.why}`);
+    addSystemNote(lines.join('\n'));
+}
+
+// ✓ 目标已达成（layer-4 细化：置信门控 + 阶段 B）。先发一次独立的轻量核验调用判定幕后 goal 是否真的兑现，
+// 再据 arcDecideOnAchieve 三分：yes → 揭晓+前进；不确定且非 stage B → 置 stage B（不揭晓、不前进）；
+// 不确定且已 stage B → 静默前进（不揭晓）。守住「不确定一律不揭晓」，且绝不把玩家困在同一拍。
+async function arcMarkAchieved() {
+    const arc = getArc();
+    if (!arc || arcCompiling || arc.mode !== 'blind') return;
+    const nextWp = arcPeekNext(arc);
+    // 常见路径（有下一路标）：把【核验 + 编下一拍】合并成一次 self-branch 调用（省掉一份 transcript+stat）。
+    if (nextWp) { await arcAchieveMerged(arc, nextWp); return; }
+
+    // —— 末路标（少见、一次性）：沿用「独立核验轻调用 → 收束 / 末路标延伸任务」。 ——
+    const resolved = arc.currentBeat;
+    const stamp = arcStamp(arc);
+    arcCompiling = true; clearArcRetry(); setArcBusyUI(true);
+    const tt = arcToast('正在确认这一拍是否真的落地…');
+    let verdict = 'unsure';
+    try { verdict = await checkBeatFulfilled(arc); } catch (e) { verdict = 'unsure'; }
+    arcClearToast(tt);
+    arcCompiling = false;
+    // 并发守卫：核验期间用户可能切了聊天 / 改了弧线。
+    const cur = getArc();
+    if (!cur || arcStamp(cur) !== stamp) { setArcBusyUI(false); renderPlanBar(); return; }
+    const decision = arcDecideOnAchieve(cur, verdict);
+    if (decision === 'stage-b') {
+        // 末路标也可延迟兑现（不揭晓、不前进）。STAGE_B_EVOLVE_GOAL：用新拍重建注入、朝同一路标推近；否则保持同一 goal、只换任务。
+        const wp = arcActiveWaypoint(cur);
+        await runCompileTransition({
+            arc: cur, waypoint: wp, kind: 'stageB',
+            toast: '看起来还差一口气——再给一个推进任务…',
+            onBeat: (a, beat) => STAGE_B_EVOLVE_GOAL ? arcCommitStageBEvolve(a, beat) : arcCommitStageB(a, beat.objective),
+            okNote: (beat) => STAGE_B_EVOLVE_GOAL
+                ? `换个方向再推近一步：${beat.objective || beat.goal}`
+                : `这一步好像还没完全落地，再往前推一下：${beat.objective || '（继续推进）'}`,
+        });
+        return;
+    }
+    // reveal-advance / quiet-advance 但没有下一路标 → 收束（揭晓仅在 yes 时）。
+    const confident = decision === 'reveal-advance';
+    if (confident) arcReveal(resolved);
+    setArc(null); applyPlanInjection(); clearArcRetry(); renderPlanBar();
+    addSystemNote(confident
+        ? '盲盒弧线的贯穿线已走完——引导停止，主聊天恢复原状。'
+        : '这条盲盒弧线到此为止（这一拍是否完全落地我不太确定，就不揭晓了）——引导停止，主聊天恢复原状。');
+}
+
+// ✗ 目标失败：不揭晓（幕后没兑现），把失败当素材编下一拍并推进；最后一拍失败则到此为止。
+async function arcMarkFailed() {
+    const arc = getArc();
+    if (!arc || arcCompiling || arc.mode !== 'blind') return;
+    const nextWp = arcPeekNext(arc);
+    if (!nextWp) {
+        setArc(null); applyPlanInjection(); clearArcRetry(); renderPlanBar();
+        addSystemNote('这条盲盒弧线到此为止——引导停止，主聊天恢复原状。');
+        return;
+    }
+    await runCompileTransition({
+        arc, waypoint: nextWp, kind: 'advance', failed: true,
+        toast: '把这次失败编进下一拍…',
+        onBeat: (a, beat) => arcCommitAdvance(a, beat, 'failed'),
+        okNote: (beat) => `失败也是素材，下一拍的任务：${beat.objective || beat.goal}`,
+    });
+}
+
+// 🚫 换个目标：偏好信号、非失败。同一路标重编一个不同的任务（不推进）。
+async function arcRejectObjective() {
+    const arc = getArc();
+    if (!arc || arcCompiling || arc.mode !== 'blind') return;
+    const wp = arc.waypoints[arc.cursor];
+    if (!wp) return;
+    const variant = ((arc.currentBeat && arc.currentBeat.variant) || 0) + 1;
+    await runCompileTransition({
+        arc, waypoint: wp, kind: 'reroll', variant,
+        toast: '换个任务…',
+        onBeat: (a, beat) => arcCommitReroll(a, beat),
+        okNote: (beat) => `换了个任务：${beat.objective || beat.goal}`,
+    });
+}
+
+/* ------------------------------------------------------------------ *
+ * 弧线编译器（layer 3）—— 每次过渡【一次】结构化 LLM 调用，把目标路标编成一拍。
+ * 纯部分（parseArcBeat / buildCompiledBeat）可单测；异步部分（callCompiler /
+ * compileBeatWithRetry / runCompileTransition）走现有连接（direct/profile）+ 3 次重试 +
+ * toastr 进度 + 并发守卫（编译在途禁重入；只在弧线身份未变时提交结果）+ 失败保留当前注入。
+ * stubCompileBeat 仍是离线 / 单测的确定性替身，形状与 buildCompiledBeat 一致。
+ * ------------------------------------------------------------------ */
+// 编译器系统提示（CoT 版，2026-06-14 committed）：mode-agnostic 生成思维链（定位→清点→信息地图→此刻与转场→
+// 把拍写好看→质量自检），透明弧单用本提示即完整。盲盒的玩家 objective【不在思考里挑】——思考只管 goal/seed/戏剧，
+// objective 留到输出区一次写定（见 BLIND_COMPILER_ADDENDUM；2026-06-16 起，详见下方附录注释）。
+// 经渲染台 + 冷代理盲评打磨（关联/惊喜/赌注质量较无 CoT 版显著提升；见 CLAUDE.md「Arc prompt tuning」）。
+const COMPILER_SYSTEM_PROMPT =
+`你是「故事神谕·剧情参谋」的弧线编译器。把【标了"要编译这个"的那个路标】编成一拍可注入主聊天的幕后引导：
+先在 <arc_think> 里按步推演，再输出正式 <ArcBeat>（盲盒还要在它之前先输出抛弃式 <ObjectiveDraft>，见下方【盲盒附录】）。
+
+═══ 思维（写在 <arc_think>…</arc_think> 内，务必简短）═══
+按步推演，不跳步、不解释自检过程。【绝不可】在 <arc_think> 内写出 <ArcBeat> / <ObjectiveDraft> 任何正式标签——它们只在 </arc_think> 之后输出。
+【一遍成稿·铁律】每步只写一条结论、≤2 句；想到第一个站得住的方案就定下来，把「挑选」全部交给最后一步质量自检。【禁止】在思考里列举多个备选拍（不写「更好的想法是…／或者…／换个角度…」之类）、【禁止】推翻已写的步骤重来、【禁止】来回重读剧情反复权衡。整段思考约 ≤800 字，写完质量自检立即输出 </arc_think>，不再续写。
+
+【目标—任务耦合·别钻牛角尖】objective 是玩家亲手做的【触发动作】，goal 是它引发的【后果 / 真相】。二者【不必同一拍内同时成立】，玩家也【不必亲手造成】goal——只需 objective 是【点燃它的引线】、存在一条看得见的因果线。① 后果可【延迟】：玩家做完 objective 后过一两次回复、或经一个延伸任务（stage B 载体拍）才落地，这是常态，别为「这动作如何当场促成 goal」反复推翻重来。② 后果可发生在【玩家不在场处】：主聊天叙事者已被授权在玩家触发【之后】用切视角 / 旁白 / 让结果找上门（信件·消息·传唤）把它演进正文。所以 goal 照写真实剧情后果（哪怕是别处的会议·决定·远方事件），不必硬塞进一个玩家在场的场景。
+
+步骤1（定位）：一句话点出贯穿线，以及这一拍在弧线里的位置与角色（user 已给「弧线角色」：早期铺垫 / 中期升温 / 倒数第二最艰难 / 末拍高潮），据角色定这一拍的张力档位。弧线形状适用于【所有难度】——即便最低赌注层级（如平和）张力也随位置升级，但绝不越出本难度该有的赌注层级（绝不为制造高潮而引入本难度不该有的更重 / 不可逆后果）。节奏可动态：已被剧情自然拉近的路标可合并，张力不足可插一个低赌注喘息拍；拍数不固定，弧线在贯穿线解决时才结束。
+步骤2（清点素材）：从【世界书 + 至今剧情】尽量【充分】清点可用素材，分两堆——(a) 已确立的人物 / 关系 / 既定事实 / 当前状态；(b) 已埋下却未兑现的伏笔 / 悬而未决的线头。这是【漏斗不是过滤网】：相关素材尽量捞全，后面在这堆上选；需要别的既定细节随时回去取（只要是这个故事里已有的）。
+步骤3（信息地图）：列出 {{user}} 与各相关角色【分别】知道 / 不知道 / 误以为什么——这是抉择与张力的引擎。
+步骤4（此刻与转场）：先读【最近剧情】——此刻人在哪、在场谁、情绪温度、{{user}} 刚做了什么；这一拍要从这个当下【长出来】，不是凭空跳一个新场景。再遵从 user 给的转场指示（换路线 / 失败吸收 / 延伸任务 / 节奏意图，若有）。
+步骤5（把这一拍写好看）：用一种戏剧手法（反转 / 倒计时 / 假黎明 / 被迫的代价抉择）塑形。素材须【植根于本故事】——步骤2–3 清点出的元素及其背后的完整剧情 / 世界书。【可以引入新人物 / 新事物】，但它必须兑现某条既定线头、或是某条既定事实的合理后果——在思考里【点名它兑现了哪条线头】（「失散的师兄登场」兑现「大弟子下落成谜」＝合格；凭空冒出、谁都接不上的新反派＝不合格）。绝不引入与世界观 / 既定事实矛盾的内容。先想这一拍【最俗套】的写法，然后避开它。${ENABLE_TYPE_ROTATION ? '类型【尽量】与 user 给的【最近几拍类型】不同（移动 / 战斗 / 社交 / 调查 / 获取 / 抉择 / 生存 / 创造 / 欺骗 / 守护）——但【自然第一】：若这一拍最贴切的写法恰好落回最近用过的某一类，直接接受、别为换而换，更不要凭空给某个类型设「保留 / 不能用」的限制。' : ''}
+步骤6（盲盒玩家 objective —— 【不在思考里挑】）：盲盒的玩家 objective【不在 <arc_think> 里推敲、不在这里挑选】——思考只把这一拍的 goal / seed / 戏剧写好；objective 留到 </arc_think> 之后、在输出区按【盲盒附录】【一次写定】（它是个精简的玩家动作、不是需要反复打磨的深度创作，放进思考里反复挑只会空转、还会撑爆思维预算）。透明弧无 objective，跳过本步。
+步骤7（质量自检·不过则重写，不要解释自检过程）：赌注（{{user}} 在意的东西处于风险中，量级按 user 给的难度 / 强度，绝不越级、绝不碰红线）/ 能动性（迫使有意义的选择或行动）/ 关联性（回收已有角色·线索·既定事实，绝不凭空降落）/ 惊喜（含路标未点明的新信息，只复述路标则不合格）；${ENABLE_TYPE_ROTATION ? '类型已轮换、' : ''}与当前 stat 不矛盾（盲盒玩家 objective 的不剧透改在输出区的两稿法把关，不在思考里挑）。
+
+═══ 输出（</arc_think> 之后）═══
+只输出一个 <ArcBeat> 区块（盲盒在它之前先输出抛弃式 <ObjectiveDraft>，见附录），逐行「键: 值」，不要多余解释：
+<ArcBeat>
+goal: 一句话、结果式、可执行的引导目标（写结果，不写过程 / 台词 / 分步）
+type: 这一拍玩家要做的事属于哪一类，从 移动 / 战斗 / 社交 / 调查 / 获取 / 抉择 / 生存 / 创造 / 欺骗 / 守护 里选一个
+seed: 这一步最初显露的一个具体而轻巧的迹象
+why: 为什么贴合此刻（呼应了哪条伏笔 / 关系 / 既定事实）
+</ArcBeat>
+全程简体中文。`;
+
+let arcCompiling = false;        // 编译在途守卫（禁重复点击 / 重入）
+let arcRetryPending = null;      // 上次失败的过渡（供方案条「重试」按钮）
+
+// 盲盒难度 = 赌注货币（弧线级、固定；见 consent）。三档同样有趣，区别在赌注层级与可逆性。
+// label/caption 供 UI（徽章 + 表单选项）；amp 是 layer-5 振幅缩放指令，注入盲盒编译调用，让难度
+// 真正改变所写赌注的量级（见 buildCompilerMessages）。
+const ADVISOR_DIFFICULTIES = {
+    calm:   { label: '平和', caption: '社交 / 情感赌注，无不可逆',
+        amp: '赌注限于社交 / 情感层面（尴尬、误会、心结、错过）；绝不引入任何不可逆后果，最坏的局面也始终可挽回。',
+        failAmp: '失败只是温和的挫折——一时的尴尬、错过、难为情，绝无持久或不可逆的代价，很快就能挽回。' },
+    normal: { label: '常规', caption: '实质后果，可恢复（输战斗 / 失宝物 / 丢盟友）',
+        amp: '可有实质后果——输掉一场冲突、失去一件要紧之物、一个盟友疏远——但都必须【可恢复 / 可逆转】，不动存在级根基。',
+        failAmp: '失败有真实但【可恢复】的代价（输了、丢了、关系一时紧张）；下一拍要从这份损失里自然长出来，而不是一笔勾销。' },
+    stark:  { label: '凛冽', caption: '存在级、不可逆的重大抉择（不一定是死亡）',
+        amp: '可推动存在级、不可逆的重大抉择（一扇门永远关上 / 一段关系永久终结 / 一个有约束力的承诺）——但巨大代价必须【购买】对等的巨大回报，苦难必须有意义、绝不无谓残忍；任何不可逆转折发生【之前】，务必先给玩家一个知情的抉择点（他随时可一键退出）。',
+        failAmp: '失败可有真实、乃至不可逆的代价，但【必须同时开辟一条对等的新路径】——是改道而非死胡同，更不是无谓的惩罚；这份苦难仍要有意义。' },
+};
+
+// 弧线塑形（layer 6）= 软性用户节奏意图（弧线级，可随时改；null = 自动位置感知塑形）。label 供 UI 分段
+// 控件；hint 是注入编译调用的节奏指令（让用户的「还想继续 / 开始收束」着色未来的拍）。
+const ADVISOR_SHAPING = {
+    building:  { label: '还想继续', hint: '【用户节奏意图：还想继续】别急着收束——可以铺垫 / 升温 / 在重拍之间插入一个低赌注的喘息拍，把张力慢慢积累，这一拍不要逼近高潮。' },
+    climaxing: { label: '开始收束', hint: '【用户节奏意图：开始收束】加速朝贯穿线的解决推进——提高赌注、把已被剧情自然拉近的路标合并推进、准备最艰难的抉择与高潮收束，不要再铺垫新支线。' },
+};
+
+// 盲盒模式编译附加（layer 4）：在 <ArcBeat> 里多产出一行 objective（玩家可见任务，不剧透），goal 仍是幕后真相。
+// **2026-06-16 重构（Edwin 真实 ST 实测：Opus 4.6 thinking 在 objective 上反复自我打架——"太简单/太被动/太日常/玩家
+// 不理解"——撑爆 <arc_think> 预算直至截断）**：把 objective【整个移出 <arc_think>】，在输出区【一次写定】。objective 不再
+// 是"在思考里反复打磨的深度创作"，而是一个【玩家从此刻、凭自己看得见的理由会去做、又恰好点燃 goal 的动作】（player-motivated
+// from the current moment；不再要求"最小/smallest"——那本身是个可被 fight 的轴）。非剧透由保留在【输出区】的两稿法
+// （plain→masked，不占思维预算）把关。诊断与设计推演见设计文档 §10「2026-06-16 objective 出思考块」。
+// 注：本附录与 ACHIEVE_SYSTEM_PROMPT 的 objective 段同源——【改一处同步另一处】。
+const BLIND_COMPILER_ADDENDUM =
+`【盲盒附录】本弧线是「盲盒」：玩家只看得到 objective（任务），看不到 goal / 幕后指令。goal / seed / why 照旧在 <arc_think> 里随这一拍想好（goal 就是要隐瞒的幕后真相）。但【玩家 objective 不在 <arc_think> 里推敲】——思考只管把 goal / seed / 戏剧写好；objective 留到 </arc_think> 之后、在输出区【一次写定】（它是个玩家动作、不是需要反复打磨的深度创作，放进思考里反复挑选只会空转、还会撑爆思维预算）。
+
+什么是好的盲盒 objective：一个 {{user}} 从【此刻的处境】出发、凭他【自己看得见的理由】（他看不到幕后 goal）就会去做的行动——它既是玩家自有动机的动作，又恰好【点燃】幕后 goal（如「赴约」＝想要答案、「陪她走回家」＝担心她、「把信交给她」＝在送信、「走进那扇门」＝在探路）。一个【只有知道幕后秘密才讲得通】的动作（如无端「脱掉外套」「站到窗边」）是【坏】objective——玩家看不到秘密、根本不会去做，goal 就永远触发不了。
+objective 始终是 {{user}}【自己亲手做】的动作，【不是别的角色（NPC）的动作、也不是"看着某事发生"】——这一点最容易在【幕后 goal 是某个 NPC 的内在变化 / 反应】时搞错：goal 尽可以是那个 NPC 的内心越界、转变、或别处 / 离屏发生的事，但 objective 永远是 {{user}} 亲手做的、点燃它的【那一下】（写错成 NPC 的动作＝玩家根本无从执行）。例：幕后是「她在独处中越界」，objective 是 {{user}} 做的「放学后陪她走回家」「找她单独说话」，绝不是「她靠过来」「她替你整理衣领」。
+
+它【可大可小、可主动可被动、可日常】：戏剧高潮 / 赌注 / 不可逆的分量【全在 goal / seed / 难度】，objective 只是那个玩家自有动机、点燃 goal 的行动。【绝不可】因为它「太简单 / 太被动 / 不够特别 / 太日常」就推翻另找——只要它是玩家从此刻、凭自己看得见的理由会做的【一个】动作（不是「X 或 Y」、不是一串并列），又能点燃 goal，就【直接写定】。把动作【本身】写出来就好，别把特定时间 / 地点 / 场合钉进 objective（那些是布景、进 seed）。
+
+输出顺序（</arc_think> 之后，一次写定、不回头改）：先 <ObjectiveDraft>（plain＝把这一拍连后果 / 意义直白摊开；masked＝把所有后果 / 意义 / 评判词抹掉，只留玩家亲手做的那个动作——两稿随后被系统整段丢弃，玩家永远看不到，这一步是【强制去剧透】、不是再挑动作），再 <ArcBeat>（在 goal / type / seed / why 之外多写一行 objective ＝ masked 的那个动作）。绝对服从 user 给出的【红线】与【难度 / 赌注层级】。
+<ObjectiveDraft>
+plain: …（连后果摊开）
+masked: …（抹掉后果，只留玩家做的动作）
+</ObjectiveDraft>`;
+
+// 置信门控核验（layer-4 细化）：玩家点了「✓ 达成」时，单独发这一调用判定幕后 goal 是否真的兑现。
+// 从严：宁可 unsure 也绝不假阳性（假阳性会提前剧透、摧毁盲盒信任）。输出仅一个 <ArcCheck> 区块。
+const CHECK_SYSTEM_PROMPT =
+`你是「故事神谕·剧情参谋」的盲盒兑现核验器。玩家刚点了「目标已达成」。你要判断：这一拍【幕后真正想促成的事】
+在最近剧情里是否已经真正发生——以文本里确有其事为准，不看玩家声称。
+
+判定从严，宁可「不确定」也绝不假阳性（假阳性会提前剧透、摧毁盲盒信任）：
+- yes：最近剧情里幕后目标已明确、确凿地兑现。
+- unsure：迹象不足 / 刚起头 / 只是接近——只要不确凿，就选这个。
+- no：剧情明确朝相反方向走，幕后目标没有兑现。
+
+只输出一个 <ArcCheck> 区块（逐行「键: 值」，不要多余解释）：
+<ArcCheck>
+fulfilled: yes | unsure | no
+reason: 一句话依据
+</ArcCheck>
+全程简体中文。`;
+
+// 解析一个 <ArcBeat> 区块（取第一个；无 goal 视为失败）。纯函数，可单测。
+function parseArcBeat(text) {
+    // 容忍模型漏写 / 截断闭标签（真实模型偶发——deepseek-v4-pro 实测见过漏 </…>）：先按闭合配，配不到再从开标签取到结尾。
+    let m = String(text || '').match(/<ArcBeat>([\s\S]*?)<\/ArcBeat>/i);
+    if (!m) m = String(text || '').match(/<ArcBeat>([\s\S]*)$/i);
+    if (!m) return null;
+    const inner = m[1];
+    const get = (keys) => {
+        for (const k of keys) {
+            const r = new RegExp('^\\s*' + k + '\\s*[:：]\\s*(.+)$', 'mi');
+            const mm = inner.match(r);
+            if (mm && mm[1].trim()) return mm[1].trim();
+        }
+        return '';
+    };
+    const goal = get(['goal', '目标']);
+    if (!goal) return null;
+    return {
+        goal,
+        seed: get(['seed', '起始迹象', '迹象', '种子']),
+        why: get(['why', '契合点', '理由']),
+        objective: get(['objective', '玩家目标', '目标任务']),
+        type: get(['type', '类型', '类别']),                       // #3 类型轮换
+    };
+}
+
+// 解析一个 <ArcCheck> 区块 → { verdict: 'yes'|'unsure'|'no', reason }。纯函数，可单测。
+// 解析不出区块 / 拿不准一律回 'unsure'（安全默认 = 绝不假阳性提前揭晓）。判定次序刻意为
+// unsure → no → yes，避免「未兑现」被「兑现」误命中为 yes。
+function parseArcCheck(text) {
+    let m = String(text || '').match(/<ArcCheck>([\s\S]*?)<\/ArcCheck>/i);
+    if (!m) m = String(text || '').match(/<ArcCheck>([\s\S]*)$/i);   // 容忍漏写 / 截断闭标签
+    if (!m) return null;
+    const inner = m[1];
+    const fm = inner.match(/^\s*(?:fulfilled|结论|判定|兑现)\s*[:：]\s*(.+)$/mi);
+    const raw = (fm ? fm[1] : '').trim().toLowerCase();
+    let verdict;
+    if (!raw || raw.includes('unsure') || raw.includes('不确定') || raw.includes('不清楚') || raw.includes('待定')) {
+        verdict = 'unsure';
+    } else if (/\bno\b/.test(raw) || raw.includes('否') || raw.includes('未') || raw.includes('没有') || raw.includes('false')) {
+        verdict = 'no';
+    } else if (/\byes\b/.test(raw) || raw.includes('是') || raw.includes('已兑现') || raw.includes('兑现') || raw.includes('达成') || raw.includes('true')) {
+        verdict = 'yes';
+    } else {
+        verdict = 'unsure';
+    }
+    const rm = inner.match(/^\s*(?:reason|理由|依据)\s*[:：]\s*(.+)$/mi);
+    return { verdict, reason: rm ? rm[1].trim() : '' };
+}
+
+// 从解析结果构建一拍（形状与 stubCompileBeat 一致，便于 arcCommit* 通用）。纯函数，可单测。
+function buildCompiledBeat(arc, waypoint, parsed, opts) {
+    const o = opts || {};
+    const inherit = (arc.currentBeat && arc.currentBeat.intensity) || 'normal';
+    const intensity = ADVISOR_INTENSITIES[inherit] ? inherit : 'normal';
+    const goal = parsed.goal;
+    const seed = parsed.seed || '';
+    return {
+        waypointId: waypoint.id,
+        title: waypoint.intent,
+        goal,
+        seed,
+        why: parsed.why || `推进路标「${waypoint.intent}」`,
+        type: parsed.type || '',                   // #3 类型轮换：编译器标注，喂回避免连续同类
+        objective: arc.mode === 'blind' ? (parsed.objective || null) : null,  // 盲盒玩家目标（layer-4 精化）
+        intensity,
+        injectedText: buildDirectiveRaw({ goal, seed, intensity, depiction: true }),
+        variant: Number(o.variant) || 0,
+        stage: null,
+        objectiveB: null,
+        beatAdoptedAt: Number(o.now) || 0,
+        reminded: false,
+    };
+}
+
+// 有界剧情：喂给编译器的最近 n 条（夹在 8..40），自本拍开始以来——长对话下仍廉价。
+function compilerTranscript(ctx, s, n) {
+    const turns = buildTranscriptTurns(ctx, { ...s, contextDepth: -1 });
+    const k = Math.min(40, Math.max(8, Number(n) || 8));
+    return turns.slice(-k).map((t) => `${t.name}: ${t.text}`).join('\n\n');
+}
+
+// #3 最近几拍的【类型】：当前拍（即将被替换）在最前，再往 revealed 末尾取，最多 3 个、滤空。纯函数。
+// 光在 prompt 里叮嘱「别重复类型」却不给类型 = 形同虚设；这把实际类型喂回去，让轮换真正机械可靠。
+function recentBeatTypes(arc) {
+    const types = [];
+    const push = (t) => { if (t && String(t).trim()) types.push(String(t).trim()); };
+    if (arc && arc.currentBeat) push(arc.currentBeat.type);
+    const rev = (arc && Array.isArray(arc.revealed)) ? arc.revealed : [];
+    for (let i = rev.length - 1; i >= 0 && types.length < 3; i--) push(rev[i] && rev[i].type);
+    return types;
+}
+
+// 编译器 user 消息里的【条件性过渡指示段】。纯函数（只读 arc/waypoint/opts，不碰 ctx）= 可单测。
+// 收纳 #3 类型轮换、#4 换路线（盲盒保 goal / 多次换后可跳过重塑）、#5 失败后果按难度、layer-6 塑形、
+// 延迟兑现 stage B。返回字符串数组，由 buildCompilerMessages 拼进 user 上下文。
+function buildTransitionDirectives(arc, waypoint, opts) {
+    const o = opts || {};
+    const blind = arc.mode === 'blind';
+    const out = [];
+
+    // #3 类型轮换：把最近几拍的实际类型喂回去，要求换一类。ENABLE_TYPE_ROTATION=false（实验）→ 不喂回、不出该段。
+    const recent = ENABLE_TYPE_ROTATION ? recentBeatTypes(arc) : [];
+    if (recent.length) {
+        out.push(`【类型轮换】最近几拍的类型依次是：${recent.join(' / ')}。这一拍【尽量】换一类（移动 / 战斗 / 社交 / 调查 / 获取 / 抉择 / 生存 / 创造 / 欺骗 / 守护）。但【自然第一】：若这一拍最贴切的写法恰好落回上面某一类，就直接接受、按自然来，别为换而换、别凭空给某类型设「保留 / 不能用」的限制。`);
+    }
+
+    // #4 换路线（reroll）。盲盒：保持幕后 goal 不变、只换玩家 objective。多次换同一路标（variant≥2，
+    // 即第 3 次起）→ 弧线向用户弯曲：允许编译器干脆跳过 / 重塑这个路标。
+    if (o.reroll) {
+        const nth = (Number(o.variant) || 1) + 1;
+        const lines = [`【换路线】这是为「${waypoint.intent}」第 ${nth} 次换路线，请给出与之前明显不同的一条路径。`];
+        if (blind && arc.currentBeat && arc.currentBeat.goal) {
+            lines.push(`【盲盒·保持幕后目标】幕后真正要促成的事【不变】（仍是：${arc.currentBeat.goal}）——只换一个通往它、且与上次明显不同的玩家 objective，绝不改动 goal。`);
+        }
+        if ((Number(o.variant) || 0) >= 2) {
+            lines.push('【已多次换路线】玩家显然对这个路标本身不买账：你可以干脆【跳过或重塑】它——把它理解得更宽松、或合并进下一段推进，给一拍绕开 / 改造该路标、直接朝贯穿线走的引导，并在 why 里说明为何这样更顺。');
+        }
+        out.push(lines.join('\n'));
+    }
+
+    // #5 失败吸收，后果量级随难度（calm 温和 / normal 真实可恢复 / stark 真实但开辟对等新路）。
+    if (o.failed) {
+        const lines = ['【上一拍失败】玩家试了但没做到——把这次失败当作素材，让下一拍从搞砸的局面里自然生长，不要无视它。'];
+        if (blind && arc.consent) {
+            const diff = ADVISOR_DIFFICULTIES[arc.consent.difficulty] || ADVISOR_DIFFICULTIES.normal;
+            if (diff.failAmp) lines.push(`失败后果的量级按当前难度【${diff.label}】定：${diff.failAmp}`);
+        }
+        out.push(lines.join('\n'));
+    }
+
+    // 延迟兑现 stage B（盲盒）。STAGE_B_EVOLVE_GOAL：重拟更贴近的 goal、朝同一路标推近；否则（原行为）保持同一 goal、只换任务。
+    if (o.stageB) {
+        out.push(STAGE_B_EVOLVE_GOAL
+            ? '【再推近一步（stage B）】玩家完成了上一个任务，但这一拍的幕后还没落地。请【重新拟定一个更贴近的幕后 goal】（连同 seed），让它仍服务【同一个路标】、把故事朝它【再推近一步】：收窄 / 具体化上一个 goal，或换一个更直接通向【同一路标终点】的幕后结果（绝不改路标、绝不越级 / 碰红线），并另给一个新的、与上个明显不同的玩家 objective（玩家从此刻、凭自己看得见的理由会做、又点燃 goal 的动作）。不剧透。'
+            : '【延伸任务（stage B · 载体拍）】玩家完成了上一个任务，但这一拍的幕后目标还没完全兑现。请【保持同一个幕后 goal 不变】，只给一个新的、更直接推动它兑现的玩家 objective——最好是一个【会把场景推到 goal 落地那一刻】的任务（如幕后是「导师战死」，就给「在这场战斗里活下来」，让战斗自然打完、后果随之落地）。仍可量化、不剧透，并与上个任务明显不同。goal 照常输出（与上一拍一致即可）。');
+    }
+
+    // layer 6 软性节奏意图：building 放缓 / climaxing 收束；null 交给位置感知自动塑形。
+    if (arc.shaping && ADVISOR_SHAPING[arc.shaping]) {
+        out.push(ADVISOR_SHAPING[arc.shaping].hint);
+    }
+    return out;
+}
+
+// 盲盒 consent 区块（风格 / 难度+amp / 方向 / 红线）。纯函数——buildCompilerMessages 与 buildAchieveMessages
+// 共用，红线 / 难度文案保持单一来源。无 consent 回空串。
+function blindConsentBlock(consent) {
+    if (!consent) return '';
+    const c = consent;
+    const diff = ADVISOR_DIFFICULTIES[c.difficulty] || ADVISOR_DIFFICULTIES.normal;
+    const con = ['=== 盲盒设定（consent）==='];
+    if (c.style) con.push(`风格偏好：${c.style}`);
+    con.push(`难度 / 赌注层级：${diff.label}（${diff.caption}）\n${diff.amp || ''}`);
+    if (c.direction) con.push(`大致方向（关于什么，而非发生什么）：${c.direction}`);
+    if (Array.isArray(c.redlines) && c.redlines.length) {
+        con.push(`【绝对红线 —— 任何 objective / goal 都绝不可触碰】：\n${c.redlines.map((r) => '· ' + r).join('\n')}`);
+    }
+    return con.join('\n');
+}
+
+// 过渡调用（编译 / 核验 / 达成）喂入的剧情记录：COMPILER_FULL_CONTEXT 开 → 全史（与参谋同级）；
+// 关 → 有界 clamp（compilerTranscript 的最近 8..40 条，省 token）。三处共用，集中在此切换。
+function transitionTranscript(ctx, s, since) {
+    if (COMPILER_FULL_CONTEXT) return buildTranscript(ctx, { ...s, contextDepth: -1 });
+    return compilerTranscript(ctx, s, since + 2);
+}
+
+// 全量匹配（COMPILER_FULL_CONTEXT）下，过渡调用额外喂入的【角色卡 + 世界书】区块（与参谋同级）。
+// 返回要拼进 user 上下文的区块数组；clamp 模式或无内容时回空数组。card 受 s.includeCard 约束（与参谋一致）；
+// wiStr 由调用方异步取（await buildWorldInfo()）后传入——纯拼装、无副作用。
+function fullContextBlocks(ctx, s, wiStr) {
+    if (!COMPILER_FULL_CONTEXT) return [];
+    const out = [];
+    if (s.includeCard) { const card = buildCardSection(ctx); if (card) out.push(card); }
+    if (wiStr) out.push('=== 世界书 / 设定 ===\n' + wiStr);
+    return out;
+}
+
+// 弧线【自身文本】凑成的世界书扫描补充：贯穿线 + 路标意图 + 方向 / 风格。喂给 buildWorldInfo 的
+// extraScanText，让「以弧线主题词为关键词的绿条」（如绿条触发词 Alex，弧线讲「Alex 的背叛」）即便最近
+// 聊天没提到也能激活，回收休眠伏笔（让过渡调用真正吃到相关 lore）。纯函数、可单测。spec / arc 同形
+// （都读 throughline / waypoints / consent），起草器（spec 无 waypoints）与过渡调用（arc 有）共用。
+function arcScanText(arc) {
+    if (!arc) return '';
+    const bits = [];
+    if (arc.throughline) bits.push(arc.throughline);
+    if (Array.isArray(arc.waypoints)) {
+        for (const w of arc.waypoints) {
+            const intent = (w && typeof w === 'object') ? w.intent : w;   // buildArc 前是字符串，后是 {intent}
+            if (intent && String(intent).trim()) bits.push(String(intent).trim());
+        }
+    }
+    const c = arc.consent || {};
+    if (c.direction) bits.push(c.direction);
+    if (c.style) bits.push(c.style);
+    return bits.join('\n');
+}
+
+// 组装编译器消息（system 指令 + user 上下文：弧线 / 最近剧情 / 变量状态 / 已推进的拍）。
+// wiStr：全量匹配时由 callCompiler 异步取的世界书（clamp 模式为空串）。
+function buildCompilerMessages(arc, waypoint, opts, statStr, wiStr) {
+    const ctx = getCtx();
+    const s = getSettings();
+    const shape = arcShapePosition(arc, waypoint);   // live 位置 + 端锚定角色（不受 skipped / 重构干扰）
+    const wpList = arc.waypoints.map((w, i) => {
+        const tag = w.id === waypoint.id ? '【要编译这个】'
+            : (w.status === 'done' ? '[已完成]' : (w.status === 'skipped' ? '[已跳过]' : '[待办]'));
+        return `${i + 1}. ${tag} ${w.intent}`;
+    }).join('\n');
+    const beatAt = (arc.currentBeat && arc.currentBeat.beatAdoptedAt) || arc.adoptedAt || 0;
+    const since = Math.max(0, chatMsgCount() - beatAt);
+    const transcript = transitionTranscript(ctx, s, since);
+    const revealed = (arc.revealed || []).slice(-6).map((r) => `· ${r.goal}`).join('\n');
+
+    const span = SPAN_FEEL[arc.spanFeel] || SPAN_FEEL.medium;   // #8 把不透明 token 译成标签 + 拍数区间
+    const parts = [
+        '=== 弧线 ===',
+        `贯穿线：${arc.throughline || '（未填）'}`,
+        `篇幅感：${span.label}（${span.range}）　·　当前：第 ${shape.index} / ${shape.total} 拍（不含已跳过）　·　本拍的弧线角色：${ARC_SHAPE_ROLES[shape.role]}`,
+        `路标列表：\n${wpList}`,
+    ];
+    for (const b of fullContextBlocks(ctx, s, wiStr)) parts.push(b);   // 全量匹配：角色卡 + 世界书
+    if (transcript) parts.push('=== 最近剧情（自本拍开始以来）===\n' + transcript);
+    if (statStr) parts.push('=== 当前变量状态（剧情硬事实，方案不得与之矛盾）===\n' + statStr);
+    if (revealed) parts.push('=== 已推进过的拍（勿原样重复）===\n' + revealed);
+    // 条件性过渡指示段（#3 类型轮换 / #4 换路线 / #5 失败按难度 / stage B / layer-6 塑形）—— 纯函数、可单测。
+    for (const d of buildTransitionDirectives(arc, waypoint, opts || {})) parts.push(d);
+    // 盲盒：附 consent（难度 / 红线 / 风格 / 方向），并切到带 objective 的盲盒编译指令。
+    const blind = arc.mode === 'blind';
+    if (blind && arc.consent) parts.push(blindConsentBlock(arc.consent));
+    parts.push(blind
+        ? '请先输出抛弃式 <ObjectiveDraft>（plain / masked 两稿，随后被系统丢弃），再输出正式的 <ArcBeat>（含 goal / objective / seed / why），编译上面标【要编译这个】的那个路标。'
+        : '请只输出一个 <ArcBeat> 区块，编译上面标【要编译这个】的那个路标。');
+
+    const subst = (t) => { try { return ctx.substituteParams(t); } catch (e) { return t; } };
+    const sysBase = blind ? (COMPILER_SYSTEM_PROMPT + '\n\n' + BLIND_COMPILER_ADDENDUM) : COMPILER_SYSTEM_PROMPT;
+    return [
+        { role: 'system', content: subst(sysBase) },
+        { role: 'user', content: subst(parts.join('\n\n')) },
+    ];
+}
+
+// 一次编译调用：取当前变量状态 + 组装消息 + 走现有连接（direct / profile，非流式）。
+async function callCompiler(arc, waypoint, opts) {
+    const s = getSettings();
+    let statStr = '';
+    try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
+    let wiStr = '';
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    const messages = buildCompilerMessages(arc, waypoint, opts, statStr, wiStr);
+    const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);
+    return await arcCall(messages, maxTokens);   // 护栏 + 实时缓冲 + 流式分发
+}
+
+// 红线（雷点）代码侧守卫（layer 5）：编译期 prompt 规避是主防线，这是【廉价的事后启发式守卫】。
+// 把每条红线按否定词拆成「主体 + 禁止项」，若禁止项与（存在的）主体在拍子文本里同时命中即判违反。
+// 无否定词、或过松（单字禁止项又无主体）则跳过——宁漏不误伤（误伤只会触发一次无谓重编）。
+const REDLINE_NEGATIONS = ['不可', '不能', '不得', '不会', '不准', '不许', '绝不', '禁止', '不要', '别', '勿'];
+function beatViolatesRedlines(beat, redlines) {
+    if (!beat || !Array.isArray(redlines) || !redlines.length) return null;
+    const hay = [beat.goal, beat.objective, beat.objectiveB, beat.seed].filter(Boolean).join(' / ');
+    for (const rl of redlines) {
+        const s = String(rl == null ? '' : rl).trim();
+        if (!s) continue;
+        // 找最靠前的否定词，拆成 主体（之前）+ 禁止项（之后）。
+        let neg = '', idx = -1;
+        for (const n of REDLINE_NEGATIONS) {
+            const i = s.indexOf(n);
+            if (i >= 0 && (idx < 0 || i < idx)) { idx = i; neg = n; }
+        }
+        if (idx < 0) continue;                         // 无否定词 → 廉价守卫无从判定，交给 prompt 侧
+        const subject = s.slice(0, idx).trim();
+        const forbidden = s.slice(idx + neg.length).trim();
+        if (!forbidden) continue;
+        // 过松保护：单字禁止项又无主体（如「不可走」），太容易误伤 → 跳过。
+        if (forbidden.length < 2 && !subject) continue;
+        const forbiddenHit = hay.includes(forbidden);
+        const subjectHit = !subject || hay.includes(subject);
+        if (forbiddenHit && subjectHit) return s;      // 返回被违反的那条红线（供日志）
+    }
+    return null;
+}
+
+// 编译 + 解析，最多重试 3 次；全部失败返回 null。盲盒还过一道红线代码侧守卫——命中即弃这次重编，
+// 三次皆中则返回 null（＝该过渡 fail-safe：保留当前注入 + 方案条「重试」）。
+async function compileBeatWithRetry(arc, waypoint, opts) {
+    const redlines = (arc.mode === 'blind' && arc.consent && Array.isArray(arc.consent.redlines))
+        ? arc.consent.redlines : [];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const text = await callCompiler(arc, waypoint, opts);
+            const parsed = parseArcBeat(text);
+            if (parsed && parsed.goal) {
+                const beat = buildCompiledBeat(arc, waypoint, parsed, opts);
+                const hit = redlines.length ? beatViolatesRedlines(beat, redlines) : null;
+                if (hit) { console.warn('[Story Oracle] arc compile attempt', attempt, '— redline violated:', hit); continue; }
+                return beat;
+            }
+            console.warn('[Story Oracle] arc compile attempt', attempt, '— no parseable <ArcBeat>.');
+        } catch (e) {
+            if (arcAborted(e)) { console.warn('[Story Oracle] arc compile aborted (timeout / cancel) — stop retrying.'); break; }
+            console.warn('[Story Oracle] arc compile attempt', attempt, 'failed:', e);
+        }
+    }
+    return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 弧线路标【自动起草】—— 盲盒表单留空路标时，由模型按篇幅暗中拟定整条骨架
+ *（恢复盲盒"看不到骨架"的本意：用户连入职都不该看到路标）。纯部分
+ *（buildWaypointDrafterMessages / parseWaypoints）可单测；异步部分
+ *（callWaypointDrafter / draftWaypoints）走现有连接 + 3 次重试。
+ * 路标数量直接随 spanFeel（短 3-5 / 中 5-9 / 长 8-15，见 SPAN_FEEL）。
+ * ------------------------------------------------------------------ */
+const WAYPOINT_DRAFTER_SYSTEM_PROMPT =
+`你是「故事神谕·剧情参谋」的弧线路标起草器。下面给你一条正在构思的剧情弧线（贯穿线 / 大致方向 / 风格 /
+难度）。把它拆成一串【意图级】路标——每个路标是一句话的「剧情意图」（如「师父的背叛浮出水面」），
+而不是具体事件，不写台词、不写过程分步。整串路标要构成一条有起承转合的弧线：早期铺垫 → 中期升温 →
+倒数第二步最艰难的抉择 → 末步高潮收束；前后呼应、步步递进，最终让贯穿线得到解决。
+末路标须【正面解决】贯穿线承诺的那个结局，绝不以「不再追究 / 放下真相 / 留作悬念」来回避——放下是【查清真相之后】做出的选择，不是绕过真相。
+
+若上下文里带有【剧情记录 / 角色卡 / 世界书】，务必让路标扎根于这个故事【已经发生的事】与【既定设定 / 世界观】：
+回收已埋下却未兑现的伏笔、呼应已有的人物与关系，绝不脱离实际剧情凭空设计。
+
+只输出一个 <Waypoints> 区块，每行一个路标（可带序号），不要任何多余解释：
+<Waypoints>
+1. ……
+2. ……
+</Waypoints>
+全程简体中文。`;
+
+// 组装路标起草消息。主体为纯逻辑（只读 spec + SPAN_FEEL / ADVISOR_DIFFICULTIES + extra）；收尾对两条消息做一次
+// {{user}} / {{char}} 宏替换（与 compiler / achieve / check 对齐——此前唯独起草器漏了，世界书 / 正传剧情里的
+// {{user}} 会字面直达模型）。ctx 不可用时（纯函数单测）try/catch 降级为恒等，故仍可单测。
+// 数量区间直接取自 spanFeel；extra = 全量匹配时由 callWaypointDrafter 注入的【剧情全史 + 角色卡 + 世界书 + stat】
+// 区块（clamp / 单测时为空），拼在弧线规格与计数指令之间，让骨架扎根于真实 RP（方案 C；见 §8 起草上下文）。
+function buildWaypointDrafterMessages(spec, extra) {
+    const c = (spec && spec.consent) || {};
+    const span = SPAN_FEEL[spec && spec.spanFeel] || SPAN_FEEL.medium;
+    const parts = ['=== 弧线 ==='];
+    if (spec && spec.throughline) parts.push(`贯穿线：${spec.throughline}`);
+    if (c.direction) parts.push(`大致方向（关于什么，而非发生什么）：${c.direction}`);
+    if (c.style) parts.push(`风格偏好：${c.style}`);
+    const diff = ADVISOR_DIFFICULTIES[c.difficulty];
+    if (diff) {
+        parts.push(`难度 / 赌注层级：${diff.label}（${diff.caption}）`);
+        // 把振幅指令 amp 也喂给起草器，让【骨架本身】的升温幅度 / 最艰难抉择的分量落在本难度的赌注层级里。
+        // 原先只给标签 + 一句说明 = 骨架只「知道难度名」却不知该升到多重；amp 才是真正缩放赌注的那条（与编译器同源）。
+        if (diff.amp) parts.push(`整条弧线的赌注量级（中期升温到何种程度、倒数第二步的最艰难抉择有多重、高潮收束的代价）须落在此难度层级内：${diff.amp}`);
+    }
+    for (const b of (extra || [])) parts.push(b);
+    parts.push(`篇幅感：${span.label} —— 请起草 ${span.min}~${span.max} 个【意图级】路标，构成一条完整弧线。只输出 <Waypoints> 区块。`);
+    // {{user}} / {{char}} 宏替换，与其余过渡调用同步。ctx 不可用（纯函数单测）则降级为恒等——不破坏可单测性。
+    let subst = (t) => t;
+    try {
+        const ctx = getCtx();
+        if (ctx && typeof ctx.substituteParams === 'function') {
+            subst = (t) => { try { return ctx.substituteParams(t); } catch (e) { return t; } };
+        }
+    } catch (e) { /* 纯 / 测试上下文：无 ctx，保持恒等 */ }
+    return [
+        { role: 'system', content: subst(WAYPOINT_DRAFTER_SYSTEM_PROMPT) },
+        { role: 'user', content: subst(parts.join('\n')) },
+    ];
+}
+
+// 解析 <Waypoints> 区块 → 路标意图字符串数组（去行首序号 / 项目符号；无区块回空数组）。纯函数、可单测。
+function parseWaypoints(text) {
+    let m = String(text || '').match(/<Waypoints>([\s\S]*?)<\/Waypoints>/i);
+    if (!m) m = String(text || '').match(/<Waypoints>([\s\S]*)$/i);   // 容忍漏写 / 截断闭标签（deepseek 实测漏过）
+    if (!m) return [];
+    return m[1].split('\n')
+        .map((l) => l.replace(/^\s*(?:\d+\s*[.、)：]|[-·*•])\s*/, '').trim())
+        .filter(Boolean);
+}
+
+// 一次起草调用：组装消息 + 走现有连接（direct / profile，非流式）。COMPILER_FULL_CONTEXT 开时，骨架起草也拿到
+// 与编译器同级的全量上下文（剧情全史 + 角色卡 + 世界书 + stat），修「最有分量的调用却最盲」（方案 C；见 §8）。
+async function callWaypointDrafter(spec) {
+    const s = getSettings();
+    let extra = [];
+    if (COMPILER_FULL_CONTEXT) {
+        const ctx = getCtx();
+        let statStr = '';
+        try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
+        let wiStr = '';
+        try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(spec)); } catch (e) { /* no WI */ }
+        extra = fullContextBlocks(ctx, s, wiStr);   // 角色卡 + 世界书
+        if (statStr) extra.push('=== 当前变量状态（剧情硬事实，骨架不得与之矛盾）===\n' + statStr);
+        const transcript = buildTranscript(ctx, { ...s, contextDepth: -1 });
+        if (transcript) extra.push('=== 完整故事对话记录（最新的在最后）===\n' + transcript);
+    }
+    const messages = buildWaypointDrafterMessages(spec, extra);
+    const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);
+    return await arcCall(messages, maxTokens);   // 护栏 + 实时缓冲 + 流式分发
+}
+
+// 起草 + 解析，最多重试 3 次；成功返回路标数组（按 spanFeel 上限封顶，过多则裁），全失败回 null。
+async function draftWaypoints(spec) {
+    const span = SPAN_FEEL[spec && spec.spanFeel] || SPAN_FEEL.medium;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const wps = parseWaypoints(await callWaypointDrafter(spec));
+            if (wps.length) return wps.slice(0, span.max);
+            console.warn('[Story Oracle] waypoint draft attempt', attempt, '— no parseable <Waypoints>.');
+        } catch (e) {
+            if (arcAborted(e)) { console.warn('[Story Oracle] waypoint draft aborted (timeout / cancel) — stop retrying.'); break; }
+            console.warn('[Story Oracle] waypoint draft attempt', attempt, 'failed:', e);
+        }
+    }
+    return null;
+}
+
+// ---- 置信门控核验（layer-4 细化）：独立于编译的一次轻调用 ----
+
+// 组装核验消息：把【待核实的幕后 goal】+ 自本拍以来的剧情 + 变量状态喂给核验器。
+// wiStr：全量匹配时由 checkBeatFulfilled 异步取的世界书（clamp 模式为空串）。
+function buildCheckMessages(arc, beat, statStr, wiStr) {
+    const ctx = getCtx();
+    const s = getSettings();
+    const beatAt = (beat && beat.beatAdoptedAt) || arc.adoptedAt || 0;
+    const since = Math.max(0, chatMsgCount() - beatAt);
+    const transcript = transitionTranscript(ctx, s, since);
+    const parts = ['=== 待核实的幕后目标（玩家看不到）===', beat.goal];
+    const playerTask = arcVisibleObjective(beat);
+    if (playerTask) parts.push(`（玩家看到的任务是：${playerTask}）`);
+    for (const b of fullContextBlocks(ctx, s, wiStr)) parts.push(b);   // 全量匹配：角色卡 + 世界书
+    if (transcript) parts.push('=== 最近剧情（自这一拍开始以来）===\n' + transcript);
+    if (statStr) parts.push('=== 当前变量状态（剧情硬事实）===\n' + statStr);
+    parts.push('请判断上面的幕后目标在最近剧情里是否已经真正兑现，只输出一个 <ArcCheck> 区块。');
+    const subst = (t) => { try { return ctx.substituteParams(t); } catch (e) { return t; } };
+    return [
+        { role: 'system', content: subst(CHECK_SYSTEM_PROMPT) },
+        { role: 'user', content: subst(parts.join('\n\n')) },
+    ];
+}
+
+// 一次核验调用 → 'yes' | 'unsure' | 'no'。走现有连接（direct / profile，非流式）；任何错误 /
+// 不可解析一律回 'unsure'（绝不假阳性）。token 上限给小（核验输出很短）。
+async function checkBeatFulfilled(arc) {
+    const beat = arc && arc.currentBeat;
+    if (!beat || !beat.goal) return 'unsure';
+    const s = getSettings();
+    let statStr = '';
+    try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
+    let wiStr = '';
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    const messages = buildCheckMessages(arc, beat, statStr, wiStr);
+    const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);   // 核验也跑判定 CoT，同享 8192 预算
+    let text = '';
+    try { text = await arcCall(messages, maxTokens); }   // 护栏 + 实时缓冲 + 流式（超时 / 取消 → 抛错 → catch 回 unsure）
+    catch (e) { console.warn('[Story Oracle] arc fulfillment check failed:', e); return 'unsure'; }
+    const parsed = parseArcCheck(text);
+    return parsed ? parsed.verdict : 'unsure';
+}
+
+/* ------------------------------------------------------------------ *
+ * ✓「达成」合并调用（2026-06-14）—— 有下一路标时把【核验 + 编下一拍】并成一次 LLM 调用（self-branch）。
+ * 模型一份回复里先 <ArcCheck>（判定）再 <ArcBeat>（按判定二选一）。代码仍掌控揭晓 / 推进（arcDecideOnAchieve /
+ * arcReveal），判定 verdict-first + 去耦 + 从严，失败 fail-safe。末路标仍走独立核验（见 arcMarkAchieved）。
+ * ------------------------------------------------------------------ */
+// ACHIEVE（CoT 版，2026-06-14 committed·prompt tuning 第二轮）：判定半边【保持精简】（盲评证实精简「先证据后结论」
+// 已够稳，不加重 CoT）；编拍半边套用与 COMPILER 同源的【生成 CoT】（清点/信息地图/此刻与转场/把拍写好看/质量自检）。
+// 2026-06-16 起，玩家 objective【不在思考里挑】、在输出区一次写定（见 BLIND_COMPILER_ADDENDUM 注释）。生成步骤 +
+// objective 段与 COMPILER_SYSTEM_PROMPT + BLIND_COMPILER_ADDENDUM 同源——改一处记得同步另一处。
+const ACHIEVE_SYSTEM_PROMPT =
+`你是「故事神谕·剧情参谋」的盲盒「达成」处理器。玩家刚点了「目标已达成」。请在【一次回复】里：先在 <arc_think> 里按步推演（先判定、再据判定编下一拍），再依次输出 <ArcCheck>（判定）→ <ObjectiveDraft>（抛弃式）→ <ArcBeat>（下一拍）。
+
+═══ 思维（写在 <arc_think>…</arc_think> 内，务必简短）═══
+不跳步、不解释自检过程。【绝不可】在 <arc_think> 内写出 <ArcCheck> / <ArcBeat> / <ObjectiveDraft> 任何正式标签——它们只在 </arc_think> 之后输出。
+【一遍成稿·铁律】每步只写一条结论、≤2 句；判定与编拍都想到第一个站得住的答案就定下来，把「挑选」交给质量自检。【禁止】列举多个备选拍（不写「更好的想法是…／或者…／换个角度…」之类）、【禁止】推翻重来、【禁止】来回重读剧情反复权衡。整段思考约 ≤800 字，写完立即输出 </arc_think>，不再续写。
+
+【目标—任务耦合·别钻牛角尖】objective 是玩家亲手做的【触发动作】，goal 是它引发的【后果 / 真相】。二者【不必同一拍内同时成立】，玩家也【不必亲手造成】goal——只需 objective 是【点燃它的引线】、存在一条看得见的因果线。① 后果可【延迟】：玩家做完 objective 后过一两次回复、或经一个延伸任务（stage B 载体拍）才落地，这是常态，别为「这动作如何当场促成 goal」反复推翻重来。② 后果可发生在【玩家不在场处】：主聊天叙事者已被授权在玩家触发【之后】用切视角 / 旁白 / 让结果找上门（信件·消息·传唤）把它演进正文。所以 goal 照写真实剧情后果（哪怕是别处的会议·决定·远方事件），不必硬塞进一个玩家在场的场景。
+
+【判定（先证据后结论）】这一拍【幕后真正想促成的事】（user「待判定的幕后目标」那条）是否已在最近剧情里【真正发生】——以文本确有其事为准，不看玩家声称。先从【剧情记录】里【逐字引用】足以证明它发生的那一句（或几句）原文；【引不出原文 = unsure】。线索找到了 / 刚起头 / 只是接近 / 可推断，统统【只算 unsure，绝不算 yes】；世界书设定与「即将发生」都不算「已发生」的证据。判定从严、诚实独立——【绝不可】因为「判 yes 才好往下写推进」而偏向 yes。据此定 fulfilled：yes（已明确确凿兑现）/ unsure（不确凿就选它）/ no（剧情明确朝反方向）。
+
+【据判定编下一拍】判定只决定【是否揭晓上一拍】，不决定你编什么——编什么【一律以 user「第二步」的指示为准】（它会按当前情形明确告诉你：要么推进到下一路标，要么${STAGE_B_EVOLVE_GOAL ? '重新拟定一个更贴近的幕后 goal、把故事朝同一路标再推近一步' : '保持同一幕后 goal、只换一个更直接的玩家任务'}）。以它为准，绝不用任何别的「一般规则」去覆盖它。然后用下列步骤把这一拍写好（与盲盒编译同标准）：
+- 清点素材：从【世界书 + 至今剧情】尽量充分清点——(a) 已确立的人物 / 关系 / 既定事实 / 当前状态；(b) 已埋下未兑现的伏笔 / 线头。漏斗非过滤网，需要别的既定细节随时回去取。
+- 信息地图：{{user}} 与各相关角色【分别】知道 / 不知道 / 误以为什么——幕后 goal 吃 {{user}} 不知道的信息差，objective 落在其已知范围。
+- 此刻与转场：读最近剧情（人在哪、在场谁、情绪、{{user}} 刚做了什么），这一拍从当下【长出来】，不凭空跳场景。
+- 把拍写好看：用一种戏剧手法（反转 / 倒计时 / 假黎明 / 被迫的代价抉择）；素材【植根于本故事】（上面清点的元素及其背后的完整剧情 / 世界书）；可引入新人物 / 新事物，但须【点名它兑现了哪条既定线头】（凭空冒出 = 不合格）；先想最俗套写法再避开${ENABLE_TYPE_ROTATION ? '；类型尽量与最近几拍不同（自然第一——最贴切的写法若重复某类型也可，别为换而换、别设「保留」限制）' : ''}。
+- 玩家 objective【不在思考里挑】：思考只把 goal / seed / 戏剧写好；玩家 objective 留到 </arc_think> 之后、在输出区【一次写定】（它是个玩家动作、不是深度创作，在思考里反复挑只会空转、撑爆预算）。好的盲盒 objective ＝ 一个 {{user}} 从【此刻】、凭他【自己看得见的理由】（他看不到幕后 goal）就会去做、又恰好【点燃】goal 的【一个】动作（赴约＝想要答案 / 陪她走回家＝担心她 / 把信交给她＝在送信 / 走进那扇门＝在探路）；只有知道秘密才讲得通的动作（无端「脱掉外套」「站到窗边」）＝坏 objective，玩家不会去做、goal 永远触发不了。objective 始终是 {{user}}【自己亲手做】的动作，【不是别的角色（NPC）的动作、也不是"看着某事发生"】——这点在【幕后 goal 是某 NPC 的内在变化 / 反应】时最易搞错：goal 尽可是那 NPC 的内心越界 / 转变 / 离屏之事，objective 仍是 {{user}} 点燃它的【那一下】（如幕后「她在独处中越界」→ objective「放学后陪她走回家」「找她单独说话」，绝不是「她靠过来」「她替你整理衣领」）。它【可大可小 / 可被动 / 可日常】——分量全在 goal / seed / 难度，【绝不可】因它「太简单 / 太被动 / 太日常」推翻另找；别把时间 / 地点 / 场合钉进去（进 seed）。
+- 质量自检（不过则重写）：赌注（按难度，不越级、不碰红线）/ 能动性 / 关联性（回收已有，不凭空降落）/ 惊喜（含路标未点明的新信息）；${ENABLE_TYPE_ROTATION ? '类型已轮换、' : ''}与 stat 不矛盾（盲盒 objective 的不剧透改在输出区两稿法把关，不在思考里挑）。
+
+═══ 输出（</arc_think> 之后，顺序固定；objective 在此【一次写定、不回头改】）═══
+<ArcCheck>
+fulfilled: yes | unsure | no
+reason: 一句话依据（引你判定时的证据）
+</ArcCheck>
+<ObjectiveDraft>
+plain: …（把这一拍连后果 / 意义直白摊开，抛弃式）
+masked: …（抹掉所有后果 / 意义 / 评判词，只留玩家亲手做的那个动作——这是强制去剧透，不是再挑动作）
+</ObjectiveDraft>
+<ArcBeat>
+goal: 一句话、结果式的幕后真相（玩家看不到）
+objective: 玩家可见任务（＝上面 masked 的那个玩家动作）
+type: 移动 / 战斗 / 社交 / 调查 / 获取 / 抉择 / 生存 / 创造 / 欺骗 / 守护 里选一个${ENABLE_TYPE_ROTATION ? '，避开最近几拍' : ''}
+seed: 起始迹象
+why: 为何贴合此刻（呼应哪条伏笔 / 关系 / 既定事实）
+</ArcBeat>
+全程简体中文。`;
+
+// 组装合并调用消息（判定目标 + 弧线上下文 + 第二步 self-branch 说明 + consent）。复用 compilerTranscript /
+// buildTransitionDirectives / blindConsentBlock，beat 质量与独立编译一致。inStageB 时不给「换任务」分支。
+function buildAchieveMessages(arc, nextWp, statStr, wiStr) {
+    const ctx = getCtx();
+    const s = getSettings();
+    const resolved = arc.currentBeat;
+    const inStageB = !!(resolved && resolved.stage === 'B');
+    const shapeNext = arcShapePosition(arc, nextWp);   // 下一拍的 live 位置 + 端锚定角色
+    const wpList = arc.waypoints.map((w, i) => {
+        const tag = w.id === nextWp.id ? '【下一个路标】'
+            : (w.status === 'done' ? '[已完成]'
+                : (w.status === 'skipped' ? '[已跳过]'
+                    : (w.status === 'active' ? '[当前]' : '[待办]')));
+        return `${i + 1}. ${tag} ${w.intent}`;
+    }).join('\n');
+    const beatAt = (resolved && resolved.beatAdoptedAt) || arc.adoptedAt || 0;
+    const since = Math.max(0, chatMsgCount() - beatAt);
+    const transcript = transitionTranscript(ctx, s, since);
+    const revealed = (arc.revealed || []).slice(-6).map((r) => `· ${r.goal}`).join('\n');
+    const span = SPAN_FEEL[arc.spanFeel] || SPAN_FEEL.medium;
+    const playerTask = arcVisibleObjective(resolved);
+
+    const parts = [
+        '=== 待判定的幕后目标（第一步要核验；玩家看不到）===\n' + (resolved ? resolved.goal : '')
+            + (playerTask ? `\n（玩家看到的任务是：${playerTask}）` : '')
+            + (inStageB ? '\n（这一拍已经是延伸任务 / follow-up。）' : '\n（这是该目标的首次判定。）'),
+        '=== 弧线 ===\n'
+            + `贯穿线：${arc.throughline || '（未填）'}\n`
+            + `篇幅感：${span.label}（${span.range}）　·　共 ${shapeNext.total} 个路标（不含已跳过）　·　下一拍的弧线角色：${ARC_SHAPE_ROLES[shapeNext.role]}\n`
+            + `路标列表：\n${wpList}`,
+    ];
+    for (const b of fullContextBlocks(ctx, s, wiStr)) parts.push(b);   // 全量匹配：角色卡 + 世界书
+    if (transcript) parts.push('=== 最近剧情（自本拍开始以来）===\n' + transcript);
+    if (statStr) parts.push('=== 当前变量状态（剧情硬事实，方案不得与之矛盾）===\n' + statStr);
+    if (revealed) parts.push('=== 已推进过的拍（勿原样重复）===\n' + revealed);
+    if (inStageB) {
+        parts.push('=== 第二步 · 编下一拍 ===\n无论判定如何，都编译上面标【下一个路标】的那个路标（判定只决定是否揭晓上一拍，不改变你编什么）。');
+    } else {
+        const unsureDirective = STAGE_B_EVOLVE_GOAL
+            ? '· 若判 unsure / no → 【不要换路标】，但这一拍的幕后还没落地——请【重新拟定一个更贴近的幕后 goal】（连同 seed），让它仍服务【同一个路标】、把故事朝它【再推近一步】：可以把上一个 goal 收窄 / 具体化，或换一个更直接通向【同一路标终点】的幕后结果（绝不改路标、绝不越级 / 碰红线）；objective 另给一个新的、与上个明显不同的玩家动作（玩家从此刻、凭自己看得见的理由会做、又点燃 goal）。不要揭晓、不要推进到下一路标。'
+            : `· 若判 unsure / no → 【不要换路标】；编一个【延伸任务 / 载体拍】：保持【同一个幕后 goal 不变】（仍是「${resolved ? resolved.goal : ''}」），`
+                + '只把 objective 换成一个新的、更直接推动它兑现、且与上个任务明显不同的玩家任务——最好是一个【会把场景推到 goal 落地那刻】的任务（幕后「导师战死」→「在这场战斗里活下来」）；goal 照原样输出。';
+        parts.push('=== 第二步 · 编下一拍（按你第一步的判定二选一）===\n'
+            + '· 若判 yes → 编译上面标【下一个路标】的那个路标，让故事向前推进。\n'
+            + unsureDirective);
+    }
+    for (const d of buildTransitionDirectives(arc, nextWp, {})) parts.push(d);
+    const consent = blindConsentBlock(arc.consent);
+    if (consent) parts.push(consent);
+    parts.push('输出顺序固定：先 <ArcCheck>（你的判定），再 <ObjectiveDraft>（抛弃式两稿），最后 <ArcBeat>（定稿）。');
+
+    const subst = (t) => { try { return ctx.substituteParams(t); } catch (e) { return t; } };
+    return [
+        { role: 'system', content: subst(ACHIEVE_SYSTEM_PROMPT) },
+        { role: 'user', content: subst(parts.join('\n\n')) },
+    ];
+}
+
+// 一次合并调用：取变量状态 + 组装消息 + 走现有连接（direct / profile，非流式）。
+async function callAchieve(arc, nextWp) {
+    const s = getSettings();
+    let statStr = '';
+    try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
+    let wiStr = '';
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    const messages = buildAchieveMessages(arc, nextWp, statStr, wiStr);
+    const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);
+    return await arcCall(messages, maxTokens);   // 护栏 + 实时缓冲 + 流式分发
+}
+
+// 据判定 + 解析出的拍，规划「达成」分支并校验拍是否可用（纯函数、可单测）。decision 沿用 arcDecideOnAchieve
+//（代码掌控揭晓 / 推进）；usable：stage-b 需 objective、推进需 goal。
+function achievePlan(arc, verdict, parsed) {
+    const decision = arcDecideOnAchieve(arc, verdict);
+    if (!parsed) return { decision, usable: false };
+    // 推进需 goal。stage-b：原行为只需 objective（goal 沿用旧拍）；STAGE_B_EVOLVE_GOAL 会据新拍重建注入，故也需 goal。
+    const usable = decision === 'stage-b'
+        ? (STAGE_B_EVOLVE_GOAL ? (!!parsed.goal && !!parsed.objective) : !!parsed.objective)
+        : !!parsed.goal;
+    return { decision, usable };
+}
+
+// 合并调用 + 解析，最多重试 3 次；成功回 { verdict, parsed }，全失败回 null（fail-safe）。每次都重判 + 重编
+//（同一份剧情下判定应稳定；失败重试不会卡死在坏拍上）。绝不在拿不到可用拍时硬推进。
+async function achieveWithRetry(arc, nextWp) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const text = await callAchieve(arc, nextWp);
+            const verdict = (parseArcCheck(text) || { verdict: 'unsure' }).verdict;
+            const parsed = parseArcBeat(text);
+            const revisedTail = parseWaypoints(text);   // 可选：编译器在显著漂移时重拟的待办尾段（无 <Waypoints> → 空数组 → 休眠）
+            if (achievePlan(arc, verdict, parsed).usable) return { verdict, parsed, revisedTail };
+            console.warn('[Story Oracle] achieve attempt', attempt, '— beat unusable for verdict', verdict);
+        } catch (e) {
+            if (arcAborted(e)) { console.warn('[Story Oracle] achieve aborted (timeout / cancel) — stop retrying.'); break; }
+            console.warn('[Story Oracle] achieve attempt', attempt, 'failed:', e);
+        }
+    }
+    return null;
+}
+
+// 常见路径（有下一路标）：一次调用搞定【核验 + 编下一拍】。代码仍掌控揭晓 / 推进（arcDecideOnAchieve）；
+// 失败 fail-safe（保留当前注入 + 方案条「↻ 重试」重走 ✓）；绝不假阳性揭晓。
+async function arcAchieveMerged(arc, nextWp) {
+    const resolved = arc.currentBeat;
+    const stamp = arcStamp(arc);
+    arcCompiling = true; clearArcRetry(); setArcBusyUI(true);
+    const tt = arcToast('正在确认这一拍是否落地、并编下一步…');
+    let result = null;
+    try { result = await achieveWithRetry(arc, nextWp); } catch (e) { result = null; }
+    arcClearToast(tt);
+    arcCompiling = false;
+    // 并发守卫：调用期间用户可能切了聊天 / 改了弧线。
+    const cur = getArc();
+    if (!cur || arcStamp(cur) !== stamp) { setArcBusyUI(false); renderPlanBar(); return; }
+    if (!result) {
+        setArcRetry({ achieve: true });   // 让方案条「↻ 重试」重走这次 ✓
+        setArcBusyUI(false); renderPlanBar();
+        arcToastErr('这次「确认 + 编下一步」没成功（失败 / 超时 / 已取消）——当前这一拍与引导保持不变。可点方案条上的「↻ 重试」再试。');
+        return;
+    }
+    const { decision } = achievePlan(cur, result.verdict, result.parsed);
+    if (decision === 'stage-b') {
+        // 不揭晓、不前进。STAGE_B_EVOLVE_GOAL：用模型新拍（新 goal/seed/objective）重建注入、朝同一路标推近一步；
+        // 否则（原行为·锁定 goal）保持当前 goal / 注入不变，只把任务换成 objectiveB。
+        if (STAGE_B_EVOLVE_GOAL) {
+            const wp = arcActiveWaypoint(cur);
+            const beat = buildCompiledBeat(cur, wp, result.parsed, { now: chatMsgCount(), variant: (resolved && resolved.variant) || 0 });
+            setArc(arcCommitStageBEvolve(cur, beat));
+            applyPlanInjection(); clearArcRetry(); setArcBusyUI(false); renderPlanBar();
+            addSystemNote(`换个方向再推近一步：${arcVisibleObjective(beat) || beat.goal}`);
+            return;
+        }
+        setArc(arcCommitStageB(cur, result.parsed.objective));
+        applyPlanInjection(); clearArcRetry(); setArcBusyUI(false); renderPlanBar();
+        addSystemNote(`这一步好像还没完全落地，再往前推一下：${result.parsed.objective || '（继续推进）'}`);
+        return;
+    }
+    // reveal-advance / quiet-advance：用模型编的下一拍推进；揭晓仅在 yes 时由【代码】触发（绝不假阳性）。
+    const confident = decision === 'reveal-advance';
+    // living-skeleton：若编译器判定剧情显著偏离骨架而重拟了待办尾段（盲盒、贯穿线神圣），先把尾段换掉、再朝
+    // 【重拟后】的新尾段头推进。盲盒下骨架本就对用户隐藏，故静默重构、不出系统提示（设计 §8）。空尾段 = 不动。
+    let working = cur, advanceTo = nextWp;
+    if (Array.isArray(result.revisedTail) && result.revisedTail.length) {
+        working = arcReviseTail(cur, result.revisedTail);
+        advanceTo = arcPeekNext(working) || nextWp;
+        console.debug('[Story Oracle] arc tail revised on drift →', result.revisedTail);
+    }
+    const beat = buildCompiledBeat(working, advanceTo, result.parsed, { now: chatMsgCount() });
+    setArc(arcCommitAdvance(working, beat, confident ? 'achieved' : 'advanced'));
+    applyPlanInjection();
+    if (confident) arcReveal(resolved);
+    clearArcRetry(); setArcBusyUI(false); renderPlanBar();
+    addSystemNote(`下一拍的任务：${arcVisibleObjective(beat) || beat.goal}`);
+}
+
+// 弧线身份指纹（并发守卫：切聊天 / 改弧线后丢弃在途结果）。
+function arcStamp(arc) {
+    return arc ? `${arc.adoptedAt}|${arc.cursor}|${arc.throughline}` : '';
+}
+
+/* ---- toastr 助手（ST 全局 toastr）---- */
+function arcToast(msg) {
+    try { return (window.toastr && window.toastr.info) ? window.toastr.info(msg, '', { timeOut: 0, extendedTimeOut: 0 }) : null; }
+    catch (e) { return null; }
+}
+function arcClearToast(t) { try { if (window.toastr) window.toastr.clear(t || undefined); } catch (e) { /* ignore */ } }
+function arcToastErr(msg) {
+    try { if (window.toastr && window.toastr.error) { window.toastr.error(msg); return; } } catch (e) { /* fall through */ }
+    addSystemNote(msg);
+}
+
+/* ---- 弧线 LLM 调用的【超时 + 可取消】护栏 ---- */
+// 弧线调用此前传 undefined signal = 无超时：请求挂死（发出去但服务端不回）时 await 永不返回，
+// setArcBusyUI(false) 永远到不了，进度计时器 / 罗盘就会【一直转下去】。这里给每次调用包一个 AbortController：
+// 到点（arcCallTimeoutMs）自动 abort 兜底，用户也可点「取消」立即 abort。abort → fetch 抛 AbortError →
+// 重试循环识别为中断、不再硬重试 → 上层走失败分支 → 清 busy（停表 + 停转）+ 留「重试」。
+const arcCallTimeoutMs = 180000;   // 3 分钟安全超时：CoT 编一拍正常数十秒，给足余量；真卡死才到点。取消按钮让此值只作兜底。
+let arcAbortCtl = null;             // 当前在途弧线调用的中断器（超时 / 取消共用）
+function arcBeginCall(ms) {
+    let ctl = null;
+    try { ctl = new AbortController(); } catch (e) { return { signal: undefined, end() {} }; }
+    arcAbortCtl = ctl;
+    let timer = null;
+    try { timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, ms); } catch (e) { /* 无 timers 环境 */ }
+    return { signal: ctl.signal, end() { if (timer) clearTimeout(timer); if (arcAbortCtl === ctl) arcAbortCtl = null; } };
+}
+function arcCancelInflight() { try { if (arcAbortCtl) arcAbortCtl.abort(); } catch (e) { /* ignore */ } }
+function arcAborted(e) { return !!e && (e.name === 'AbortError' || e.name === 'TimeoutError'); }
+
+/* ---- 实时输出缓冲 + 「📡 实时输出」查看器（诊断「在动 vs 卡死」）---- */
+// 每次弧线调用把流式 content / reasoning 累计在这里；用户开一个独立浮窗看它实时增长，一眼分辨
+// 「真在流（只是慢，等就行）」还是「一直空着（八成卡死，点取消）」。renderArcLive 在查看器关着时是空操作 = 零开销。
+let arcLiveText = '';        // 累计 content
+let arcLiveReasoning = '';   // 累计 reasoning_content（reasoning 模型）
+let arcLiveActive = false;   // 是否有调用在途
+let arcLiveStreamed = false; // 本次是否走了流式（s.stream 关 → false → 查看器解释「未开流式」）
+let arcLiveStartedAt = 0;
+function arcLiveBegin(streamed) { arcLiveText = ''; arcLiveReasoning = ''; arcLiveActive = true; arcLiveStreamed = !!streamed; arcLiveStartedAt = Date.now(); renderArcLive(); }
+function arcLiveDelta(o) { if (o) { if (typeof o.content === 'string') arcLiveText = o.content; if (typeof o.reasoning === 'string') arcLiveReasoning = o.reasoning; } renderArcLive(); }
+function arcLiveDone() { arcLiveActive = false; renderArcLive(); }
+
+// 一次弧线 LLM 调用：超时/取消护栏 + 实时缓冲 + 流式分发（尊重 s.stream；关流式则退回非流式，查看器会说明）。
+// 4 个调用助手（编译 / 达成 / 核验 / 起草）统一走这里——返回完整文本，与原非流式行为一致。
+async function arcCall(messages, maxTokens) {
+    const s = getSettings();
+    const guard = arcBeginCall(arcCallTimeoutMs);
+    arcLiveBegin(!!s.stream);
+    try {
+        if (s.mode === 'direct') {
+            const url = normalizeUrl(s.endpoint);
+            const body = { model: s.model, messages, max_tokens: maxTokens };
+            if (s.sendTemperature) body.temperature = s.temperature;
+            if (s.stream) return await streamDirectArc(url, s.apiKey, body, guard.signal, arcLiveDelta);
+            return await callDirect(url, s.apiKey, body, guard.signal);
+        }
+        const override = s.sendTemperature ? { temperature: s.temperature } : {};
+        if (s.stream) return await callProfileStream(s.profileId, messages, maxTokens, override, guard.signal, (full) => arcLiveDelta({ content: full }));
+        return await callProfile(s.profileId, messages, maxTokens, override, guard.signal);
+    } finally { guard.end(); arcLiveDone(); }
+}
+
+// 编译中：禁用游玩按钮 + 进度行跑一个【动画 + 已用时（+ 流式时的已接收字数）】计时器 + 旋转罗盘图标。
+// CoT 编一拍可能数十秒，只给一个静态 toast「开始了」却没有「在动」的反馈；墙钟计时 + CSS 旋转给出活着的进度感，
+// 对所有模型 / 连接都稳。开了流式时，arcLive* 还累计实时字数（含 reasoning_content，故 reasoning 模型也不会卡在 0），
+// 「📡 实时输出」浮窗可看逐字流（确认在流 vs 卡死）。单点放在 setArcBusyUI 里 → 覆盖所有出拍路径。完成后由 renderPlanBar 复原。
+let arcBusyTimer = null;
+let arcBusyStart = 0;
+function arcBusyLabel() {
+    const secs = Math.max(0, Math.round((Date.now() - arcBusyStart) / 1000));
+    const dots = '.'.repeat(1 + (Math.floor(Date.now() / 400) % 3));   // 动起来的省略号
+    const n = arcLiveText.length + arcLiveReasoning.length;            // 流式时的实时字数（含 reasoning）
+    const recv = n > 0 ? ` · 已接收 ${n >= 1000 ? (n / 1000).toFixed(1) + 'k' : n} 字` : '';
+    return `正在推演这一拍${dots}（已 ${secs}s${recv} · CoT 思考中，请稍候）`;
+}
+function startArcBusyTicker() {
+    arcBusyStart = Date.now();
+    const tick = () => {
+        if (!planBarEl) return;
+        const p = planBarEl.querySelector('#so-plan-progress');
+        if (p) { p.style.display = ''; p.textContent = arcBusyLabel(); }
+    };
+    tick();
+    arcBusyTimer = setInterval(tick, 400);
+}
+function stopArcBusyTicker() {
+    if (arcBusyTimer) { clearInterval(arcBusyTimer); arcBusyTimer = null; }
+}
+function setArcBusyUI(busy) {
+    if (busy && !arcBusyTimer) startArcBusyTicker();
+    if (!busy) stopArcBusyTicker();
+    // 旋转一切罗盘图标（窗口内方案条 / 浮窗头 / 折叠态那枚）——窗口关着甚至折叠成指南针时也看得到「在忙」。
+    if (planBarEl) planBarEl.classList.toggle('so-arc-busy', busy);
+    if (planFloat) planFloat.classList.toggle('so-arc-busy', busy);
+    if (!planBarEl) return;
+    for (const sel of ['#so-arc-complete', '#so-arc-reroll', '#so-arc-achieved',
+        '#so-arc-failed', '#so-arc-reject', '#so-arc-exit', '#so-arc-retry']) {
+        const el = planBarEl.querySelector(sel);
+        if (el) el.disabled = busy;
+    }
+    // 「取消」+「实时输出」只在忙时露出（且都不禁用——卡死时的逃生口 / 诊断口）。
+    const stop = planBarEl.querySelector('#so-arc-stop');
+    if (stop) { stop.style.display = busy ? '' : 'none'; stop.disabled = false; }
+    const live = planBarEl.querySelector('#so-arc-live');
+    if (live) { live.style.display = busy ? '' : 'none'; live.disabled = false; }
+    if (busy) {
+        const p = planBarEl.querySelector('#so-plan-progress');
+        if (p) { p.style.display = ''; p.textContent = arcBusyLabel(); }
+    }
+}
+function setArcRetry(o) { arcRetryPending = o; }
+function clearArcRetry() { arcRetryPending = null; }
+
+// 一次过渡的编排：toast → 编译（带重试）→ 成功才提交（且仅当弧线身份未变）→ 注入 + 渲染；
+// 失败 / 出错：保留当前注入不动 + 留「重试」。供 adoptArc / arcComplete / arcRerollBeat 共用。
+async function runCompileTransition(o) {
+    if (arcCompiling) return;
+    arcCompiling = true;
+    clearArcRetry();
+    setArcBusyUI(true);
+    const stamp = arcStamp(o.arc);
+    const tt = arcToast(o.toast || '正在编译…');
+    let beat = null;
+    try {
+        beat = await compileBeatWithRetry(o.arc, o.waypoint, {
+            variant: o.variant || 0, now: chatMsgCount(),
+            reroll: o.kind === 'reroll', failed: !!o.failed, stageB: o.kind === 'stageB',
+        });
+    } catch (e) {
+        console.warn('[Story Oracle] compile transition error:', e);
+    }
+    arcClearToast(tt);
+    arcCompiling = false;
+    // 并发守卫：编译期间用户可能切了聊天 / 改了弧线 —— 只有在身份完全一致时才提交结果。
+    const cur = getArc();
+    if (!cur || arcStamp(cur) !== stamp) { setArcBusyUI(false); renderPlanBar(); return; }
+    if (!beat) {
+        setArcBusyUI(false);
+        setArcRetry(o);                 // 暂存供方案条「重试」
+        renderPlanBar();
+        arcToastErr('编译没成功（失败 / 超时 / 已取消）——当前这一拍与引导保持不变。可点方案条上的「重试」再试。');
+        return;
+    }
+    setArc(o.onBeat(cur, beat));
+    applyPlanInjection();
+    setArcBusyUI(false);
+    renderPlanBar();
+    if (o.onSuccess) o.onSuccess(cur, beat);
+    if (o.okNote) addSystemNote(o.okNote(beat));
 }
 
 /* ------------------------------------------------------------------ *
@@ -1427,13 +3017,17 @@ async function getMvuStatData() {
     }
 }
 
-function getLatestAiMessageText() {
+// 返回最近一条 AI 回复的 { idx, text }。idx 用于把推导出的更新块写回该消息（自动诊断衍生情形）。
+function getLatestAiMessage() {
     const chat = getCtx().chat || [];
     for (let i = chat.length - 1; i >= 0; i--) {
         const m = chat[i];
-        if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) return m.mes;
+        if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) return { idx: i, text: m.mes };
     }
-    return '';
+    return { idx: -1, text: '' };
+}
+function getLatestAiMessageText() {
+    return getLatestAiMessage().text;
 }
 
 function extractUpdateBlock(text) {
@@ -1467,6 +3061,273 @@ async function undoFix(snapshot) {
     const Mvu = await getMvu();
     if (!Mvu || typeof Mvu.replaceMvuData !== 'function') throw new Error('MVU not available');
     await Mvu.replaceMvuData(snapshot, { type: 'message', message_id: 'latest' });
+}
+
+/* ------------------------------------------------------------------ *
+ * 用户功能请求：自动诊断 —— 每收到一条新的主聊天 AI 回复，就在后台跑一次诊断、确有错误时自动
+ * 应用修复。与窗口的手动诊断共用底层（buildDiagnosePromptFrom + MVU 管线），但全程无界面：
+ * 自建提示词（不碰窗口共享状态）、非流式调用、仅在确有改动时写入，并用可撤销的 toast 告知。
+ * ⚠ 与 MVU「额外模型解析」不兼容（那时更新由另一模型异步解析、不在正文里）——开启时已警告。
+ * ------------------------------------------------------------------ */
+let autoDiagBusy = false;          // 防重入：一次只跑一个后台诊断
+let autoDiagErrorToasted = false;  // 错误 toast 每会话只弹一次，免得每条回复都打扰
+
+// message_received 监听：仅在自动模式开启、且这是一条 AI 回复时，安排一次后台诊断。
+async function maybeAutoDiagnose(messageId) {
+    if (!ENABLE_AUTO_DIAGNOSE) return;     // 杀死开关：后台自动诊断整体停摆，绝不调用模型 / 绝不写 MVU
+    const s = getSettings();
+    if (!s.autoDiagnoseEnabled || autoDiagBusy) return;
+    const ctx = getCtx();
+    const chat = ctx.chat || [];
+    const idx = Number.isInteger(messageId) ? messageId : chat.length - 1;
+    const m = chat[idx];
+    if (!m || m.is_user || m.is_system) return;             // 只处理 AI 回复
+    autoDiagBusy = true;
+    try {
+        // 给 MVU 先消化这条回复的更新，再读取权威状态（额外模型解析模式本就不支持）。
+        await new Promise((r) => setTimeout(r, Math.max(0, (s.autoDiagnoseDelayMs | 0) || 1200)));
+        await runAutoDiagnose(ctx, s);
+    } catch (e) {
+        console.warn('[Story Oracle] 自动诊断失败：', e);
+        if (!autoDiagErrorToasted) {
+            autoDiagErrorToasted = true;
+            try { window.toastr && window.toastr.warning && window.toastr.warning('故事神谕：自动诊断这一轮没跑成（详见控制台）。后续回复会继续尝试。', '自动诊断'); } catch (e2) { /* ignore */ }
+        }
+    } finally {
+        autoDiagBusy = false;
+    }
+}
+
+// 后台诊断主体：自建诊断提示词 → 调模型 → 解析出修正区块 → 仅在确有改动时经 MVU 应用。
+async function runAutoDiagnose(ctx, s) {
+    const Mvu = await getMvu();
+    if (!Mvu) return;                                       // 没有 MVU 就没什么可诊断
+    // 连接没配好就静默退出——别让每条回复都报错（开自动模式的人一般已配好直连 / 配置文件）。
+    if (s.mode === 'direct' && (!s.endpoint || !s.model)) return;
+    if (s.mode === 'profile' && !s.profileId) return;
+
+    // 自建诊断上下文（不碰窗口共享的 worldInfoBlock / diagStatData / diagLatestUpdate）。
+    let wiBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
+    const mvuRules = await collectMvuUpdateRules(wiBlock);
+    if (mvuRules.length) wiBlock = [wiBlock, ...mvuRules].filter(Boolean).join('\n\n');
+    const stat = await getMvuStatData();
+    const statStr = stat ? JSON.stringify(stat, null, 2) : '';
+    const { idx: aiIdx, text: latestReply } = getLatestAiMessage();
+    if (!latestReply.trim()) return;                        // 没有可分析的 AI 回复
+    const latestBlock = extractUpdateBlock(latestReply);
+    // 关键：正文里没有内联 <UpdateVariable> 也【不退出】——此时自动诊断改为据回复正文【推导】本回合
+    // 的更新，充当 MVU「额外模型解析」的替代（用户要的正是这个：不开额外模型解析，靠自动诊断补出更新）。
+    const systemPrompt = buildDiagnosePromptFrom(ctx, s, { wiBlock, statStr, latestBlock, latestReply, auto: true });
+    const userMsg = latestBlock
+        ? '【自动诊断】最新一条 AI 回复里带有 <UpdateVariable> 更新。请按本卡 MVU 规则与当前状态核验它：有错就只输出一个修正后的 <UpdateVariable> 区块（仅含需改正的字段）；完全正确则在 <JSONPatch> 里输出空数组（[]）。'
+        : '【自动诊断】最新一条 AI 回复的正文里【没有】变量更新区块。请充当变量更新引擎：通读这条回复，依本卡 MVU 规则与当前状态，推导出本回合应当发生的全部变量更新，输出一个 <UpdateVariable> 区块把状态更新到位；若这条回复确实不涉及任何变量变化，则在 <JSONPatch> 里输出空数组（[]）。';
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMsg },
+    ];
+
+    const effMaxTokens = Math.max(s.maxTokens, 4096);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, 120000);
+    const genToast = showAutoDiagGenerating();   // 用户功能请求：生成报告时给个「正在自动诊断…」提示
+    let finalText = '';
+    try {
+        if (s.mode === 'direct') {
+            const body = { model: s.model, messages, max_tokens: effMaxTokens };
+            if (s.sendTemperature) body.temperature = s.temperature;
+            finalText = await callDirect(normalizeUrl(s.endpoint), s.apiKey, body, ctl.signal);
+        } else {
+            const override = s.sendTemperature ? { temperature: s.temperature } : {};
+            finalText = await callProfile(s.profileId, messages, effMaxTokens, override, ctl.signal);
+        }
+    } finally {
+        clearTimeout(timer);
+        dismissToast(genToast);   // 无论成功 / 失败 / 抛错，都收掉「正在诊断」提示
+    }
+
+    // 用户功能请求：每跑完一轮都留一条记录（含「无需改动」）。改动 → 带补丁 + 撤销按钮；无改动 / 失败 → 一句话。
+    const patchBlock = extractUpdateBlock(finalText);
+    const result = patchBlock ? await autoApplyFix(Mvu, patchBlock) : { status: 'nochange' };
+    // 确有改动 → 把结果反映到消息 / 状态栏（auto 诊断走 replaceMvuData，不发刷新事件，状态栏不会自己更新）：
+    //   衍生（乙，原回复无块）：写回推导块 + saveChat + 重渲染（与官方 MVU 更新一致）；
+    //   核验（甲，原回复已有块）：只重渲染刷新状态栏，不碰消息正文（避免出现两个更新块）。
+    if (AUTO_DIAGNOSE_WRITE_BACK && result.status === 'applied' && aiIdx >= 0) {
+        if (!latestBlock) await writeUpdateBlockToMessage(aiIdx, patchBlock);
+        else refreshMessageBar(aiIdx);
+    }
+    notifyAutoDiagnose(result, patchBlock);
+}
+
+// 自动应用修复：解析补丁。回 {status:'applied', snapshot}（确有改动、已写入）/ {status:'nochange'}
+// （解析成功但与现状无差，no-op）/ {status:'failed'}（无 MVU 或没解析出数据）。
+async function autoApplyFix(Mvu, patchBlock) {
+    if (!Mvu || typeof Mvu.parseMessage !== 'function') return { status: 'failed' };
+    const opts = { type: 'message', message_id: 'latest' };
+    const oldData = Mvu.getMvuData(opts);
+    const snapshot = JSON.parse(JSON.stringify(oldData));
+    const newData = await Mvu.parseMessage(patchBlock, oldData);
+    if (!newData) return { status: 'failed' };
+    if (JSON.stringify(newData) === JSON.stringify(oldData)) return { status: 'nochange' };   // no-op
+    await Mvu.replaceMvuData(newData, opts);
+    return { status: 'applied', snapshot };
+}
+
+// 重渲染该 AI 消息，让前端状态栏反映这次自动诊断的写入。auto 诊断经 Mvu.replaceMvuData 写库，而它【不发】
+// VARIABLE_UPDATE_ENDED（官方更新走 MVU 更新引擎才发），状态栏不会自己刷新；重渲染（ctx.updateMessageBlock →
+// 重跑 messageFormatting / 卡片 <StatusPlaceHolderImpl/> 状态栏正则）令其读取刚写入的 display_data 而刷新。
+// MVU 只在 MESSAGE_RECEIVED/SENT 解析更新块，重渲染不触发其重解析，故不二次写库。衍生与核验两情形共用；
+// 卡片侧状态栏实现各异，视觉刷新仍需真卡验证。
+function refreshMessageBar(idx) {
+    const ctx = getCtx();
+    const m = (ctx.chat || [])[idx];
+    if (!m) return;
+    try { if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(idx, m); }
+    catch (e) { console.warn('[Story Oracle] 自动诊断后重渲染消息失败：', e); }
+    // updateMessageBlock 只把 .mes_text 重渲染成状态栏 HTML 代码块；【酒馆助手】要收到 MESSAGE_UPDATED 才会把那段
+    // HTML 真正渲染成 iframe（运行其 <script>）——其消息 iframe 渲染器（JS-Slash-Runner store/iframe_runtimes/
+    // message.ts）正监听 CHARACTER/USER_MESSAGE_RENDERED / MESSAGE_UPDATED / MESSAGE_SWIPED。不补发它，状态栏就停在
+    //「原始 HTML 代码」（用户手动编辑→保存能修，正因为保存会发 MESSAGE_UPDATED）。故重渲染后补发。MVU 只听
+    // MESSAGE_RECEIVED/SENT，不会被它二次触发（不会重解析 / 二次写库）。
+    try {
+        const et = ctx.eventTypes || ctx.event_types || {};
+        if (ctx.eventSource && typeof ctx.eventSource.emit === 'function') {
+            Promise.resolve(ctx.eventSource.emit(et.MESSAGE_UPDATED || 'message_updated', idx)).catch(() => {});
+        }
+    } catch (e) { console.warn('[Story Oracle] 自动诊断后发 MESSAGE_UPDATED 失败：', e); }
+}
+
+// 衍生（乙）情形专用：把推导出的 <UpdateVariable> 块 + MVU 状态栏占位符写回这条 AI 消息（让消息像官方 MVU
+// 更新那样【携带】更新记录 + 触发状态栏；块默认被卡片「去除变量更新」正则在显示 / 提示词里隐藏，占位符由卡片
+// 显示正则渲染成状态栏，二者都跨重载存活，故 saveChat），再调 refreshMessageBar 重渲染。核验（甲）情形不走这里
+// （消息里已有块 + 占位符，再追加会重复），只 refreshMessageBar。
+async function writeUpdateBlockToMessage(idx, block) {
+    const ctx = getCtx();
+    const m = (ctx.chat || [])[idx];
+    if (!m || typeof m.mes !== 'string' || !block) return;
+    let changed = false;
+    if (!m.mes.includes(block)) {                            // 幂等：已写过就不重复追加
+        m.mes = m.mes.trimEnd() + '\n\n' + block;
+        changed = true;
+    }
+    // 再补上 MVU 状态栏占位符（衍生情形 MVU 没跑、不会自己加它）——否则有更新块也不出状态栏（见 STATUS_PLACEHOLDER）。
+    if (!m.mes.includes(STATUS_PLACEHOLDER)) {
+        m.mes = m.mes.trimEnd() + '\n\n' + STATUS_PLACEHOLDER;
+        changed = true;
+    }
+    if (changed) {
+        try { if (typeof ctx.saveChat === 'function') await ctx.saveChat(); }
+        catch (e) { console.warn('[Story Oracle] 自动诊断写回消息后保存失败：', e); }
+    }
+    refreshMessageBar(idx);
+}
+
+// 纯函数：拼一条自动诊断侧聊记录的正文。status: applied（带补丁）/ nochange（无需改动）/ failed
+// （没解析出可应用的更新）。stamp 由调用方传入（纯函数不读时钟，便于单测）。可单测。
+function autoDiagNoteContent({ status, patch, stamp }) {
+    const t = stamp ? ' · ' + stamp : '';
+    if (status === 'applied') {
+        const body = (patch && patch.trim()) ? `\n${patch.trim()}` : '';
+        return `🔧 自动诊断${t} —— 已自动修复本回合的 MVU 状态（在下方点「撤销」可还原）。${body}`;
+    }
+    if (status === 'failed') {
+        return `⚠️ 自动诊断${t} —— 跑完了，但这条更新没能解析 / 应用（已跳过，未改动状态）。`;
+    }
+    return `🩺 自动诊断${t} —— 已检查最新回复，本回合无需改动。`;   // nochange
+}
+
+// 自动诊断跑完一轮后的提示。用户功能请求：每轮都在侧聊里留一条【持久】记录（含「无需改动」）；改动
+// 的那条还带一个【撤销按钮】（与手动诊断同款，经 applyFix/undoFix），撤销不再走 toast。toast 只作信息
+// 提示。注意：撤销按钮只在【刚跑完的本会话】可用——重载后记录变只读（重放旧补丁不安全，与手动诊断回复
+// 重载后失去按钮一致）。
+function notifyAutoDiagnose(result, patch) {
+    const status = (result && result.status) || 'failed';
+    const snapshot = status === 'applied' ? result.snapshot : null;
+
+    // 信息 toast（不再承担撤销动作——撤销在记录的按钮上）
+    try {
+        if (status === 'applied') {
+            window.toastr && window.toastr.success && window.toastr.success(
+                '已自动修复最新回复的 MVU 状态。可在神谕侧聊里点「撤销」还原。', '故事神谕 · 自动诊断', { timeOut: 7000 });
+        } else if (status === 'nochange') {
+            window.toastr && window.toastr.info && window.toastr.info(
+                '已检查最新回复，本回合无需改动。', '故事神谕 · 自动诊断', { timeOut: 4000 });
+        } else {
+            window.toastr && window.toastr.warning && window.toastr.warning(
+                '自动诊断跑完了，但这条更新没能解析 / 应用（已跳过）。', '故事神谕 · 自动诊断', { timeOut: 5000 });
+        }
+    } catch (e) { /* toastr 不在就算了 */ }
+
+    // 持久侧聊记录（每轮都写）。窗口关着也留得下（DOM 在 init 就建好）；随 per-chat 持久化、跨重载存活。
+    // 它是 note 条目，不是问答轮，绝不回灌给模型（见 convoForPrompt）。
+    try {
+        const stamp = (() => { try { return new Date().toLocaleTimeString(); } catch (e) { return ''; } })();
+        const entry = { id: ++cidSeq, role: 'note', content: autoDiagNoteContent({ status, patch, stamp }) };
+        convo.push(entry);
+        persistConvo();
+        // 改动型记录在本会话挂可用的撤销按钮；其余（无改动 / 失败 / 重载后）是只读记录。
+        const undoable = (snapshot && patch) ? { snapshot, patch } : null;
+        if (messagesEl) entry._el = addNoteMessage(entry, undoable);
+    } catch (e) { console.warn('[Story Oracle] 自动诊断记录写入侧聊失败：', e); }
+}
+
+// 「正在自动诊断…」提示。返回一个句柄交给 dismissToast 收掉（toastr 不在则回 null）。timeOut:0 = 不
+// 自动消失，由我们在生成结束后手动 clear。
+function showAutoDiagGenerating() {
+    try {
+        if (window.toastr && window.toastr.info) {
+            return window.toastr.info('正在分析最新回复、生成诊断报告…', '故事神谕 · 自动诊断', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+        }
+    } catch (e) { /* ignore */ }
+    return null;
+}
+function dismissToast(handle) {
+    try { if (handle && window.toastr && window.toastr.clear) window.toastr.clear(handle); } catch (e) { /* ignore */ }
+}
+
+// 自动诊断记录上的「撤销 / 重新应用」按钮条（与 addApplyControls 同款，复用 applyFix/undoFix）。
+// 记录创建时修复【已自动应用】，故按钮初始就是「撤销」态。
+function addNoteUndoControls(wrap, initialSnapshot, patch) {
+    const bar = document.createElement('div');
+    bar.className = 'so-apply-bar so-note-undo';
+    const btn = document.createElement('button');
+    btn.className = 'so-apply-btn';
+    btn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> 撤销此次修复';
+    const status = document.createElement('span');
+    status.className = 'so-apply-status';
+    bar.appendChild(btn);
+    bar.appendChild(status);
+    wrap.appendChild(bar);
+
+    let snapshot = initialSnapshot;   // 非空 = 当前处于「已应用」
+    btn.addEventListener('click', async () => {
+        status.classList.remove('so-hint-error');
+        btn.disabled = true;
+        if (snapshot) {
+            status.textContent = '正在还原…';
+            try {
+                await undoFix(snapshot);
+                snapshot = null;
+                btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> 重新应用';
+                status.textContent = '已还原到修复前的状态。';
+            } catch (e) {
+                status.textContent = '还原失败：' + (e?.message || e);
+                status.classList.add('so-hint-error');
+            }
+        } else {
+            status.textContent = '正在重新应用…';
+            try {
+                snapshot = await applyFix(patch, status);
+                if (snapshot) {
+                    btn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> 撤销此次修复';
+                    status.textContent = '已重新应用。';
+                }
+            } catch (e) {
+                status.textContent = '重新应用失败：' + (e?.message || e);
+                status.classList.add('so-hint-error');
+            }
+        }
+        btn.disabled = false;
+    });
 }
 
 function injectWandButton() {
@@ -1506,9 +3367,10 @@ function buildWindow() {
         <div id="so-header">
             <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span><span id="so-lb-pill">世界书</span><span id="so-adv-pill">参谋</span></div>
             <div id="so-header-btns">
-                <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋（实验性）—— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
+                <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋 —— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
                 <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
-                <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量"><i class="fa-solid fa-stethoscope"></i></div>
+                <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）"><i class="fa-solid fa-stethoscope"></i><span class="so-auto-tag">AUTO</span></div>
+                <div class="so-iconbtn" id="so-summary-btn" title="剧情概要 —— 粘贴你的运行总结 / 前情提要，神谕会在最近对话前读到它"><i class="fa-solid fa-scroll"></i></div>
                 <div class="so-iconbtn" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i></div>
                 <div class="so-iconbtn" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i></div>
                 <div class="so-iconbtn" id="so-clear-btn" title="清空对话"><i class="fa-solid fa-trash-can"></i></div>
@@ -1644,21 +3506,68 @@ function buildWindow() {
         <div id="so-adv-bar">
             <label class="so-check so-adv-check"><input id="so-adv-preset" type="checkbox"><span>套用我的补全预设（参谋指令叠加其上）</span></label>
             <div class="so-hint so-adv-preset-warn">⚠ 仅在确实需要预设里的越狱时才勾选：预设的额外内容会分散模型注意力。未整理过预设时勾它不报错，会自动退回内置参谋提示词。</div>
+            <button type="button" class="so-plan-mini" id="so-arc-new" title="实验性功能：把整条剧情弧线交给神谕做长程引导（仍在打磨）" style="display:none"><i class="fa-solid fa-route"></i> 新建弧线（手动·实验性）</button>
+            <div id="so-arc-form" style="display:none">
+                <div class="so-hint so-arc-exp-warn">⚠ 弧线系统是实验性功能：长程引导（多拍 / 盲盒 / 自动起草骨架）仍在打磨，行为可能随版本调整。上面的单拍「开始引导」已稳定，不受影响。</div>
+                <label class="so-field"><span>引导方式</span>
+                    <select id="so-arc-mode">
+                        <option value="transparent" selected>全透明 —— 我看得到每拍指令，逐拍选强度</option>
+                        <option value="blind">盲盒 —— 我只看任务，幕后指令保密（可揭开偷看）</option>
+                    </select>
+                </label>
+                <label class="so-field"><span>贯穿线（一句话脊柱）</span><input id="so-arc-throughline" type="text" placeholder="例如：青璃与旧门派的恩怨了结"></label>
+                <label class="so-field"><span id="so-arc-waypoints-label">路标（每行一个，意图级——透明弧你看得到每一拍，需自己填写）</span><textarea id="so-arc-waypoints" rows="4" placeholder="师父的背叛浮出水面&#10;幸存者开始跟踪青璃&#10;最终对峙"></textarea></label>
+                <label class="so-field"><span>篇幅感（路标起草软范围）</span>
+                    <select id="so-arc-span">
+                        <option value="short">短篇（3-5 拍）</option>
+                        <option value="medium" selected>中篇（5-9 拍）</option>
+                        <option value="long">长篇（8-15 拍）</option>
+                    </select>
+                </label>
+                <!-- 盲盒专属（mode=blind 时显示）：难度=赌注货币、红线=唯一安全护栏、风格 / 方向。 -->
+                <div id="so-arc-blind-fields" style="display:none">
+                    <label class="so-field"><span>难度 / 赌注层级</span>
+                        <select id="so-arc-difficulty"></select>
+                    </label>
+                    <label class="so-field"><span>红线（每行一条，编译器绝不触碰；凛冽强烈建议至少一条）</span><textarea id="so-arc-redlines" rows="2" placeholder="导师不可死&#10;不可背叛挚友"></textarea></label>
+                    <label class="so-field"><span>风格偏好（可选）</span><input id="so-arc-style" type="text" placeholder="悬疑 / 治愈 / 西幻…"></label>
+                    <label class="so-field"><span>大致方向（关于什么，而非发生什么；可选）</span><input id="so-arc-direction" type="text" placeholder="例如：关于背叛与原谅"></label>
+                </div>
+                <div class="so-arc-form-actions">
+                    <button type="button" class="so-plan-mini" id="so-arc-cancel">取消</button>
+                    <button type="button" class="so-plan-mini so-plan-done" id="so-arc-create">创建透明弧</button>
+                </div>
+            </div>
         </div>
 
         <div id="so-plan-bar">
             <div class="so-plan-head">
                 <i class="fa-solid fa-compass so-plan-icon"></i>
-                <span class="so-plan-label">引导中</span>
+                <span class="so-plan-label" id="so-plan-label">引导中</span>
+                <span class="so-arc-diff-badge" id="so-arc-diff-badge" style="display:none"></span>
                 <span id="so-plan-goal"></span>
             </div>
+            <div class="so-hint" id="so-plan-progress" style="display:none"></div>
             <div class="so-plan-intensity" id="so-plan-intensity"></div>
             <div class="so-hint" id="so-plan-caption"></div>
+            <div class="so-arc-shaping-row" id="so-arc-shaping" style="display:none">
+                <span class="so-arc-shaping-label">弧线节奏</span>
+                <div class="so-plan-intensity" id="so-arc-shaping-seg"></div>
+            </div>
             <div class="so-plan-actions">
                 <button type="button" class="so-plan-mini" id="so-plan-show">▸ 查看注入内容</button>
                 <span class="so-plan-spacer"></span>
                 <button type="button" class="so-plan-mini so-plan-done" id="so-plan-done" title="目标已达成，停止引导">完成</button>
                 <button type="button" class="so-plan-mini so-plan-drop" id="so-plan-drop" title="不再需要，停止引导">放弃</button>
+                <button type="button" class="so-plan-mini so-plan-done" id="so-arc-complete" title="这一拍落地了，进入下一拍" style="display:none">完成</button>
+                <button type="button" class="so-plan-mini" id="so-arc-reroll" title="同一路标换条路线" style="display:none">换个思路</button>
+                <button type="button" class="so-plan-mini so-plan-done" id="so-arc-achieved" title="这一拍的任务达成了——揭晓幕后并进入下一拍" style="display:none">✓ 达成</button>
+                <button type="button" class="so-plan-mini" id="so-arc-failed" title="任务没做到——把失败当素材，进入下一拍" style="display:none">✗ 失败</button>
+                <button type="button" class="so-plan-mini" id="so-arc-reject" title="不喜欢这个任务，换一个（同一路标，不推进）" style="display:none">🚫 换个目标</button>
+                <button type="button" class="so-plan-mini so-plan-drop" id="so-arc-exit" title="退出整条弧线（清除引导）" style="display:none">退出</button>
+                <button type="button" class="so-plan-mini" id="so-arc-retry" title="重新编译这一拍" style="display:none">↻ 重试</button>
+                <button type="button" class="so-plan-mini so-plan-drop" id="so-arc-stop" title="中断这次生成（卡住 / 等太久时用）" style="display:none">取消</button>
+                <button type="button" class="so-plan-mini" id="so-arc-live" title="开一个浮窗看模型的实时输出——确认是在流式生成、还是真卡住了" style="display:none">📡 实时输出</button>
             </div>
             <pre id="so-plan-directive"></pre>
         </div>
@@ -1679,6 +3588,37 @@ function buildWindow() {
                 </div>
             </div>
             <pre id="so-debug-body"></pre>
+        </div>
+
+        <div id="so-summary">
+            <div id="so-summary-head">
+                <span><i class="fa-solid fa-scroll"></i> 剧情概要（本聊天）</span>
+                <div style="display:flex;gap:2px;">
+                    <div class="so-iconbtn" id="so-summary-clear" title="清空概要"><i class="fa-solid fa-trash-can"></i></div>
+                    <div class="so-iconbtn" id="so-summary-close" title="关闭"><i class="fa-solid fa-xmark"></i></div>
+                </div>
+            </div>
+            <div id="so-summary-sub">粘贴你的运行总结 / 前情提要（比如存在补全预设或别处、神谕本来读不到的剧情梗概）。它随【本聊天】保存，并在【普通聊天】与【剧情参谋】模式下插入到最近对话记录的正前方。留空即不启用。</div>
+            <textarea id="so-summary-text" placeholder="在此粘贴剧情概要 / 前情提要…"></textarea>
+            <div id="so-summary-foot"><span id="so-summary-count"></span></div>
+        </div>
+
+        <div id="so-autowarn">
+            <div id="so-autowarn-card">
+                <div id="so-autowarn-head"><i class="fa-solid fa-triangle-exclamation"></i> 开启自动诊断模式？</div>
+                <div id="so-autowarn-body">
+                    <p>开启后，每当主聊天收到一条新的 AI 回复，故事神谕都会在后台自动处理它的 MVU 变量，并<strong>自动应用</strong>（无需点击确认，每次都会弹出可撤销提示；窗口关着也照常工作）：</p>
+                    <p>· 回复里<strong>带有</strong> &lt;UpdateVariable&gt; 更新 → 核验并修正它；<br>· 回复里<strong>没有</strong>更新区块 → 直接据剧情<strong>推导</strong>出本回合应有的变量更新并补上。</p>
+                    <p>因此它也能<strong>替代</strong> MVU 的「额外模型解析」：不必再开额外模型解析，改由自动诊断补出每回合的更新。</p>
+                    <p class="so-autowarn-danger">⚠ 但切勿与「额外模型解析」<strong>同时</strong>开启：两者会抢着解析同一条回复、重复或冲突写入，产生错误数据。二者只用其一。</p>
+                    <p class="so-autowarn-note">自动模式每条回复都会多发一次模型请求，会额外消耗 token。</p>
+                </div>
+                <label class="so-autowarn-check"><input type="checkbox" id="so-autowarn-never"><span>不再提示</span></label>
+                <div id="so-autowarn-btns">
+                    <button type="button" id="so-autowarn-cancel">取消</button>
+                    <button type="button" id="so-autowarn-ok">开启自动模式</button>
+                </div>
+            </div>
         </div>
         <div id="so-resize-grip" title="拖动调整大小" aria-label="调整窗口大小"></div>
     `;
@@ -1724,13 +3664,67 @@ function bindControls() {
         const pre = planBarEl.querySelector('#so-plan-directive');
         const open = pre.classList.toggle('open');
         planBarEl.querySelector('#so-plan-show').textContent = open ? '▾ 收起注入内容' : '▸ 查看注入内容';
-        if (open) {
-            const plan = getPlan();
-            pre.textContent = plan ? buildDirective(plan) : '';
-        }
+        if (open) pre.textContent = currentInjectionPreview();   // type-aware (arc beat OR single plan)
+        else pre.classList.remove('peek');                       // closing a blind spoiler re-masks it next open
+    });
+    // Blind spoiler: a masked (blurred) directive reveals on one tap (soft secrecy —
+    // the goal is intentionally peekable). No-op when not a blind arc (no so-spoiler).
+    win.querySelector('#so-plan-directive').addEventListener('click', (e) => {
+        const pre = planBarEl.querySelector('#so-plan-directive');
+        if (pre.classList.contains('so-spoiler')) { pre.classList.toggle('peek'); e.stopPropagation(); }
     });
     win.querySelector('#so-plan-done').addEventListener('click', () => endPlan(true));
     win.querySelector('#so-plan-drop').addEventListener('click', () => endPlan(false));
+    // Arc lifecycle buttons. Hidden unless the matching arc kind is the active construct
+    // (renderPlanBar toggles them); handlers are no-ops without one.
+    // Transparent arc (layer 2):
+    win.querySelector('#so-arc-complete').addEventListener('click', () => arcComplete());
+    win.querySelector('#so-arc-reroll').addEventListener('click', () => arcRerollBeat());
+    // Blind arc (layer 4): ✓ reveal+advance · ✗ absorb failure+advance · 🚫 swap objective.
+    win.querySelector('#so-arc-achieved').addEventListener('click', () => arcMarkAchieved());
+    win.querySelector('#so-arc-failed').addEventListener('click', () => arcMarkFailed());
+    win.querySelector('#so-arc-reject').addEventListener('click', () => arcRejectObjective());
+    // Shared by both arc kinds:
+    win.querySelector('#so-arc-exit').addEventListener('click', () => confirmArcExit());
+    win.querySelector('#so-arc-retry').addEventListener('click', () => {
+        if (!arcRetryPending) return;
+        if (arcRetryPending.achieve) arcMarkAchieved();        // 合并「达成」失败的重试：重走 ✓
+        else runCompileTransition(arcRetryPending);
+    });
+    // 中断在途生成（超时护栏之外的手动逃生口）：abort 当前调用 → 重试循环识别中断 → 失败分支清 busy + 留「重试」。
+    win.querySelector('#so-arc-stop').addEventListener('click', () => arcCancelInflight());
+    // 开 / 关「实时输出」浮窗：看模型流式回传的内容（含 reasoning），确认在流 vs 卡死。
+    win.querySelector('#so-arc-live').addEventListener('click', () => toggleArcLiveViewer());
+    // Manual arc creation (the "place beats by hand" entry; gated by ENABLE_ARC).
+    win.querySelector('#so-arc-new').style.display = ENABLE_ARC ? '' : 'none';
+    win.querySelector('#so-arc-new').addEventListener('click', () => {
+        const form = win.querySelector('#so-arc-form');
+        form.style.display = (form.style.display === 'none') ? 'flex' : 'none';
+    });
+    win.querySelector('#so-arc-cancel').addEventListener('click', () => {
+        win.querySelector('#so-arc-form').style.display = 'none';
+    });
+    win.querySelector('#so-arc-create').addEventListener('click', onArcCreate);
+    // Difficulty options come straight from ADVISOR_DIFFICULTIES (single source of truth).
+    const diffSel = win.querySelector('#so-arc-difficulty');
+    for (const [key, D] of Object.entries(ADVISOR_DIFFICULTIES)) {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = `${D.label} —— ${D.caption}`;
+        if (key === 'normal') opt.selected = true;
+        diffSel.appendChild(opt);
+    }
+    // Mode toggle: reveal the blind-only consent fields + relabel the create button.
+    win.querySelector('#so-arc-mode').addEventListener('change', (e) => {
+        const blind = e.target.value === 'blind';
+        win.querySelector('#so-arc-blind-fields').style.display = blind ? 'block' : 'none';
+        win.querySelector('#so-arc-create').textContent = blind ? '创建盲盒弧' : '创建透明弧';
+        // 路标说明随模式变：盲盒可留空（神谕自动起草整条骨架）；透明你看得到每一拍，必须自己填。
+        const wpLabel = win.querySelector('#so-arc-waypoints-label');
+        if (wpLabel) wpLabel.textContent = blind
+            ? '路标（每行一个，意图级——盲盒可留空＝由神谕按篇幅暗中拟定整条骨架）'
+            : '路标（每行一个，意图级——透明弧你看得到每一拍，需自己填写）';
+    });
     win.querySelector('#so-lb-refresh').addEventListener('click', () => populateLorebookBooks(true));
     win.querySelector('#so-lb-book').addEventListener('change', (e) => {
         const s2 = getSettings();
@@ -1779,6 +3773,29 @@ function bindControls() {
         const open = panel.classList.toggle('open');
         win.classList.toggle('so-settings-open', open);   // lets CSS free up space (hide mode toolbar)
         if (open) { refreshProfiles(); populateSysPromptPresets(); }
+    });
+    // 用户功能请求：剧情概要编辑器（本聊天，自动保存到元数据）。
+    win.querySelector('#so-summary-btn').addEventListener('click', openSummary);
+    win.querySelector('#so-summary-close').addEventListener('click', () => win.querySelector('#so-summary').classList.remove('open'));
+    win.querySelector('#so-summary-text').addEventListener('input', (e) => {
+        setSummary(e.target.value);
+        updateSummaryIndicator(e.target.value);
+    });
+    win.querySelector('#so-summary-clear').addEventListener('click', () => {
+        const ta = win.querySelector('#so-summary-text');
+        if (ta.value.trim() && !confirm('确定清空本聊天的剧情概要吗？')) return;
+        ta.value = '';
+        setSummary('');
+        updateSummaryIndicator('');
+        ta.focus();
+    });
+    // 用户功能请求：自动诊断首次开启前的一次性警告弹窗。
+    const closeAutoWarn = () => win.querySelector('#so-autowarn').classList.remove('open');
+    win.querySelector('#so-autowarn-cancel').addEventListener('click', closeAutoWarn);
+    win.querySelector('#so-autowarn-ok').addEventListener('click', () => {
+        if (win.querySelector('#so-autowarn-never').checked) { getSettings().autoDiagnoseWarned = true; save(); }
+        closeAutoWarn();
+        applyDiagButtonState('auto');
     });
     win.querySelector('#so-profile-refresh').addEventListener('click', refreshProfiles);
 
@@ -1862,6 +3879,9 @@ function bindControls() {
             onSend();
         }
     });
+
+    // 用户功能请求：反映持久化的自动诊断状态（重载后若 AUTO 仍开着，按钮显示红色 + AUTO）。
+    updateDiagButtonVisual();
 }
 
 function loadSettingsIntoForm() {
@@ -2670,15 +4690,75 @@ function setOracleMode(target) {
     inputEl.placeholder = MODE_PLACEHOLDERS[target] || MODE_PLACEHOLDERS.chat;
 }
 
+// 用户功能请求：诊断按钮三态循环 —— 关 → 诊断 → 诊断·自动(AUTO) → 关。两个纯函数便于单测：
+//   diagButtonState 由当前 (diagnoseMode, autoDiagnoseEnabled) 推出按钮态；nextDiagState 给下一态。
+function diagButtonState(diagOn, autoOn) {
+    return autoOn ? 'auto' : (diagOn ? 'diagnose' : 'off');
+}
+function nextDiagState(state) {
+    return state === 'off' ? 'diagnose' : (state === 'diagnose' ? 'auto' : 'off');
+}
+
+// 诊断按钮点击：算出下一态；进入 auto 且还没看过警告时，先弹一次性警告（确认后才真正开启）。
 function toggleDiagnose() {
-    const entering = !diagnoseMode;
-    setOracleMode(entering ? 'diagnose' : 'chat');
-    if (entering) {
-        addSystemNote('诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。');
-    } else {
-        addSystemNote('已返回普通聊天模式。');
+    const s = getSettings();
+    // 杀死开关关闭：退回原始两态（关 ↔ 诊断），AUTO 不可达；顺手清掉历史残留的开启态。
+    if (!ENABLE_AUTO_DIAGNOSE) {
+        const entering = !diagnoseMode;
+        if (s.autoDiagnoseEnabled) { s.autoDiagnoseEnabled = false; save(); }
+        setOracleMode(entering ? 'diagnose' : 'chat');
+        addSystemNote(entering
+            ? '诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。'
+            : '已返回普通聊天模式。');
+        updateDiagButtonVisual();
+        if (inputEl) inputEl.focus();
+        return;
     }
-    inputEl.focus();
+    const next = nextDiagState(diagButtonState(diagnoseMode, !!s.autoDiagnoseEnabled));
+    if (next === 'auto' && !s.autoDiagnoseWarned) { openAutoDiagWarn(); return; }
+    applyDiagButtonState(next);
+}
+
+// 把按钮态落到：窗口模式 + 持久化的 autoDiagnoseEnabled + 视觉 + 一条说明。
+function applyDiagButtonState(state) {
+    const s = getSettings();
+    if (state === 'off') {
+        s.autoDiagnoseEnabled = false; save();
+        setOracleMode('chat');
+        addSystemNote('已关闭诊断 / 自动诊断，返回普通聊天模式。');
+    } else if (state === 'diagnose') {
+        s.autoDiagnoseEnabled = false; save();
+        setOracleMode('diagnose');
+        addSystemNote('诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。再点一次诊断按钮即可开启【自动模式】。');
+    } else { // auto
+        s.autoDiagnoseEnabled = true; save();
+        setOracleMode('diagnose');
+        addSystemNote('🔴 自动诊断模式已开启。此后每当主聊天收到新的 AI 回复，我都会在后台自动检查其中的 MVU 变量更新，发现问题就【自动应用修复】（每次都会弹出一个可撤销的提示）。窗口关着也照常工作。再点一次诊断按钮即可关闭。');
+    }
+    updateDiagButtonVisual();
+    if (inputEl) inputEl.focus();
+}
+
+// 诊断按钮视觉：自动开启时图标变红 + 显示 AUTO 标签（覆盖普通诊断的蓝色高亮）。init 与每次切换后调用。
+function updateDiagButtonVisual() {
+    if (!win) return;
+    const btn = win.querySelector('#so-diagnose-btn');
+    if (!btn) return;
+    const auto = ENABLE_AUTO_DIAGNOSE && !!getSettings().autoDiagnoseEnabled;
+    btn.classList.toggle('so-diag-auto', auto);
+    win.classList.toggle('so-diag-auto-on', auto);
+    btn.title = auto
+        ? '诊断 · 自动模式开启 —— 每条新回复都会自动检查并修复 MVU（再点一次关闭）'
+        : '诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）';
+}
+
+// 首次开启自动模式前的一次性警告弹窗（含「不再提示」+ 与 MVU「额外模型解析」不兼容的提醒）。
+function openAutoDiagWarn() {
+    if (!win) return;
+    const never = win.querySelector('#so-autowarn-never');
+    if (never) never.checked = false;
+    const modal = win.querySelector('#so-autowarn');
+    if (modal) modal.classList.add('open');
 }
 
 function toggleLorebook() {
@@ -2697,12 +4777,12 @@ function toggleAdvisor() {
     const entering = !advisorMode;
     setOracleMode(entering ? 'advisor' : 'chat');
     if (entering) {
-        addSystemNote('⚠️ 剧情参谋是实验性功能，行为可能随版本调整。\n剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
+        addSystemNote('剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
             + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : ''));
         // 桥接：从普通模式聊到一半切过来时（侧聊有内容、且还没有方案在引导），
         // 给一个一键把刚才的讨论正式化成方案的入口。出现时机是确定性的——
         // 只在这一刻、只在这个条件下，绝不靠关键词探测。
-        if (convo.length > 0 && !getPlan()) addBridgeChip();
+        if (convoForPrompt().length > 0 && !getPlan()) addBridgeChip();
     } else {
         addSystemNote('已返回普通聊天模式。');
     }
@@ -2741,33 +4821,286 @@ function addBridgeChip() {
  * ------------------------------------------------------------------ */
 function renderPlanBar() {
     if (!planBarEl) return;
-    const plan = getPlan();
-    if (win) win.classList.toggle('so-plan-on', !!plan);
-    if (!plan) {
-        const pre0 = planBarEl.querySelector('#so-plan-directive');
-        pre0.classList.remove('open');
+    const active = getActiveConstruct();
+    if (win) win.classList.toggle('so-plan-on', !!active);
+    const pre = planBarEl.querySelector('#so-plan-directive');
+    if (!active) {
+        pre.classList.remove('open');
         planBarEl.querySelector('#so-plan-show').textContent = '▸ 查看注入内容';
         placePlanBar();
         return;
     }
-    planBarEl.querySelector('#so-plan-goal').textContent = plan.title ? `${plan.title}：${plan.goal}` : plan.goal;
-    // Intensity segmented control — rebuilt each render; label IS the compressed
-    // directive, the caption underneath is its one-line expansion.
+    const isArc = active.type === 'arc';
+    const isBlind = isArc && active.arc.mode === 'blind';
+    const isTransparent = isArc && !isBlind;
+    // Toggle button families by construct type: single-shot (完成/放弃) ·
+    // transparent arc (完成/换个思路) · blind arc (✓达成/✗失败/🚫换个目标).
+    // 退出 and ↻重试 are shared by both arc kinds.
+    planBarSetDisplay('#so-plan-progress', isArc);
+    planBarSetDisplay('#so-plan-done', !isArc);
+    planBarSetDisplay('#so-plan-drop', !isArc);
+    planBarSetDisplay('#so-arc-complete', isTransparent);
+    planBarSetDisplay('#so-arc-reroll', isTransparent);
+    planBarSetDisplay('#so-arc-achieved', isBlind);
+    planBarSetDisplay('#so-arc-failed', isBlind);
+    planBarSetDisplay('#so-arc-reject', isBlind);
+    planBarSetDisplay('#so-arc-exit', isArc);
+    planBarSetDisplay('#so-arc-retry', isArc && !!arcRetryPending);   // shown only after a compile failure
+    if (isArc) renderArcBarBody(active.arc);
+    else renderSinglePlanBody(active.plan);
+    if (pre.classList.contains('open')) pre.textContent = currentInjectionPreview();
+    placePlanBar();
+}
+
+// Toggle an element inside the strip (queried via planBarEl — it may be reparented
+// into the float). A missing element is a no-op.
+function planBarSetDisplay(sel, on) {
+    const el = planBarEl.querySelector(sel);
+    if (el) el.style.display = on ? '' : 'none';
+}
+
+// Rebuild the intensity segmented control, wiring each button to onPick(key).
+// label IS the compressed directive; the caption underneath is its one-line expansion.
+function renderIntensitySegments(current, onPick) {
     const seg = planBarEl.querySelector('#so-plan-intensity');
     seg.innerHTML = '';
     for (const [key, I] of Object.entries(ADVISOR_INTENSITIES)) {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'so-plan-int' + (plan.intensity === key ? ' active' : '');
+        b.className = 'so-plan-int' + (current === key ? ' active' : '');
         b.textContent = I.label;
-        b.addEventListener('click', () => setPlanIntensity(key));
+        b.addEventListener('click', () => onPick(key));
         seg.appendChild(b);
     }
+}
+
+// Single-shot plan body. Also resets the shared arc-only widgets (difficulty badge,
+// intensity segments, directive spoiler) in case a blind arc previously left them toggled.
+function renderSinglePlanBody(plan) {
+    planBarEl.querySelector('#so-plan-label').textContent = '引导中';
+    planBarEl.querySelector('#so-arc-diff-badge').style.display = 'none';
+    planBarEl.querySelector('#so-plan-intensity').style.display = '';
+    planBarEl.querySelector('#so-arc-shaping').style.display = 'none';   // arc-only (layer 6)
+    const pre = planBarEl.querySelector('#so-plan-directive');
+    pre.classList.remove('so-spoiler', 'peek');
+    pre.title = '';
+    planBarEl.querySelector('#so-plan-goal').textContent = plan.title ? `${plan.title}：${plan.goal}` : plan.goal;
+    renderIntensitySegments(plan.intensity, setPlanIntensity);
     const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
     planBarEl.querySelector('#so-plan-caption').textContent = I.caption;
+}
+
+// Arc body. Transparent: waypoint intent + beat goal + per-beat intensity segments.
+// Blind: player-facing OBJECTIVE (never the goal) + difficulty badge/caption, no
+// intensity (blind uses arc-level difficulty), and the waypoint intent is withheld from
+// the progress line — only 路标 n/m + 贯穿线 show, so the bar can't telegraph the current
+// beat's subject. The directive viewer (which holds the goal) is blurred — soft secrecy.
+function renderArcBarBody(arc) {
+    const beat = arc.currentBeat;
+    const blind = arc.mode === 'blind';
+    const total = arc.waypoints.length;
+    const idx = Math.min(arc.cursor + 1, total);
+    const wp = arcActiveWaypoint(arc);
+    const badge = planBarEl.querySelector('#so-arc-diff-badge');
+    const seg = planBarEl.querySelector('#so-plan-intensity');
     const pre = planBarEl.querySelector('#so-plan-directive');
-    if (pre.classList.contains('open')) pre.textContent = buildDirective(plan);
-    placePlanBar();
+    planBarEl.querySelector('#so-plan-label').textContent = blind ? '盲盒引导' : '弧线引导';
+    planBarEl.querySelector('#so-plan-progress').textContent =
+        `路标 ${idx}/${total}` + (!blind && wp ? `　·　${wp.intent}` : '')
+        + (arc.throughline ? `　·　贯穿线：${arc.throughline}` : '');
+
+    if (blind) {
+        // Show the task, not the scheme. stage B → objectiveB (a more direct follow-up).
+        const task = beat ? arcVisibleObjective(beat) : '';
+        const stageB = !!(beat && beat.stage === 'B');
+        planBarEl.querySelector('#so-plan-goal').textContent =
+            beat ? (task || '（任务待明确——可点「🚫 换个目标」重编）') : '';
+        seg.style.display = 'none';
+        const diffKey = (arc.consent && arc.consent.difficulty) || 'normal';
+        const D = ADVISOR_DIFFICULTIES[diffKey] || ADVISOR_DIFFICULTIES.normal;
+        badge.textContent = D.label;
+        badge.title = D.caption;
+        badge.dataset.difficulty = diffKey;
+        badge.style.display = '';
+        planBarEl.querySelector('#so-plan-caption').textContent =
+            (stageB ? '盲盒 · 延伸任务（上一步还差一口气） · ' : '盲盒 · ') + D.caption;
+        pre.classList.add('so-spoiler');
+        pre.classList.remove('peek');            // re-mask on every state change (new secret)
+        pre.title = '点击查看隐藏指令（含剧透）';
+    } else {
+        planBarEl.querySelector('#so-plan-goal').textContent = beat ? beat.goal : '';
+        badge.style.display = 'none';
+        seg.style.display = '';
+        renderIntensitySegments(beat ? beat.intensity : 'normal', arcSetActiveIntensity);
+        const I = ADVISOR_INTENSITIES[(beat && beat.intensity)] || ADVISOR_INTENSITIES.normal;
+        planBarEl.querySelector('#so-plan-caption').textContent = I.caption;
+        pre.classList.remove('so-spoiler', 'peek');
+        pre.title = '';
+    }
+    renderArcShaping(arc);   // 弧线节奏控件（两种弧线都显示，layer 6）
+}
+
+// Rebuild the arc-shaping segmented control (自动 / 还想继续 / 开始收束). Shown for both arc
+// kinds; reflects arc.shaping (null = 自动). Picking sets the soft pacing intent for future beats.
+function renderArcShaping(arc) {
+    const row = planBarEl.querySelector('#so-arc-shaping');
+    const seg = planBarEl.querySelector('#so-arc-shaping-seg');
+    if (!row || !seg) return;
+    row.style.display = '';
+    seg.innerHTML = '';
+    const cur = arc.shaping || '';
+    const opts = [['', '自动塑形'], ...Object.entries(ADVISOR_SHAPING).map(([k, v]) => [k, v.label])];
+    for (const [key, label] of opts) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'so-plan-int' + (cur === key ? ' active' : '');
+        b.textContent = label;
+        b.addEventListener('click', () => arcSetActiveShaping(key || null));
+        seg.appendChild(b);
+    }
+}
+
+// The injected text for the active construct, substituted for display.
+function currentInjectionPreview() {
+    const active = getActiveConstruct();
+    if (!active) return '';
+    if (active.type === 'arc') return arcInjectionPreview(active.arc);
+    return buildDirective(active.plan);
+}
+function arcInjectionPreview(arc) {
+    const raw = (arc.currentBeat && arc.currentBeat.injectedText) || '';
+    try { return getCtx().substituteParams(raw); } catch (e) { return raw; }
+}
+
+// One-line label for the active construct (collapsed-float tooltip).
+function activeConstructLabel() {
+    const active = getActiveConstruct();
+    if (!active) return '';
+    if (active.type === 'arc') {
+        const b = active.arc.currentBeat;
+        // 盲盒：tooltip 绝不露幕后 goal / throughline —— 只给【玩家可见】objective（与方案条防剧透遮罩一致，§9）。
+        if (active.arc.mode === 'blind') return b ? (arcVisibleObjective(b) || '引导进行中') : '引导进行中';
+        return b ? b.goal : (active.arc.throughline || '');
+    }
+    const p = active.plan;
+    return p.title ? `${p.title}：${p.goal}` : p.goal;
+}
+
+// 退出整条弧线需一次确认（与游玩按钮空间分离的硬操作）。
+function confirmArcExit() {
+    if (confirm('确定退出？当前弧线和引导将被完全清除，主聊天恢复原状。')) arcExit();
+}
+
+// 读手动弧线表单 → 采用一条弧线（透明 或 盲盒；layer-2 / 4b「手动放置拍子」入口）。
+// 第一拍仍由真编译器升级（见 adoptArc）。盲盒额外读 consent：难度 / 红线 / 风格 / 方向。
+// 关表单 + 清字段 + 复位到「透明」默认（手填与盲盒自动起草两条路径都用）。
+function resetArcForm() {
+    win.querySelector('#so-arc-form').style.display = 'none';
+    win.querySelector('#so-arc-throughline').value = '';
+    win.querySelector('#so-arc-waypoints').value = '';
+    win.querySelector('#so-arc-redlines').value = '';
+    win.querySelector('#so-arc-style').value = '';
+    win.querySelector('#so-arc-direction').value = '';
+    win.querySelector('#so-arc-mode').value = 'transparent';
+    win.querySelector('#so-arc-blind-fields').style.display = 'none';
+    win.querySelector('#so-arc-create').textContent = '创建透明弧';
+    const wpL = win.querySelector('#so-arc-waypoints-label');
+    if (wpL) wpL.textContent = '路标（每行一个，意图级——透明弧你看得到每一拍，需自己填写）';
+}
+
+function onArcCreate() {
+    const throughline = win.querySelector('#so-arc-throughline').value.trim();
+    const waypoints = win.querySelector('#so-arc-waypoints').value
+        .split('\n').map((x) => x.trim()).filter(Boolean);
+    const spanFeel = win.querySelector('#so-arc-span').value;
+    const mode = win.querySelector('#so-arc-mode').value === 'blind' ? 'blind' : 'transparent';
+    const spec = { mode, throughline, spanFeel, waypoints };
+    if (mode === 'blind') {
+        const redlines = win.querySelector('#so-arc-redlines').value
+            .split('\n').map((x) => x.trim()).filter(Boolean);
+        const difficulty = win.querySelector('#so-arc-difficulty').value;
+        spec.consent = {
+            style: win.querySelector('#so-arc-style').value.trim(),
+            redlines,
+            difficulty: ADVISOR_DIFFICULTIES[difficulty] ? difficulty : 'normal',
+            direction: win.querySelector('#so-arc-direction').value.trim(),
+        };
+        // 凛冽 = 不可逆赌注，红线是它唯一的安全护栏（设计 §0.5 / §5）。空着仍放行，但提醒一次。
+        if (spec.consent.difficulty === 'stark' && !redlines.length) {
+            addSystemNote('提示：凛冽难度会推动不可逆的重大抉择，建议至少填一条红线（编译器绝不触碰的底线）。这次不填也行——「退出」始终一键可达。');
+        }
+    }
+    // 透明弧的路标用户看得到、需自己定，仍须手填；盲盒弧留空 = 由神谕按篇幅暗中拟定整条骨架。
+    if (!waypoints.length && mode !== 'blind') {
+        addSystemNote('请至少填写一个路标（每行一个）。透明弧的路标你看得到，需要你来定。');
+        return;
+    }
+    resetArcForm();
+    if (waypoints.length) adoptArc(spec);
+    else adoptArcWithDraftedWaypoints(spec);   // 盲盒留空：异步起草整条骨架后采用
+}
+
+/* ---- 「📡 实时输出」查看器：独立浮窗，实时显示模型流式回传（含 reasoning），可拖动 / 关闭 ---- */
+let arcLiveEl = null;
+let arcLiveDirty = false;
+function ensureArcLiveViewer() {
+    if (arcLiveEl) return arcLiveEl;
+    arcLiveEl = document.createElement('div');
+    arcLiveEl.id = 'so-live';
+    arcLiveEl.style.display = 'none';
+    arcLiveEl.innerHTML = `
+        <div id="so-live-head">
+            <i class="fa-solid fa-satellite-dish"></i>
+            <span id="so-live-title">实时输出</span>
+            <span class="so-live-status" id="so-live-status"></span>
+            <span class="so-plan-spacer"></span>
+            <div class="so-iconbtn" id="so-live-copy" title="复制全部"><i class="fa-solid fa-copy"></i></div>
+            <div class="so-iconbtn" id="so-live-close" title="关闭"><i class="fa-solid fa-xmark"></i></div>
+        </div>
+        <pre id="so-live-body"></pre>`;
+    document.body.appendChild(arcLiveEl);
+    arcLiveEl.querySelector('#so-live-close').addEventListener('click', () => { arcLiveEl.style.display = 'none'; });
+    arcLiveEl.querySelector('#so-live-copy').addEventListener('click', () => {
+        copyTextRobust((arcLiveReasoning ? '〔思考过程〕\n' + arcLiveReasoning + '\n\n' : '') + (arcLiveText || ''));
+    });
+    makeDraggable(arcLiveEl, arcLiveEl.querySelector('#so-live-head'), { left: 'liveLeft', top: 'liveTop' });
+    return arcLiveEl;
+}
+function toggleArcLiveViewer() {
+    ensureArcLiveViewer();
+    const show = arcLiveEl.style.display === 'none';
+    arcLiveEl.style.display = show ? 'flex' : 'none';
+    if (show) renderArcLiveNow();
+}
+// 节流渲染：查看器关着时是空操作（零开销）；开着时每帧最多渲一次。
+function renderArcLive() {
+    if (!arcLiveEl || arcLiveEl.style.display === 'none' || arcLiveDirty) return;
+    arcLiveDirty = true;
+    const run = () => { arcLiveDirty = false; renderArcLiveNow(); };
+    try { requestAnimationFrame(run); } catch (e) { arcLiveDirty = false; renderArcLiveNow(); }
+}
+function renderArcLiveNow() {
+    if (!arcLiveEl) return;
+    const secs = Math.max(0, Math.round((Date.now() - arcLiveStartedAt) / 1000));
+    const n = arcLiveText.length + arcLiveReasoning.length;
+    arcLiveEl.querySelector('#so-live-status').textContent = arcLiveActive
+        ? `⏳ 接收中…（已 ${secs}s · ${n} 字）`
+        : (n ? '✓ 本次已结束' : '— 空闲');
+    const parts = [];
+    if (arcLiveReasoning) parts.push('〔思考过程 reasoning〕\n' + arcLiveReasoning);
+    if (arcLiveText) parts.push('〔正式输出〕\n' + arcLiveText);
+    let txt = parts.join('\n\n');
+    if (!txt) {
+        txt = !arcLiveStreamed
+            ? '（本次没走流式——到「设置」里打开「流式」开关后，这里才能看到实时输出；当前只能等最终结果。）'
+            : (arcLiveActive
+                ? '（已发出请求，但还没有任何内容回来。\n若上方读秒一直在涨、这里却长时间空着，多半是连接卡住了——可点方案条上的「取消」。）'
+                : '（本次没有输出。）');
+    }
+    const body = arcLiveEl.querySelector('#so-live-body');
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+    body.textContent = txt;
+    if (atBottom) body.scrollTop = body.scrollHeight;   // 用户在底部时才自动滚（不打断往上翻看）
 }
 
 // Lazy-build the floating home for the strip.
@@ -2805,20 +5138,23 @@ function ensurePlanFloat() {
     applyPlanFloatCollapsed(); // restore persisted collapsed state
 }
 
-// Collapsed = head-only pill 「🧭 引导中」: tiny footprint (mobile!), still an
-// unmissable signal that steering is active. Strip stays parented in the hidden
-// slot, so expanding is pure CSS — no re-render, no listener churn.
+// Collapsed = a single 🧭 compass button, no words: tiniest footprint (mobile —
+// nothing blocks the screen) while still an unmissable signal that steering is
+// active. The collapse toggle itself carries the compass icon when folded; the
+// decorative compass + title + open(moon) are hidden via CSS. Strip stays parented
+// in the hidden slot, so expanding is pure CSS — no re-render, no listener churn.
 function applyPlanFloatCollapsed() {
     if (!planFloat) return;
     const collapsed = !!getSettings().planFloatCollapsed;
     planFloat.classList.toggle('so-collapsed', collapsed);
-    const icon = planFloat.querySelector('#so-plan-float-collapse i');
-    icon.className = collapsed ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-up';
+    const btn = planFloat.querySelector('#so-plan-float-collapse');
+    btn.querySelector('i').className = collapsed ? 'fa-solid fa-compass' : 'fa-solid fa-chevron-up';
     planFloat.querySelector('.so-plan-float-title').textContent = collapsed ? '引导中' : '剧情引导';
-    // Collapsed pill: hovering (desktop) shows the goal it stands for.
-    const plan = getPlan();
-    planFloat.querySelector('#so-plan-float-head').title =
-        collapsed && plan ? (plan.title ? `${plan.title}：${plan.goal}` : plan.goal) : '';
+    // 防剧透：① 绝不在可 hover 的 head 上挂任何内容（此前折叠态把当前拍 goal 直接 hover 出来 = 破坏盲盒保密）；
+    // ② 只在 compass 按钮上给【玩家可见】标签（activeConstructLabel 盲盒只回 objective、绝不回 goal）。
+    const label = activeConstructLabel();
+    btn.title = collapsed ? (label ? `展开 · ${label}` : '展开剧情引导') : '收起成指南针（不挡屏）';
+    planFloat.querySelector('#so-plan-float-head').title = '';
 }
 
 // Decide where the strip lives right now. Rules: no plan -> hidden (and parked
@@ -2826,9 +5162,9 @@ function applyPlanFloatCollapsed() {
 // hides); plan + window closed -> inside the float, always on screen.
 function placePlanBar() {
     if (!planBarEl || !win) return;
-    const plan = getPlan();
+    const active = getActiveConstruct();
     const winVisible = win.style.display !== 'none';
-    if (plan && !winVisible) {
+    if (active && !winVisible) {
         ensurePlanFloat();
         if (planBarEl.parentElement !== planFloatSlot) planFloatSlot.appendChild(planBarEl);
         planFloat.style.display = 'flex';
@@ -2884,58 +5220,92 @@ function updateLbHint() {
     const s = getSettings();
     hint.textContent = s.lorebookTarget
         ? `将聊 / 编辑：「${s.lorebookTarget}」这一本。`
-        : '将聊 / 编辑：当前角色卡 / 聊天 / 全局所激活的全部世界书。整本注入，token 消耗可能较大。';
+        : '将聊 / 编辑：当前角色卡 / 聊天 / 全局所激活的全部世界书。可在下方按条目精选（含仅蓝灯 / 仅绿灯等快捷选择）以控制 token 消耗。';
 }
 
-/* ---- per-entry picker (only shown when a single book is targeted) ---- */
-function allLbEntryUids() {
-    const list = win.querySelector('#so-lb-entries-list');
-    return list ? [...list.querySelectorAll('input[type="checkbox"]')].map((b) => Number(b.dataset.uid)) : [];
+/* ---- per-entry picker (single targeted book, OR every active book grouped) ----
+ * Selection is keyed by book name in lbEntryFilter, so the same machinery serves
+ * both: each rendered row carries data-book, and the buttons/summary fan out over
+ * whatever books are currently shown (one book, or all active ones). */
+
+// All entry uids of one book, from its rendered rows (regardless of checked state).
+function allLbEntryUidsForBook(book) {
+    const uids = [];
+    for (const row of win.querySelectorAll('#so-lb-entries-list .so-lb-ent')) {
+        if ((row.dataset.book || '') !== (book || '')) continue;
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box) uids.push(Number(box.dataset.uid));
+    }
+    return uids;
 }
 
-// "all" is represented as null (no filter). Normalize a full set back to null so
-// buildLorebookContext takes its untouched "整本" path.
-function refreshLbEntriesSummary(name, total) {
-    let sel = lbEntryFilter[name];
-    if (sel instanceof Set && total > 0 && sel.size >= total) { sel = null; lbEntryFilter[name] = null; }
+// Every book currently rendered in the picker -> its entry-row count.
+function lbShownBookTotals() {
+    const totals = new Map();
+    for (const row of win.querySelectorAll('#so-lb-entries-list .so-lb-ent')) {
+        const b = row.dataset.book || '';
+        totals.set(b, (totals.get(b) || 0) + 1);
+    }
+    return totals;
+}
+
+// Recompute the summary across EVERY book shown. A book whose Set covers all its
+// shown entries collapses back to null ("all" — buildLorebookContext's untouched
+// 整本 path), so re-checking everything reverts to "send the whole book".
+function refreshLbEntriesSummary() {
+    const totals = lbShownBookTotals();
+    let total = 0;
+    let selected = 0;
+    let anyFiltered = false;
+    for (const [book, t] of totals) {
+        const sel = lbEntryFilter[book];
+        if (sel instanceof Set && t > 0 && sel.size >= t) lbEntryFilter[book] = null;
+        const now = lbEntryFilter[book];
+        total += t;
+        if (now instanceof Set) { selected += now.size; anyFiltered = true; }
+        else selected += t;
+    }
     const summary = win.querySelector('#so-lb-entries-summary');
     if (!summary) return;
-    summary.textContent = (sel instanceof Set) ? `条目：已选 ${sel.size} / ${total}` : `条目：全部（${total}）`;
+    summary.textContent = anyFiltered ? `条目：已选 ${selected} / ${total}` : `条目：全部（${total}）`;
 }
 
-function toggleLbEntry(name, uid, checked, total) {
-    let sel = lbEntryFilter[name];
-    if (!(sel instanceof Set)) sel = new Set(allLbEntryUids()); // was "all" -> materialize
+function toggleLbEntry(book, uid, checked) {
+    let sel = lbEntryFilter[book];
+    if (!(sel instanceof Set)) sel = new Set(allLbEntryUidsForBook(book)); // was "all" -> materialize
     if (checked) sel.add(uid); else sel.delete(uid);
-    lbEntryFilter[name] = sel;
-    refreshLbEntriesSummary(name, total);
+    lbEntryFilter[book] = sel;
+    refreshLbEntriesSummary();
 }
 
+// 全选 / 全不选 across every book shown (each book is its own filter entry).
 function setAllLbEntries(on) {
-    const name = getSettings().lorebookTarget;
-    if (!name) return;
-    const boxes = [...win.querySelectorAll('#so-lb-entries-list input[type="checkbox"]')];
-    boxes.forEach((b) => { b.checked = on; });
-    lbEntryFilter[name] = on ? null : new Set();   // all  |  none
-    refreshLbEntriesSummary(name, boxes.length);
+    const books = new Set();
+    for (const row of win.querySelectorAll('#so-lb-entries-list .so-lb-ent')) {
+        const box = row.querySelector('input[type="checkbox"]');
+        if (box) box.checked = on;
+        books.add(row.dataset.book || '');
+    }
+    for (const b of books) lbEntryFilter[b] = on ? null : new Set();   // all | none, per book
+    refreshLbEntriesSummary();
 }
 
 // Select exactly the entries of one lamp type: 'blue' (常驻), 'green' (关键词触发),
-// or 'off' (已禁用). None of these include disabled entries except 'off' itself.
+// or 'off' (已禁用), across every book shown. None include disabled except 'off'.
 function setLbEntriesByType(type) {
-    const name = getSettings().lorebookTarget;
-    if (!name) return;
     const rows = [...win.querySelectorAll('#so-lb-entries-list .so-lb-ent')];
     if (!rows.length) return;
-    const sel = new Set();
+    const perBook = new Map();   // book -> Set of matching uids
     for (const row of rows) {
+        const book = row.dataset.book || '';
+        if (!perBook.has(book)) perBook.set(book, new Set());
         const box = row.querySelector('input[type="checkbox"]');
         const match = row.dataset.type === type;
-        box.checked = match;
-        if (match) sel.add(Number(box.dataset.uid));
+        if (box) box.checked = match;
+        if (match) perBook.get(book).add(Number(box.dataset.uid));
     }
-    lbEntryFilter[name] = sel;   // empty Set if none of that type -> sends none
-    refreshLbEntriesSummary(name, rows.length);
+    for (const [book, sel] of perBook) lbEntryFilter[book] = sel;   // empty Set -> sends none of that book
+    refreshLbEntriesSummary();
 }
 
 function filterLbEntries(q) {
@@ -2945,61 +5315,107 @@ function filterLbEntries(q) {
     for (const row of list.querySelectorAll('.so-lb-ent')) {
         row.style.display = (!needle || (row.dataset.hay || '').includes(needle)) ? '' : 'none';
     }
+    // Hide a book header (+ its "empty" sub-line) when none of its rows are visible.
+    for (const head of list.querySelectorAll('.so-lb-book-head, .so-lb-ent-empty-sub')) {
+        if (!needle) { head.style.display = ''; continue; }
+        const book = head.dataset.book || '';
+        const headMatches = (head.dataset.hay || '').includes(needle);
+        const anyRowVisible = [...list.querySelectorAll('.so-lb-ent')]
+            .some((r) => (r.dataset.book || '') === book && r.style.display !== 'none');
+        head.style.display = (headMatches || anyRowVisible) ? '' : 'none';
+    }
 }
 
-// Build / refresh the checklist for the currently targeted single book. Hidden
-// entirely when target is "all active books" (selection is per single book).
+// Build / refresh the entry checklist. A specific target -> just that book's
+// entries. "All active books" ('') -> every active book's entries, grouped under
+// per-book headers (the same book set buildLorebookContext feeds in all-active
+// mode); the shortcut buttons + filter then span all of them. Hidden entirely when
+// there's nothing to show (no target picked AND no active book).
 async function populateLorebookEntries() {
     const box = win.querySelector('#so-lb-entries');
     const list = win.querySelector('#so-lb-entries-list');
     if (!box || !list) return;
-    const name = getSettings().lorebookTarget;
-    if (!name) { box.classList.remove('shown'); return; }
+    const target = getSettings().lorebookTarget;
+
+    let books;
+    if (target) {
+        books = [target];
+    } else {
+        try { books = await getActiveBookNames(); } catch (e) { books = []; }
+    }
+    if (!books.length) { box.classList.remove('shown'); return; }
     box.classList.add('shown');
+    const grouped = !target;   // per-book headers only when showing every active book
 
     list.innerHTML = '<div class="so-lb-ent-empty">读取条目中…</div>';
-    let entries = [];
-    try {
-        const mod = await getWiEditApi();
-        const data = mod ? await mod.loadWorldInfo(name) : null;
-        if (data && data.entries) {
-            entries = Object.values(data.entries)
-                .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+    const mod = await getWiEditApi();
+    const loaded = [];   // [{ name, entries }]
+    for (const name of books) {
+        let entries = [];
+        try {
+            const data = mod ? await mod.loadWorldInfo(name) : null;
+            if (data && data.entries) {
+                entries = Object.values(data.entries)
+                    .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+            }
+        } catch (e) { /* leave empty */ }
+        // Drop stale uids from a prior selection (entries may have changed since).
+        if (lbEntryFilter[name] instanceof Set) {
+            const valid = new Set(entries.map((e) => e.uid));
+            lbEntryFilter[name] = new Set([...lbEntryFilter[name]].filter((u) => valid.has(u)));
         }
-    } catch (e) { /* leave empty */ }
-
-    // Drop stale uids from a prior selection (entries may have changed since).
-    if (lbEntryFilter[name] instanceof Set) {
-        const valid = new Set(entries.map((e) => e.uid));
-        const kept = new Set([...lbEntryFilter[name]].filter((u) => valid.has(u)));
-        lbEntryFilter[name] = kept;
+        loaded.push({ name, entries });
     }
 
+    const totalEntries = loaded.reduce((n, b) => n + b.entries.length, 0);
     list.innerHTML = '';
-    if (!entries.length) {
-        list.innerHTML = '<div class="so-lb-ent-empty">（此世界书暂无条目。）</div>';
-        refreshLbEntriesSummary(name, 0);
+    if (!totalEntries) {
+        list.innerHTML = `<div class="so-lb-ent-empty">（${grouped ? '当前激活的世界书暂无条目' : '此世界书暂无条目'}。）</div>`;
+        refreshLbEntriesSummary();
         return;
     }
-    const sel = lbEntryFilter[name];   // Set | null (= all)
-    for (const e of entries) {
-        const checked = !(sel instanceof Set) || sel.has(e.uid);
-        const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
-        const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
-        const row = document.createElement('label');
-        row.className = 'so-lb-ent';
-        row.dataset.hay = `${e.uid} ${title} ${keys}`.toLowerCase();
-        row.dataset.type = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
-        row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
-            `<span class="so-lb-ent-type so-lb-type-${e.disable ? 'off' : (e.constant ? 'blue' : 'green')}"></span>` +
-            `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
-        row.querySelector('.so-lb-ent-title').textContent = title;
-        row.querySelector('input').addEventListener('change', (ev) => toggleLbEntry(name, e.uid, ev.target.checked, entries.length));
-        list.appendChild(row);
+
+    for (const { name, entries } of loaded) {
+        if (grouped) {
+            const head = document.createElement('div');
+            head.className = 'so-lb-book-head';
+            head.dataset.book = name;
+            head.dataset.hay = name.toLowerCase();
+            head.innerHTML = '<i class="fa-solid fa-book"></i><span class="so-lb-book-name"></span>' +
+                `<span class="so-lb-book-count">${entries.length}</span>`;
+            head.querySelector('.so-lb-book-name').textContent = name;
+            list.appendChild(head);
+            if (!entries.length) {
+                const empty = document.createElement('div');
+                empty.className = 'so-lb-ent-empty so-lb-ent-empty-sub';
+                empty.dataset.book = name;
+                empty.dataset.hay = name.toLowerCase();
+                empty.textContent = '（此书暂无条目）';
+                list.appendChild(empty);
+                continue;
+            }
+        }
+        const sel = lbEntryFilter[name];   // Set | null (= all)
+        for (const e of entries) {
+            const checked = !(sel instanceof Set) || sel.has(e.uid);
+            const title = (e.comment && e.comment.trim()) ? e.comment.trim() : '（无标题）';
+            const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(', ') : '';
+            const row = document.createElement('label');
+            row.className = 'so-lb-ent';
+            row.dataset.book = name;
+            row.dataset.hay = `${grouped ? name + ' ' : ''}${e.uid} ${title} ${keys}`.toLowerCase();
+            row.dataset.type = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
+            row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
+                `<span class="so-lb-ent-type so-lb-type-${e.disable ? 'off' : (e.constant ? 'blue' : 'green')}"></span>` +
+                `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
+            row.querySelector('.so-lb-ent-title').textContent = title;
+            row.querySelector('input').addEventListener('change', (ev) => toggleLbEntry(name, e.uid, ev.target.checked));
+            list.appendChild(row);
+        }
     }
     const f = win.querySelector('#so-lb-entries-filter');
     if (f && f.value) filterLbEntries(f.value);
-    refreshLbEntriesSummary(name, entries.length);
+    refreshLbEntriesSummary();
 }
 
 function formatPrompt(msgs) {
@@ -3052,6 +5468,10 @@ function buildSystemPrompt() {
 
     parts.push(buildChatStatSection());
 
+    // 用户功能请求：运行概要插在最近对话记录的正前方。
+    const summarySection = buildSummarySection(getSummary());
+    if (summarySection) parts.push(summarySection);
+
     const transcript = buildTranscript(ctx, s);
     if (transcript) {
         parts.push('=== 故事对话记录（最新的在最后）===\n' + transcript);
@@ -3073,22 +5493,64 @@ function buildChatStatSection() {
     return '（注意：你看不到实时变量数值（好感度、金钱等状态数据）。用户问具体数值时，如实说明无法查看精确数值，建议用诊断或剧情参谋模式查询；可以根据剧情做定性判断（关系变暖 / 资源吃紧），但绝不要编造具体数字。）';
 }
 
+// 用户功能请求：用户粘贴的运行概要 / 前情提要（本聊天）。在【普通聊天】与【剧情参谋】模式下
+// 插入到最近对话记录的正前方——填补「有总结但存在预设 / 世界书 / 主聊天之外」、神谕本来读不到
+// 的那段故事。纯函数（文本入参），可单测：空串回空串（调用处用 if/pushMsg 跳过）；末尾的
+// substituteParams 由各调用方统一处理。
+function buildSummarySection(text) {
+    const t = String(text || '').trim();
+    if (!t) return '';
+    return '=== 剧情概要 / 前情提要（用户提供，是最近对话之前的故事梗概，供你理解来龙去脉）===\n' + t;
+}
+
 function buildDiagnosePrompt(ctx, s) {
+    // 手动诊断模式：用 generateReply 现算好的模块状态变量。
+    return buildDiagnosePromptFrom(ctx, s, {
+        wiBlock: worldInfoBlock, statStr: diagStatData, latestBlock: diagLatestUpdate,
+    });
+}
+
+// 无状态版诊断提示词构建器（用入参而非模块变量）——这样「自动诊断」后台运行能自建提示词、
+// 不与窗口共享的 worldInfoBlock/diagStatData/diagLatestUpdate 抢状态。keepMechanism 这里强制
+// 为 true：诊断是唯一需要读 <UpdateVariable> 区块的模式。
+//
+// auto=true 时进入「自动诊断」双模（见 ADDENDUM）：回复里有更新区块就核验修正；没有区块就把这条
+// 回复的正文当输入、据 MVU 规则【推导】出本回合应有的更新——即充当 MVU「额外模型解析」的替代品
+// （那也是每回合用另一个模型从回复里抽更新；二者择一，绝不并用——见首开警告）。latestReply 是这条
+// AI 回复的正文（仅在没有更新区块的推导情形用到）。手动诊断 auto 缺省为假，行为与原先完全一致。
+function buildDiagnosePromptFrom(ctx, s, { wiBlock, statStr, latestBlock, latestReply, auto }) {
     const parts = [resolveModePrompt(s, 'diagnose')];
+
+    // 自动诊断附则：基础诊断提示词假设「当前状态已反映最新更新」——这在【没有区块、需从正文推导】
+    // 的情形里是错的（没有任何机制写过这条回复）。下面这段把两种情形讲清，并推翻那个假设。
+    if (auto) {
+        parts.push(
+            '【自动诊断模式 —— 重要】这是一次后台自动诊断，时机是一条新 AI 回复刚到、其变量更新可能还没被任何机制写入。按以下两种情形之一处理：\n'
+            + '（甲）若下面「最新更新区块」里给出了 <UpdateVariable>：当前状态已反映该更新，按既定规则核验并最小化修正它（仍以当前状态为事实依据）。\n'
+            + '（乙）若没有给出更新区块、只给了「最新一条 AI 回复」正文：说明本回合的变量更新【还没有】被写入，当前状态【尚未】包含这条回复带来的变化。请你充当变量更新引擎——通读这段回复，依角色卡 MVU 规则与当前状态，推导出本回合【应当】发生的全部变量更新（好感度增减、物品获得 / 消耗、时间推进、地点 / 状态变化……），生成 <UpdateVariable> 补丁把状态更新到这条回复之后的正确值。只依据回复里确凿发生的事，绝不脑补没写的细节。\n'
+            + '两种情形都遵循下方输出规则；确实没有任何变量需要变动时，输出空的 JSONPatch（[]）。',
+        );
+    }
 
     // World info carries the card's MVU rules (blue/constant entries always fire).
     parts.push('=== 角色卡 MVU 规则（来自世界书）===\n' +
-        (worldInfoBlock || '（未找到世界书规则 —— 诊断结果可能不完整）'));
+        (wiBlock || '（未找到世界书规则 —— 诊断结果可能不完整）'));
 
     parts.push('=== 当前变量状态（stat_data）===\n' +
-        (diagStatData || '（不可用 —— 未检测到 MVU 框架）'));
+        (statStr || '（不可用 —— 未检测到 MVU 框架）'));
 
-    parts.push('=== 最新更新区块（待检查的更新）===\n' +
-        (diagLatestUpdate || '（在最新一条 AI 回复中未找到 <UpdateVariable> 区块）'));
+    if (latestBlock) {
+        parts.push('=== 最新更新区块（待检查的更新）===\n' + latestBlock);
+    } else if (auto && latestReply) {
+        // 推导情形：把整条回复正文交给模型，明确「正文里没有更新区块、请据此推导」。
+        parts.push('=== 最新一条 AI 回复（正文里【没有】变量更新区块——请据这段剧情、依 MVU 规则与当前状态，推导出本回合应当发生的全部变量更新）===\n' + latestReply);
+    } else {
+        parts.push('=== 最新更新区块（待检查的更新）===\n（在最新一条 AI 回复中未找到 <UpdateVariable> 区块）');
+    }
 
     if (s.includeCard) parts.push(buildCardSection(ctx));
 
-    const transcript = buildTranscript(ctx, s);
+    const transcript = buildTranscript(ctx, s, /*keepMechanism*/ true);
     if (transcript) parts.push('=== 故事对话记录（最新的在最后）===\n' + transcript);
 
     const full = parts.filter(Boolean).join('\n\n');
@@ -3117,7 +5579,58 @@ function buildLorebookPrompt(ctx, s) {
     return parts.filter(Boolean).join('\n\n');
 }
 
-// 参谋模式提示词：参谋指令 + 人格（若选）+ 当前引导方案（若有，供“检查进度”
+// 把【当前正在引导的弧线】渲染成参谋上下文（供”检查进度”等对话）。since = 自本拍采用以来的主聊天
+// 消息数，由调用方注入（保持纯函数、可 jsdom 单测，同弧线纯函数层把”时钟”作参数的约定）。两种模式分流：
+//   透明弧——全可见：贯穿线 + 当前拍幕后 goal/seed + 逐拍强度 + 路标进度，参谋可畅所欲言。
+//   盲盒弧——只交出玩家自己也看得到的 objective + 难度 + 已解决拍数，【绝不】交出幕后 goal/seed/贯穿线/路标
+//   意图（拿不到就漏不了），并附「盲盒守则」：回答只用任务/过程语言，不点名幕后目标或未揭晓事件（守软保密）。
+function buildAdvisorArcBlock(arc, since) {
+    if (!arc || !Array.isArray(arc.waypoints)) return '';
+    const beat = arc.currentBeat || null;
+    const sinceN = Math.max(0, Number(since) || 0);
+    if (arc.mode === 'blind') {
+        const c = arc.consent || {};
+        const diff = ADVISOR_DIFFICULTIES[c.difficulty] || ADVISOR_DIFFICULTIES.normal;
+        const task = beat ? arcVisibleObjective(beat) : '';
+        const lines = [
+            '=== 当前正在引导的剧情弧线（盲盒弧 · 正在引导主聊天）===',
+            `难度 / 赌注层级：${diff.label}（${diff.caption}）`,
+        ];
+        if (task) lines.push(`玩家当前的任务（objective，玩家自己也看得到）：${task}`);
+        lines.push(`已解决拍数：${(arc.revealed || []).length}　·　已持续：${sinceN} 条主聊天消息`);
+        lines.push(
+            '【盲盒守则 —— 回答用户时务必遵守】这是一条「盲盒」弧线：你看不到、也绝不可编造或点名幕后目标（goal）、'
+            + '起始迹象、贯穿线或任何未揭晓的转折 / 结局——上面只给了玩家自己也看得到的任务。用户问进度 / 接下来怎么走时，'
+            + '只用「任务（过程）」语言如实回答：铺垫是否已经露头、当前任务离达成还差哪一步（例如「铺垫已经露头，但关键事件还没正面发生」），'
+            + '绝不替他剧透幕后在做什么。若用户明说想直接看幕后内容，请提示他在方案条上点开「查看注入内容」的防剧透遮罩自行揭开——由他主动，而不是你说破。',
+        );
+        return lines.join('\n');
+    }
+    // 透明弧：全可见。
+    const I = ADVISOR_INTENSITIES[(beat && beat.intensity)] || ADVISOR_INTENSITIES.normal;
+    const total = arc.waypoints.length;
+    const doneCount = arc.waypoints.filter((w) => w && w.status === 'done').length;
+    const wpList = arc.waypoints.map((w, i) => {
+        const tag = w.status === 'done' ? '[已完成]'
+            : (w.status === 'active' ? '【当前】'
+                : (w.status === 'skipped' ? '[已跳过]' : '[待办]'));
+        return `${i + 1}. ${tag} ${w.intent}`;
+    }).join('\n');
+    const lines = [
+        '=== 当前正在引导的剧情弧线（透明弧 · 正在引导主聊天）===',
+        `贯穿线：${arc.throughline || '（未填）'}`,
+        `进度：第 ${Math.min(doneCount + 1, total)} / ${total} 拍（路标）　·　已持续：${sinceN} 条主聊天消息`,
+    ];
+    if (beat) {
+        lines.push(`当前这一拍的幕后目标：${beat.goal}`);
+        if (beat.seed) lines.push(`起始迹象：${beat.seed}`);
+        lines.push(`强度：${I.label}（${I.caption}）`);
+    }
+    lines.push(`路标列表：\n${wpList}`);
+    return lines.join('\n');
+}
+
+// 参谋模式提示词：参谋指令 + 人格（若选）+ 当前引导构件（单拍 异或 弧线，若有，供”检查进度”
 // 用）+ 角色卡 + 世界书 + 【整段】对话记录。无论全局上下文深度设成多少，参谋
 // 都看全史——只看最近十几条提出的方案会漏掉长线伏笔。
 function buildAdvisorPrompt(ctx, s) {
@@ -3128,15 +5641,23 @@ function buildAdvisorPrompt(ctx, s) {
     const personaBlock = buildPersonaBlock(s.personaId, 'advisor');
     if (personaBlock) parts.push(personaBlock);
 
-    const plan = getPlan();
-    if (plan) {
-        const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
-        const since = Math.max(0, chatMsgCount() - (plan.adoptedAt || 0));
-        parts.push('=== 当前已采用的引导方案（正在引导主聊天）===\n' +
-            `${plan.title ? `标题：${plan.title}\n` : ''}目标：${plan.goal}\n` +
-            (plan.seed ? `起始迹象：${plan.seed}\n` : '') +
-            `强度：${I.label}（${I.caption}）\n` +
-            `已持续：${since} 条主聊天消息`);
+    // 当前正在引导主聊天的构件：弧线 异或 单拍（§4 不变量）。参谋拿到它才能回答"检查进度"。
+    // 弧线走 buildAdvisorArcBlock（盲盒分支只给 objective + 难度 + 防剧透守则，绝不交出幕后 goal）。
+    const arc = ENABLE_ARC ? getArc() : null;
+    if (arc) {
+        const beatAt = (arc.currentBeat && arc.currentBeat.beatAdoptedAt) || arc.adoptedAt || 0;
+        parts.push(buildAdvisorArcBlock(arc, Math.max(0, chatMsgCount() - beatAt)));
+    } else {
+        const plan = getPlan();
+        if (plan) {
+            const I = ADVISOR_INTENSITIES[plan.intensity] || ADVISOR_INTENSITIES.normal;
+            const since = Math.max(0, chatMsgCount() - (plan.adoptedAt || 0));
+            parts.push('=== 当前已采用的引导方案（正在引导主聊天）===\n' +
+                `${plan.title ? `标题：${plan.title}\n` : ''}目标：${plan.goal}\n` +
+                (plan.seed ? `起始迹象：${plan.seed}\n` : '') +
+                `强度：${I.label}（${I.caption}）\n` +
+                `已持续：${since} 条主聊天消息`);
+        }
     }
 
     if (s.includeCard) parts.push(buildCardSection(ctx));
@@ -3151,6 +5672,10 @@ function buildAdvisorPrompt(ctx, s) {
     if (worldInfoBlock) {
         parts.push('=== 世界书 / 设定 ===\n' + worldInfoBlock);
     }
+
+    // 用户功能请求：运行概要插在完整对话记录的正前方（参谋本就读全程，对超长聊天仍有帮助）。
+    const summarySection = buildSummarySection(getSummary());
+    if (summarySection) parts.push(summarySection);
 
     // Full history, regardless of the shared contextDepth setting.
     const transcript = buildTranscript(ctx, { ...s, contextDepth: -1 });
@@ -3179,7 +5704,7 @@ function buildCardSection(ctx) {
 // Story-context turns as role-tagged objects {role:'user'|'assistant', name, text}.
 // Mirrors ST's prompt builder: drop system messages, run each through the regex
 // engine (isPrompt, depth relative to full chat), trim empties, take last N.
-function buildTranscriptTurns(ctx, s) {
+function buildTranscriptTurns(ctx, s, keepMechanism = diagnoseMode) {
     if (s.contextDepth === 0) return [];
     const coreChat = (ctx.chat || []).filter((m) => m && !m.is_system && typeof m.mes === 'string');
     const useRegex = s.applyRegex && regexEngine && regexEngine.getRegexedString;
@@ -3205,7 +5730,7 @@ function buildTranscriptTurns(ctx, s) {
             // 基线，就会自信地推算出离谱数值。除诊断模式外（读这些区块正是诊
             // 断的本职），一律从喂给神谕的剧情记录里剥掉。整条消息只剩区块时
             // 会变成空串，被下方的过滤器自然丢弃。
-            text: diagnoseMode ? text : stripMechanismBlocks(text),
+            text: keepMechanism ? text : stripMechanismBlocks(text),
         };
     });
 
@@ -3214,8 +5739,8 @@ function buildTranscriptTurns(ctx, s) {
     return processed;
 }
 
-function buildTranscript(ctx, s) {
-    return buildTranscriptTurns(ctx, s).map((l) => `${l.name}: ${l.text}`).join('\n\n');
+function buildTranscript(ctx, s, keepMechanism) {
+    return buildTranscriptTurns(ctx, s, keepMechanism).map((l) => `${l.name}: ${l.text}`).join('\n\n');
 }
 
 // v1.14.1 修复：用户预设里常带「每条回复末尾必须输出 <UpdateVariable>」的输出
@@ -3303,7 +5828,7 @@ function buildMessages() {
     if (!diagnoseMode && !lorebookMode && !advisorMode && presetCurationActive(s)) {
         return buildPresetMessages(s);
     }
-    return [{ role: 'system', content: buildSystemPrompt() }, ...convo];
+    return [{ role: 'system', content: buildSystemPrompt() }, ...convoForPrompt()];
 }
 
 /* ------------------------------------------------------------------ *
@@ -3357,11 +5882,14 @@ function expandMarker(out, identifier, ctx, s) {
             // Authoritative variable state (or the honest-refusal caveat) rides
             // just ahead of the story context — same discipline as plain mode.
             pushMsg(out, 'system', buildChatStatSection());
+            // 用户功能请求：运行概要紧贴故事记录之前（仅普通模式经此 marker；参谋 / 世界书
+            // 预设各走自己的 placeAdv / placeLore，不经这里）。
+            pushMsg(out, 'system', buildSummarySection(getSummary()));
             // Story context first, then the Oracle's own Q&A — as real turns.
             for (const t of buildTranscriptTurns(ctx, s)) {
                 pushMsg(out, t.role, t.text);
             }
-            for (const m of convo) pushMsg(out, m.role, m.content);
+            for (const m of convoForPrompt()) pushMsg(out, m.role, m.content);
             break;
         }
         default:
@@ -3394,11 +5922,12 @@ function buildPresetMessages(s) {
     // story + the question — append them so it never sends a question with no
     // context and no final user turn.
     if (!sawHistory) {
+        pushMsg(out, 'system', buildSummarySection(getSummary()));
         for (const t of buildTranscriptTurns(ctx, s)) pushMsg(out, t.role, t.text);
-        for (const m of convo) pushMsg(out, m.role, m.content);
+        for (const m of convoForPrompt()) pushMsg(out, m.role, m.content);
     }
 
-    return out.length ? out : [{ role: 'system', content: subst(ctx, '（预设无可用内容）') }, ...convo];
+    return out.length ? out : [{ role: 'system', content: subst(ctx, '（预设无可用内容）') }, ...convoForPrompt()];
 }
 
 /* ------------------------------------------------------------------ *
@@ -3422,7 +5951,7 @@ function buildLorebookPresetMessages(s) {
     const placeLore = () => {
         if (placed) return;
         pushMsg(out, 'system', loreBlock);
-        for (const m of convo) pushMsg(out, m.role, m.content);
+        for (const m of convoForPrompt()) pushMsg(out, m.role, m.content);
         placed = true;
     };
 
@@ -3436,7 +5965,7 @@ function buildLorebookPresetMessages(s) {
     }
     placeLore(); // no chatHistory marker in the curation -> append at the end
 
-    return out.length ? out : [{ role: 'system', content: loreBlock }, ...convo];
+    return out.length ? out : [{ role: 'system', content: loreBlock }, ...convoForPrompt()];
 }
 
 /* ------------------------------------------------------------------ *
@@ -3458,7 +5987,7 @@ function buildAdvisorPresetMessages(s) {
     const placeAdv = () => {
         if (placed) return;
         pushMsg(out, 'system', advBlock);
-        for (const m of convo) pushMsg(out, m.role, m.content);
+        for (const m of convoForPrompt()) pushMsg(out, m.role, m.content);
         placed = true;
     };
 
@@ -3472,7 +6001,7 @@ function buildAdvisorPresetMessages(s) {
     }
     placeAdv(); // no chatHistory marker in the curation -> append at the end
 
-    return out.length ? out : [{ role: 'system', content: advBlock }, ...convo];
+    return out.length ? out : [{ role: 'system', content: advBlock }, ...convoForPrompt()];
 }
 
 /* ------------------------------------------------------------------ *
@@ -3497,6 +6026,7 @@ async function onSend() {
     inputEl.value = '';
     const entry = { id: ++cidSeq, role: 'user', content: text };
     convo.push(entry);
+    persistConvo();
     entry._el = addMessage('user', text, entry);
     await generateReply();
 }
@@ -3529,9 +6059,11 @@ async function generateReply() {
         // state, and remember which books are in scope for the apply step.
         await buildLorebookContext();
     } else if (advisorMode) {
-        // Advisor sees world info per the user's setting (off by default), and
-        // builds its own full-history transcript inside buildAdvisorPrompt.
-        worldInfoBlock = await buildWorldInfo();
+        // Advisor (incl. the arc system) forces a WI scan like Diagnose, so the
+        // card's blue entries + keyword-matched green entries are always present
+        // (keep 'all' if the user chose it) — gives the arc lore to recall.
+        // Builds its own full-history transcript inside buildAdvisorPrompt.
+        worldInfoBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
         // Live MVU variable state (好感度 / 时间 / 资源…) — hard story facts the
         // proposed beats must not contradict. Silently absent for non-MVU cards.
         const stat = await getMvuStatData();
@@ -3670,6 +6202,7 @@ async function generateReply() {
             }
             aEntry.content = historyText;
             convo.push(aEntry);
+            persistConvo();
             if (diagnoseMode) {
                 const block = extractUpdateBlock(finalText);
                 if (block) addApplyControls(assistantEl, block);
@@ -3839,6 +6372,42 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
     return full;
 }
 
+// 弧线「实时输出」专用流式 direct：同时累计 content 与 reasoning_content（reasoning 模型把 CoT 放在后者），
+// 经 onLive({content, reasoning}) 实时报给查看器——这样窗口在 reasoning 模型上也看得到「在动」，而不是盯着
+// content 卡在空。返回值仍是 content 全文（供 parseArcBeat / parseArcCheck 解析，与非流式完全一致）。
+async function streamDirectArc(url, apiKey, body, signal, onLive) {
+    const res = await fetch(url, { method: 'POST', headers: directHeaders(apiKey), body: JSON.stringify({ ...body, stream: true }), signal });
+    if (!res.ok || !res.body) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 300)}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', full = '', reasoning = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (let line of lines) {
+            line = line.trim();
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (payload === '[DONE]') { if (onLive) onLive({ content: full, reasoning }); return full; }
+            try {
+                const d = JSON.parse(payload)?.choices?.[0]?.delta || {};
+                if (typeof d.content === 'string') full += d.content;
+                const r = (typeof d.reasoning_content === 'string' ? d.reasoning_content : '') || (typeof d.reasoning === 'string' ? d.reasoning : '');
+                if (r) reasoning += r;
+                if ((typeof d.content === 'string' && d.content) || r) { if (onLive) onLive({ content: full, reasoning }); }
+            } catch (e) { /* keepalive / 非 JSON 行 */ }
+        }
+    }
+    if (onLive) onLive({ content: full, reasoning });
+    return full;
+}
+
 async function callProfile(profileId, messages, maxTokens, overridePayload, signal) {
     const ctx = getCtx();
     const result = await ctx.ConnectionManagerRequestService.sendRequest(
@@ -3992,6 +6561,7 @@ function deleteMessage(entry) {
         convo.splice(i, 1);
     }
     if (entry._el) entry._el.remove();
+    persistConvo();
     maybeRenderEmpty();
 }
 
@@ -4004,6 +6574,7 @@ async function regenerateFrom(entry) {
     const i = convo.indexOf(entry);
     if (i !== -1) convo.splice(i);     // drop this entry and all after (error bubbles aren't in convo)
     if (el) { while (el.nextSibling) el.nextSibling.remove(); el.remove(); }
+    persistConvo();
     if (!convo.length || convo[convo.length - 1].role !== 'user') { maybeRenderEmpty(); return; }
     await generateReply();
 }
@@ -4044,6 +6615,7 @@ function editUserMessage(entry) {
         entry.content = newText;
         contentEl.textContent = newText;
         convo.splice(i + 1);                                   // drop later turns
+        persistConvo();
         close();
         while (el.nextSibling) el.nextSibling.remove();        // drop their DOM
         await generateReply();
@@ -4336,6 +6908,26 @@ function addSystemNote(text) {
     scrollToBottom();
 }
 
+// 持久化的「系统记录」气泡（目前用于自动诊断的修复记录）。带 entry（写进 convo → 持久化 → 重载可
+// 重建），左对齐、补丁可滚动。opts.{snapshot,patch} 提供时挂一个「撤销 / 重新应用」按钮（仅改动型记录、
+// 仅本会话）——重载后 loadConvoForChat 不传 opts，记录变只读（重放旧补丁不安全，与手动诊断回复重载后
+// 失去按钮一致）。
+function addNoteMessage(entry, opts) {
+    const empty = messagesEl.querySelector('.so-empty');
+    if (empty) empty.remove();
+    const wrap = document.createElement('div');
+    wrap.className = 'so-note so-note-record';
+    if (entry) wrap.dataset.cid = entry.id;
+    const txt = document.createElement('div');
+    txt.className = 'so-note-record-text';
+    txt.textContent = entry ? entry.content : '';
+    wrap.appendChild(txt);
+    if (opts && opts.snapshot && opts.patch) addNoteUndoControls(wrap, opts.snapshot, opts.patch);
+    messagesEl.appendChild(wrap);
+    scrollToBottom();
+    return wrap;
+}
+
 function renderEmptyState() {
     if (convo.length || messagesEl.children.length) return;
     const wrap = document.createElement('div');
@@ -4349,8 +6941,57 @@ function renderEmptyState() {
 
 function clearConversation() {
     convo = [];
+    persistConvo();   // 用户功能请求：手动清空也清掉本聊天保存的历史（删元数据键）
     messagesEl.innerHTML = '';
     renderEmptyState();
+}
+
+/* ------------------------------------------------------------------ *
+ * 用户功能请求：per-chat 侧聊历史的载入端 + 运行概要编辑器的 UI 刷新。
+ * ------------------------------------------------------------------ */
+// 从本聊天的元数据重建侧聊窗口。chat 切换 / 首次载入时调用（onChatChanged）。先中止任何在途
+// 生成，避免流式气泡继续写到被清掉的 DOM 上。
+function loadConvoForChat() {
+    if (!messagesEl) return;                       // 窗口还没建好（极早期）——略过，init 末尾会再调一次
+    if (isGenerating && abortCtl) { try { abortCtl.abort(); } catch (e) { /* ignore */ } }
+    const saved = getConvoMeta();
+    convo = saved
+        .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'note') && typeof m.content === 'string')
+        .map((m) => ({ id: m.id, role: m.role, content: m.content }));
+    cidSeq = convo.reduce((mx, m) => Math.max(mx, Number(m.id) || 0), cidSeq);
+    messagesEl.innerHTML = '';
+    if (!convo.length) { renderEmptyState(); return; }
+    for (const m of convo) { m._el = (m.role === 'note') ? addNoteMessage(m) : addMessage(m.role, m.content, m); }
+    scrollToBottom();
+}
+
+// 打开运行概要编辑器（叠层，仿 openDebug）。
+function openSummary() {
+    if (!win) return;
+    const ta = win.querySelector('#so-summary-text');
+    if (ta) ta.value = getSummary();
+    updateSummaryIndicator(ta ? ta.value : getSummary());
+    win.querySelector('#so-summary').classList.add('open');
+    if (ta) ta.focus();
+}
+
+// 把本聊天的运行概要载入文本框 + 刷新字数 / 图标小红点。切换聊天 / 首次载入时调用。
+function refreshSummaryUI() {
+    if (!win) return;
+    const ta = win.querySelector('#so-summary-text');
+    const text = getSummary();
+    if (ta && document.activeElement !== ta) ta.value = text;   // 别在用户正打字时覆盖
+    updateSummaryIndicator(text);
+}
+
+// 概要图标的「有内容」小红点 + 编辑器底部字数。text 传 null 时现读元数据。
+function updateSummaryIndicator(text) {
+    if (!win) return;
+    const t = String(text == null ? getSummary() : text);
+    const btn = win.querySelector('#so-summary-btn');
+    if (btn) btn.classList.toggle('so-has-summary', !!t.trim());
+    const count = win.querySelector('#so-summary-count');
+    if (count) count.textContent = t.trim() ? `${t.length} 字` : '（空——不会注入）';
 }
 
 function scrollToBottom() {
