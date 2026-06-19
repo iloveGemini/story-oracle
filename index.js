@@ -3675,111 +3675,137 @@ function buildWindow() {
                 <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋 —— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
                 <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
                 <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）"><i class="fa-solid fa-stethoscope"></i><span class="so-auto-tag">AUTO</span></div>
+                <span class="so-hdr-div" aria-hidden="true"></span>
                 <div class="so-iconbtn" id="so-summary-btn" title="剧情概要 —— 粘贴你的运行总结 / 前情提要，神谕会在最近对话前读到它"><i class="fa-solid fa-scroll"></i></div>
                 <div class="so-iconbtn" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i></div>
                 <div class="so-iconbtn" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i></div>
+                <span class="so-hdr-div" aria-hidden="true"></span>
                 <div class="so-iconbtn" id="so-clear-btn" title="清空对话"><i class="fa-solid fa-trash-can"></i></div>
                 <div class="so-iconbtn" id="so-close-btn" title="关闭"><i class="fa-solid fa-xmark"></i></div>
             </div>
         </div>
 
         <div id="so-settings">
-            <label class="so-row"><span>连接模式</span>
-                <select id="so-mode">
-                    <option value="direct">直连（自定义 URL）</option>
-                    <option value="profile">连接配置文件</option>
-                </select>
-            </label>
+            <details class="so-set-group" open>
+                <summary>连接</summary>
+                <div class="so-set-body">
+                    <label class="so-row"><span>连接模式</span>
+                        <select id="so-mode">
+                            <option value="direct">直连（自定义 URL）</option>
+                            <option value="profile">连接配置文件</option>
+                        </select>
+                    </label>
 
-            <div id="so-direct-fields">
-                <label class="so-field"><span>端点 URL</span>
-                    <input id="so-endpoint" type="text" placeholder="https://your-proxy.com/v1">
-                </label>
-                <label class="so-field"><span>API 密钥</span>
-                    <input id="so-apikey" type="password" placeholder="sk-...">
-                </label>
-                <label class="so-field"><span>模型</span>
-                    <div class="so-model-row">
-                        <input id="so-model" type="text" placeholder="gpt-4o-mini">
-                        <div class="so-iconbtn" id="so-model-fetch" title="从服务商获取可用模型列表"><i class="fa-solid fa-cloud-arrow-down"></i></div>
+                    <div id="so-direct-fields">
+                        <label class="so-field"><span>端点 URL</span>
+                            <input id="so-endpoint" type="text" placeholder="https://your-proxy.com/v1">
+                        </label>
+                        <label class="so-field"><span>API 密钥</span>
+                            <input id="so-apikey" type="password" placeholder="sk-...">
+                        </label>
+                        <label class="so-field"><span>模型</span>
+                            <div class="so-model-row">
+                                <input id="so-model" type="text" placeholder="gpt-4o-mini">
+                                <div class="so-iconbtn" id="so-model-fetch" title="从服务商获取可用模型列表"><i class="fa-solid fa-cloud-arrow-down"></i></div>
+                            </div>
+                            <select id="so-model-list" style="display:none"></select>
+                            <div class="so-hint" id="so-model-hint"></div>
+                        </label>
+                        <div class="so-hint">如果请求因 CORS / 网络错误失败，请切换到“连接配置文件”模式（通过 ST 服务器转发）。</div>
                     </div>
-                    <select id="so-model-list" style="display:none"></select>
-                    <div class="so-hint" id="so-model-hint"></div>
-                </label>
-                <div class="so-hint">如果请求因 CORS / 网络错误失败，请切换到“连接配置文件”模式（通过 ST 服务器转发）。</div>
-            </div>
 
-            <div id="so-profile-fields">
-                <label class="so-field"><span>配置文件</span>
-                    <div class="so-profile-row">
-                        <select id="so-profile"></select>
-                        <div class="so-iconbtn" id="so-profile-refresh" title="刷新配置文件列表"><i class="fa-solid fa-rotate-right"></i></div>
+                    <div id="so-profile-fields">
+                        <label class="so-field"><span>配置文件</span>
+                            <div class="so-profile-row">
+                                <select id="so-profile"></select>
+                                <div class="so-iconbtn" id="so-profile-refresh" title="刷新配置文件列表"><i class="fa-solid fa-rotate-right"></i></div>
+                            </div>
+                        </label>
+                        <div class="so-hint" id="so-profile-hint">使用已保存的连接配置文件，通过 ST 服务器转发（无 CORS 问题）。</div>
                     </div>
-                </label>
-                <div class="so-hint" id="so-profile-hint">使用已保存的连接配置文件，通过 ST 服务器转发（无 CORS 问题）。</div>
-            </div>
-
-            <div class="so-grid2">
-                <label class="so-field"><span>温度</span>
-                    <input id="so-temp" type="number" step="0.05" min="0" max="2">
-                </label>
-                <label class="so-field"><span>最大 token 数</span>
-                    <input id="so-maxtok" type="number" step="50" min="1">
-                </label>
-            </div>
-
-            <label class="so-check"><input id="so-stream" type="checkbox"><span>流式输出</span></label>
-            <label class="so-check"><input id="so-chatbar-toggle" type="checkbox"><span>在聊天输入栏显示快捷按钮（🌙 一键开 / 关神谕）</span></label>
-
-            <label class="so-field"><span>上下文深度（消息条数，-1 = 全部，0 = 不带）</span>
-                <input id="so-depth" type="number" step="1" min="-1">
-            </label>
-            <label class="so-field"><span>剧情引导注入深度（参谋模式：方案指令插入主聊天的深度）</span>
-                <input id="so-adv-depth" type="number" step="1" min="0">
-            </label>
-            <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
-            <label class="so-check"><input id="so-stat" type="checkbox"><span>附带变量状态（MVU stat_data，普通模式）—— 数值问题的权威来源；关掉则如实拒答数值</span></label>
-            <label class="so-check"><input id="so-regex" type="checkbox"><span>应用剧情正则（剥离思维链 / 状态栏、使用总结）—— 与主聊天保持一致</span></label>
-
-            <label class="so-row"><span>世界书 / 知识库</span>
-                <select id="so-wi">
-                    <option value="off">关闭</option>
-                    <option value="st">常驻 + 关键词匹配（ST 默认行为）</option>
-                    <option value="all">全部条目（规划用 —— 忽略关键词）</option>
-                </select>
-            </label>
-            <div class="so-hint" id="so-wi-hint"></div>
-
-            <label class="so-check"><input id="so-sendtemp" type="checkbox"><span>发送温度参数（部分拒收该参数的模型请关闭）</span></label>
-
-            <label class="so-row"><span>说话人格</span>
-                <select id="so-persona"></select>
-            </label>
-            <div class="so-hint">给神谕套一层“说话腔调”，只改变语气与文采，不改变其分析职责。选「普通」即关闭人格（默认）。使用预设时，人格默认关闭、以免与预设自带的角色声线冲突；若选择某个人格，它会叠加在预设之上。参谋 / 世界书模式下同样叠加（人格只改语气，方案与条目正文的格式不受影响）。诊断模式下不生效。</div>
-
-            <label class="so-row"><span>系统提示词（选择要查看 / 修改的模式）</span>
-                <select id="so-sysprompt-which"></select>
-            </label>
-
-            <div id="so-sysprompt-preset-wrap">
-            <label class="so-row"><span>系统提示词来源（补全预设）</span>
-                <div class="so-profile-row">
-                    <select id="so-sysprompt-preset"></select>
-                    <div class="so-iconbtn" id="so-sysprompt-preset-recurate" title="重新挑选要保留的块"><i class="fa-solid fa-list-check"></i></div>
-                    <div class="so-iconbtn" id="so-sysprompt-preset-refresh" title="刷新预设列表"><i class="fa-solid fa-rotate-right"></i></div>
                 </div>
-            </label>
-            <div class="so-hint" id="so-sysprompt-preset-hint"></div>
-            </div>
+            </details>
 
-            <div class="so-field">
-                <div class="so-sysprompt-head">
-                    <span>系统提示词</span>
-                    <button type="button" id="so-sysprompt-reset" title="恢复为内置默认提示词">↺ 重置为默认</button>
+            <details class="so-set-group">
+                <summary>生成参数</summary>
+                <div class="so-set-body">
+                    <div class="so-grid2">
+                        <label class="so-field"><span>温度</span>
+                            <input id="so-temp" type="number" step="0.05" min="0" max="2">
+                        </label>
+                        <label class="so-field"><span>最大 token 数</span>
+                            <input id="so-maxtok" type="number" step="50" min="1">
+                        </label>
+                    </div>
+                    <label class="so-check"><input id="so-stream" type="checkbox"><span>流式输出</span></label>
+                    <label class="so-check"><input id="so-sendtemp" type="checkbox"><span>发送温度参数（部分拒收该参数的模型请关闭）</span></label>
                 </div>
-                <textarea id="so-sysprompt" rows="5"></textarea>
-            </div>
-            <div class="so-hint" id="so-sysprompt-which-hint"></div>
+            </details>
+
+            <details class="so-set-group">
+                <summary>上下文与世界书</summary>
+                <div class="so-set-body">
+                    <label class="so-field"><span>上下文深度（消息条数，-1 = 全部，0 = 不带）</span>
+                        <input id="so-depth" type="number" step="1" min="-1">
+                    </label>
+                    <label class="so-field"><span>剧情引导注入深度（参谋模式：方案指令插入主聊天的深度）</span>
+                        <input id="so-adv-depth" type="number" step="1" min="0">
+                    </label>
+                    <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
+                    <label class="so-check"><input id="so-stat" type="checkbox"><span>附带变量状态（MVU stat_data，普通模式）—— 数值问题的权威来源；关掉则如实拒答数值</span></label>
+                    <label class="so-check"><input id="so-regex" type="checkbox"><span>应用剧情正则（剥离思维链 / 状态栏、使用总结）—— 与主聊天保持一致</span></label>
+
+                    <label class="so-row"><span>世界书 / 知识库</span>
+                        <select id="so-wi">
+                            <option value="off">关闭</option>
+                            <option value="st">常驻 + 关键词匹配（ST 默认行为）</option>
+                            <option value="all">全部条目（规划用 —— 忽略关键词）</option>
+                        </select>
+                    </label>
+                    <div class="so-hint" id="so-wi-hint"></div>
+                </div>
+            </details>
+
+            <details class="so-set-group">
+                <summary>人格与提示词</summary>
+                <div class="so-set-body">
+                    <label class="so-row"><span>说话人格</span>
+                        <select id="so-persona"></select>
+                    </label>
+                    <div class="so-hint">给神谕套一层“说话腔调”，只改变语气与文采，不改变其分析职责。选「普通」即关闭人格（默认）。使用预设时，人格默认关闭、以免与预设自带的角色声线冲突；若选择某个人格，它会叠加在预设之上。参谋 / 世界书模式下同样叠加（人格只改语气，方案与条目正文的格式不受影响）。诊断模式下不生效。</div>
+
+                    <label class="so-row"><span>系统提示词（选择要查看 / 修改的模式）</span>
+                        <select id="so-sysprompt-which"></select>
+                    </label>
+
+                    <div id="so-sysprompt-preset-wrap">
+                    <label class="so-row"><span>系统提示词来源（补全预设）</span>
+                        <div class="so-profile-row">
+                            <select id="so-sysprompt-preset"></select>
+                            <div class="so-iconbtn" id="so-sysprompt-preset-recurate" title="重新挑选要保留的块"><i class="fa-solid fa-list-check"></i></div>
+                            <div class="so-iconbtn" id="so-sysprompt-preset-refresh" title="刷新预设列表"><i class="fa-solid fa-rotate-right"></i></div>
+                        </div>
+                    </label>
+                    <div class="so-hint" id="so-sysprompt-preset-hint"></div>
+                    </div>
+
+                    <div class="so-field">
+                        <div class="so-sysprompt-head">
+                            <span>系统提示词</span>
+                            <button type="button" id="so-sysprompt-reset" title="恢复为内置默认提示词">↺ 重置为默认</button>
+                        </div>
+                        <textarea id="so-sysprompt" rows="5"></textarea>
+                    </div>
+                    <div class="so-hint" id="so-sysprompt-which-hint"></div>
+                </div>
+            </details>
+
+            <details class="so-set-group">
+                <summary>界面</summary>
+                <div class="so-set-body">
+                    <label class="so-check"><input id="so-chatbar-toggle" type="checkbox"><span>在聊天输入栏显示快捷按钮（🌙 一键开 / 关神谕）</span></label>
+                </div>
+            </details>
         </div>
 
         <div id="so-diag-bar">
@@ -3967,12 +3993,33 @@ function buildWindow() {
     modeBadge = win.querySelector('#so-mode-badge');
 
     bindControls();
+    enhanceIconButtonA11y();
     loadSettingsIntoForm();
     planBarEl = win.querySelector('#so-plan-bar');
     makeDraggable(win, win.querySelector('#so-header'));
     makeResizable(win, win.querySelector('#so-resize-grip'));
     renderEmptyState();
     renderPlanBar();
+}
+
+// 无障碍：图标按钮本是 <div>（为了样式自由），这里补上原生 <button> 该有的语义与键盘操作——
+// role=button + 可聚焦（tabindex）+ Enter/空格触发，并把每个按钮已有的 title 复用为屏幕阅读器
+// 的可读名（aria-label）。这样整套图标工具栏对键盘 / 读屏用户也完全可用，且无需改动任何模板标记。
+function enhanceIconButtonA11y() {
+    win.querySelectorAll('.so-iconbtn').forEach((b) => {
+        b.setAttribute('role', 'button');
+        if (!b.hasAttribute('tabindex')) b.setAttribute('tabindex', '0');
+        if (!b.getAttribute('aria-label') && b.title) b.setAttribute('aria-label', b.title);
+    });
+    // 委托键盘事件：聚焦某个图标按钮时按 Enter / 空格即等同点击（原生 <button> 的默认行为）。
+    // 输入框 / 文本域里的按键不会命中（closest 找不到 .so-iconbtn），故不影响打字与「Enter 发送」。
+    win.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const btn = e.target.closest && e.target.closest('.so-iconbtn');
+        if (!btn || !win.contains(btn)) return;
+        e.preventDefault();
+        btn.click();
+    });
 }
 
 function bindControls() {
@@ -5043,6 +5090,33 @@ const MODE_PLACEHOLDERS = {
     advisor: '聊聊剧情接下来可以怎么走…（出方案后可一键开始引导）',
 };
 
+// 各模式的空状态：模式图标 + 引导语 +（可选）副标题 + 示例 chip。点一下 chip 把问题填进输入框
+// 并聚焦，回车即发，由该模式的发送管线处理。与 MODE_PLACEHOLDERS 并列维护。用户选择方案 A：
+// 侧聊为空时它取代进入提示（modeEntryNote 此时跳过那段说明，避免与引导语 + chip 叠加重复）。
+const MODE_EMPTY = {
+    chat: {
+        icon: 'fa-moon',
+        lead: '关于当前剧情，尽管问吧。',
+        sub: '此窗口与主聊天相互独立。',
+        chips: ['接下来可能会发生什么？', '这个角色现在的处境如何？', '帮我理一下当前的剧情线。'],
+    },
+    diagnose: {
+        icon: 'fa-stethoscope',
+        lead: '检查并修复 MVU 变量状态。',
+        chips: ['检查最新一条回复有没有问题。', '审计一下当前的整个状态。'],
+    },
+    lorebook: {
+        icon: 'fa-book',
+        lead: '聊聊或修改这本世界书。',
+        chips: ['这本世界书都写了些什么？', '帮我新增一个条目。', '找找条目之间有没有矛盾。'],
+    },
+    advisor: {
+        icon: 'fa-compass',
+        lead: '一起构思剧情接下来怎么走。',
+        chips: ['接下来剧情可以怎么走？给我几个方向。', '基于现在的局势，提一个值得推进的转折。'],
+    },
+};
+
 function currentOracleMode() {
     return diagnoseMode ? 'diagnose' : (lorebookMode ? 'lorebook' : (advisorMode ? 'advisor' : 'chat'));
 }
@@ -5059,6 +5133,8 @@ function setOracleMode(target) {
     win.querySelector('#so-advisor-btn').classList.toggle('so-adv-active', advisorMode);
     inputEl.placeholder = MODE_PLACEHOLDERS[target] || MODE_PLACEHOLDERS.chat;
     if (ENABLE_DIAG_WI_PICKER) refreshDiagPickerUI();   // 诊断「精选条目」栏随模式刷新（用户功能请求）
+    // 空侧聊时切换模式要刷新空状态（每模式自带一组引导语 + 示例 chip）；有内容则保留现有记录不动。
+    if (messagesEl && !convo.length) { messagesEl.innerHTML = ''; renderEmptyState(); }
 }
 
 // 用户功能请求：诊断按钮三态循环 —— 关 → 诊断 → 诊断·自动(AUTO) → 关。两个纯函数便于单测：
@@ -5078,7 +5154,7 @@ function toggleDiagnose() {
         const entering = !diagnoseMode;
         if (s.autoDiagnoseEnabled) { s.autoDiagnoseEnabled = false; save(); }
         setOracleMode(entering ? 'diagnose' : 'chat');
-        addSystemNote(entering
+        modeEntryNote(entering
             ? '诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。'
             : '已返回普通聊天模式。');
         updateDiagButtonVisual();
@@ -5096,15 +5172,15 @@ function applyDiagButtonState(state) {
     if (state === 'off') {
         s.autoDiagnoseEnabled = false; save();
         setOracleMode('chat');
-        addSystemNote('已关闭诊断 / 自动诊断，返回普通聊天模式。');
+        modeEntryNote('已关闭诊断 / 自动诊断，返回普通聊天模式。');
     } else if (state === 'diagnose') {
         s.autoDiagnoseEnabled = false; save();
         setOracleMode('diagnose');
-        addSystemNote('诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。再点一次诊断按钮即可开启【自动模式】。');
+        modeEntryNote('诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。再点一次诊断按钮即可开启【自动模式】。');
     } else { // auto
         s.autoDiagnoseEnabled = true; save();
         setOracleMode('diagnose');
-        addSystemNote('🔴 自动诊断模式已开启。此后每当主聊天收到新的 AI 回复，我都会在后台自动检查其中的 MVU 变量更新，发现问题就【自动应用修复】（每次都会弹出一个可撤销的提示）。窗口关着也照常工作。再点一次诊断按钮即可关闭。');
+        modeEntryNote('🔴 自动诊断模式已开启。此后每当主聊天收到新的 AI 回复，我都会在后台自动检查其中的 MVU 变量更新，发现问题就【自动应用修复】（每次都会弹出一个可撤销的提示）。窗口关着也照常工作。再点一次诊断按钮即可关闭。');
     }
     updateDiagButtonVisual();
     if (inputEl) inputEl.focus();
@@ -5137,9 +5213,9 @@ function toggleLorebook() {
     setOracleMode(entering ? 'lorebook' : 'chat');
     if (entering) {
         populateLorebookBooks();
-        addSystemNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
+        modeEntryNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
     } else {
-        addSystemNote('已返回普通聊天模式。');
+        modeEntryNote('已返回普通聊天模式。');
     }
     inputEl.focus();
 }
@@ -5148,14 +5224,14 @@ function toggleAdvisor() {
     const entering = !advisorMode;
     setOracleMode(entering ? 'advisor' : 'chat');
     if (entering) {
-        addSystemNote('剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
+        modeEntryNote('剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
             + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : ''));
         // 桥接：从普通模式聊到一半切过来时（侧聊有内容、且还没有方案在引导），
         // 给一个一键把刚才的讨论正式化成方案的入口。出现时机是确定性的——
         // 只在这一刻、只在这个条件下，绝不靠关键词探测。
         if (convoForPrompt().length > 0 && !getPlan()) addBridgeChip();
     } else {
-        addSystemNote('已返回普通聊天模式。');
+        modeEntryNote('已返回普通聊天模式。');
     }
     inputEl.focus();
 }
@@ -7613,6 +7689,12 @@ function addSystemNote(text) {
     scrollToBottom();
 }
 
+// 模式进入 / 退出 / 自动开关的说明：仅在侧聊已有内容时才作为系统记录追加。侧聊为空时，落地模式
+// 专属的空状态（引导语 + 示例 chip）已充当介绍，再叠一段说明反而冗余（用户选择方案 A）。
+function modeEntryNote(text) {
+    if (convo.length) addSystemNote(text);
+}
+
 // 持久化的「系统记录」气泡（目前用于自动诊断的修复记录）。带 entry（写进 convo → 持久化 → 重载可
 // 重建），左对齐、补丁可滚动。opts.{snapshot,patch} 提供时挂一个「撤销 / 重新应用」按钮（仅改动型记录、
 // 仅本会话）——重载后 loadConvoForChat 不传 opts，记录变只读（重放旧补丁不安全，与手动诊断回复重载后
@@ -7635,16 +7717,37 @@ function addNoteMessage(entry, opts) {
 
 function renderEmptyState() {
     if (convo.length || messagesEl.children.length) return;
+    const m = MODE_EMPTY[currentOracleMode()] || MODE_EMPTY.chat;
     const wrap = document.createElement('div');
     wrap.className = 'so-empty';
-    wrap.innerHTML =
-        `<i class="fa-solid fa-moon so-empty-icon"></i>` +
-        `<div>关于当前剧情，尽管问吧。</div>` +
-        `<div class="so-empty-sub">此窗口与主聊天相互独立。</div>`;
+    let html = `<i class="fa-solid ${m.icon} so-empty-icon"></i>` +
+        `<div class="so-empty-line">${m.lead}</div>`;
+    if (m.sub) html += `<div class="so-empty-sub">${m.sub}</div>`;
+    wrap.innerHTML = html;
+    // 示例问题 chip：每种模式一组（见 MODE_EMPTY）。点一下把问题填进输入框并聚焦，直接回车即可
+    // 发送，由该模式的发送管线处理。chip 是真正的 <button>，键盘可达（与 Tier 1 一致）。
+    const chips = document.createElement('div');
+    chips.className = 'so-empty-chips';
+    for (const q of m.chips) {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'so-empty-chip';
+        chip.textContent = q;
+        chip.addEventListener('click', () => {
+            inputEl.value = q;
+            inputEl.dispatchEvent(new Event('input'));   // 触发自动高度 / 发送键状态
+            inputEl.focus();
+        });
+        chips.appendChild(chip);
+    }
+    wrap.appendChild(chips);
     messagesEl.appendChild(wrap);
 }
 
 function clearConversation() {
+    // 清空会连带删除本聊天已保存的侧聊历史（含自动诊断记录），无法撤销——与本扩展其它破坏性
+    // 操作（清空概要 / 重置提示词 / 退出弧线）保持一致，先确认再执行。空对话则无需打扰直接返回。
+    if (convo.length && !confirm('确定清空本聊天的侧聊历史吗？此操作会删除已保存的记录，无法撤销。')) return;
     convo = [];
     persistConvo();   // 用户功能请求：手动清空也清掉本聊天保存的历史（删元数据键）
     messagesEl.innerHTML = '';
