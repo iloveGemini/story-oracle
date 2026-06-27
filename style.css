@@ -115,6 +115,40 @@
 #so-clear-btn:hover { color: var(--crimson70a, #e08585); }
 .so-iconbtn.so-generating { color: var(--crimson70a, #e0685f); opacity: 1; }
 
+/* ---------- 标题栏「⋯」工具下拉（剧情概要 / 调试 / 设置 收进一处） ---------- */
+.so-tools-wrap { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
+#so-tools-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 10;
+    min-width: 150px;
+    flex-direction: column;
+    gap: 2px;
+    padding: 5px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+    border-radius: var(--so-r-md, 12px);
+    background: var(--SmartThemeBlurTintColor, rgba(26, 26, 28, 0.98));
+    box-shadow: 0 12px 30px -8px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+    animation: so-open 0.16s ease;
+}
+#so-tools-menu.open { display: flex; }
+/* 菜单项：把 30×30 的方形图标块改成左对齐的「图标 + 文字」整行 */
+.so-tools-item {
+    width: auto;
+    height: auto;
+    justify-content: flex-start;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    white-space: nowrap;
+    opacity: 0.9;
+}
+.so-tools-item > i { width: 16px; text-align: center; }
+/* 行变宽后，把「有概要」小红点改到整行右端竖直居中（默认 top/right:4px 会贴在右上角，显得脱离） */
+#so-tools-menu #so-summary-btn.so-has-summary::after { top: 50%; right: 9px; transform: translateY(-50%); }
+
 /* ---------- settings ---------- */
 #so-settings {
     display: none;
@@ -585,7 +619,7 @@
     .so-msg-btn { padding: 9px 11px; }
     .so-actions { gap: 4px; }
     /* 诊断 / 世界书配置栏：手机上最多占半屏（内部滚动），条目列表也压低，避免盖住聊天区 */
-    #so-lb-bar, #so-diag-bar { max-height: 50vh; overflow-y: auto; }
+    #so-lb-bar, #so-diag-bar, #so-fix-bar { max-height: 50vh; overflow-y: auto; }
     .so-lb-entries-list { max-height: 120px; }
 }
 
@@ -595,6 +629,25 @@
     background-color: color-mix(in srgb, var(--so-accent) 16%, transparent);
     opacity: 1;
 }
+
+/* ---------- reply-fix mode (校正) ---------- */
+#so-fix-btn.so-fix-active {
+    color: var(--so-accent);
+    background-color: color-mix(in srgb, var(--so-accent) 16%, transparent);
+    opacity: 1;
+}
+/* ✨ 自动校正开启：把校正图标染金，作为「小指示」（用户功能请求）。只改 color/opacity——本块在 .so-fix-active
+   之后、源序更高，故自动开启时金色图标优先；又因不改 background，与 active 的强调底色叠加时仍能看出「在校正模式」。 */
+#so-fix-btn.so-fix-auto {
+    color: var(--so-fix-auto-gold, #e3b341);
+    opacity: 1;
+}
+/* 校正稿卡片里"改了哪些"的小字摘要。 */
+.so-fix-changes { margin-top: 6px; font-size: 0.85em; opacity: 0.78; line-height: 1.4; white-space: pre-wrap; }
+/* 「看改动」内联差异卡：原文→校正稿，删划掉红、增高亮绿。 */
+.so-diff-card { white-space: pre-wrap; font-size: 0.9em; margin-top: 6px; padding: 6px 8px; border-radius: var(--so-r-md, 8px); background: color-mix(in srgb, var(--so-accent) 6%, transparent); line-height: 1.5; }
+.so-diff-del { background: color-mix(in srgb, #e5544b 30%, transparent); text-decoration: line-through; opacity: 0.85; }
+.so-diff-ins { background: color-mix(in srgb, #2a9d6f 32%, transparent); }
 
 #so-diag-pill {
     display: none;
@@ -683,6 +736,40 @@
 #so-diag-picker { display: none; flex-direction: column; gap: 6px; }
 #so-diag-bar.so-diag-usesel-on #so-diag-picker { display: flex; }
 
+/* 校正模式配置栏。结构与诊断栏同构（默认隐藏 + 竖向 flex 布局），只在 .so-fix-on 时显示、
+   配置面板打开时让位。复用 --so-accent 的局部换肤与共享的 .so-mode-collapse 折叠机制。 */
+#so-fix-bar {
+    --so-lb-accent: var(--so-accent);
+    display: none;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    background: color-mix(in srgb, var(--so-accent) 7%, transparent);
+    /* 校正栏内容多、且默认展开（不像诊断 / 世界书栏把大块内容默认折起）：桌面上它的自然高度
+       可达 ~680px，超过整窗（默认 540px）。因为是 flex:0 0 auto（绝不收缩）且桌面无高度上限，
+       它会撑爆窗口——把消息区与输入框整体顶到 overflow:hidden 边界之外、自身底部也被裁掉，
+       于是「进了校正模式就出不来 / 拖不动」。封顶到窗口一半 + 内部滚动：标题栏(✕/拖动)、聊天区、
+       输入框任何视口下都留在屏内，超出的选项在栏内滚动取用。按窗口百分比而非 vh——桌面窗口远小于
+       视口，vh 在大屏上仍会溢出。手机上本就自动折叠（见 bindControls 的 max-width:600 折叠）。 */
+    max-height: 50%;
+    overflow-y: auto;
+}
+#so-window.so-fix-on #so-fix-bar { display: flex; }
+#so-window.so-settings-open #so-fix-bar { display: none; }
+
+/* 校正配置：目标说明小字、可竖向拉伸的多行输入框、以及主题色描边的"开始校正"按钮。 */
+.so-fix-targets-head { font-size: 0.82em; opacity: 0.7; margin-top: 4px; }
+#so-fix-bar textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: inherit; font-size: 0.9em; }
+.so-fix-run-btn { margin-top: 4px; padding: 7px 10px; cursor: pointer; border-radius: var(--so-r-md, 8px);
+    border: 1px solid var(--so-accent); background: color-mix(in srgb, var(--so-accent) 16%, transparent); color: inherit; }
+.so-fix-run-btn:hover { background: color-mix(in srgb, var(--so-accent) 26%, transparent); }
+/* ✨ 校正 Phase 4：全局命名套餐库的一行控件（下拉 + 加载 / 保存为… / 删除）。 */
+.so-fix-bundle-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.so-fix-bundle-row #so-fix-bundle { flex: 1 1 120px; min-width: 100px; }
+.so-fix-bundle-row .so-fix-run-btn { margin-top: 0; padding: 5px 9px; flex: 0 0 auto; }
+
 /* 模式工具栏折叠：诊断 / 世界书的配置栏整条可折叠成一行标题，给聊天区让出竖向空间（手机上尤其重要）。
    复用设置分组的 <summary> ▸ 机制，染上当前模式的主题色（世界书=羊皮纸暖色；诊断里 --so-lb-accent 被改写为蓝）。 */
 .so-mode-collapse { width: 100%; }
@@ -731,6 +818,14 @@
     font-size: 0.9em;
 }
 #so-lb-book:focus, #so-diag-book:focus { outline: none; border-color: var(--so-lb-accent); }
+.so-lb-bookpick { flex: 1 1 auto; min-width: 0; border: 1px solid var(--SmartThemeBorderColor, #444); border-radius: var(--so-r-md, 6px); padding: 2px 6px; }
+.so-lb-bookpick > summary { cursor: pointer; list-style: none; padding: 2px 0; font-size: 0.9em; }
+.so-lb-bookpick > summary::-webkit-details-marker { display: none; }
+.so-lb-bookpick-tools { display: flex; gap: 4px; margin: 4px 0; }
+.so-lb-book-list { max-height: 160px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.so-lb-book-opt { display: flex; align-items: center; gap: 6px; font-size: 0.9em; padding: 2px 4px; cursor: pointer; }
+.so-lb-book-opt:hover { background: var(--white20a, rgba(255,255,255,0.08)); border-radius: 4px; }
+@media (max-width: 600px) { .so-lb-book-list { max-height: 120px; } }
 .so-lb-check {
     display: flex;
     align-items: center;
@@ -757,6 +852,11 @@
     transition: background-color 0.15s;
 }
 .so-lb-mini:hover { background: color-mix(in srgb, var(--so-lb-accent) 22%, transparent); }
+/* 切换型 mini 按钮（如「👁 内容预览」）开启时的按下高亮——比 hover 更实，表示「正生效」。 */
+.so-lb-mini.active {
+    background: color-mix(in srgb, var(--so-lb-accent) 34%, transparent);
+    border-color: var(--so-lb-accent);
+}
 .so-lb-mini:disabled { opacity: 0.45; cursor: not-allowed; }
 .so-lb-mini:disabled:hover { background: color-mix(in srgb, var(--so-lb-accent) 10%, transparent); }
 .so-lb-mini-blue::before, .so-lb-mini-green::before, .so-lb-mini-off::before {
@@ -780,7 +880,7 @@
 .so-lb-entries.open .so-lb-entries-filter,
 .so-lb-entries.open .so-lb-entries-list { display: flex; }
 .so-lb-ent {
-    display: flex; align-items: center; gap: 7px; cursor: pointer;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 7px; cursor: pointer;
     font-size: 0.82em; padding: 3px 4px; border-radius: 6px;
 }
 .so-lb-ent:hover { background: rgba(255, 255, 255, 0.05); }
@@ -790,7 +890,19 @@
 .so-lb-type-green { background: #7bbf6a; }
 .so-lb-type-off { background: #777; opacity: 0.5; }
 .so-lb-ent-uid { opacity: 0.5; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
-.so-lb-ent-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.so-lb-ent-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* 条目内容预览（用户功能请求）：默认隐藏；选条目器顶部「👁 内容预览」开关给整列加 .so-lb-show-preview
+   即显示。内容字面（含宏，与世界书模式逐字原则一致）、裁到 2 行、缩进落到标题下方独占一行。 */
+.so-lb-ent-preview {
+    display: none;
+    flex: 0 0 100%;                 /* 独占一行 -> 落到标题那行的下方 */
+    margin: 1px 0 1px 16px;         /* 缩进，对齐到复选框之后 */
+    font-size: 0.9em; opacity: 0.62; line-height: 1.3;
+    overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    word-break: break-word; white-space: normal;
+}
+#so-lb-entries-list.so-lb-show-preview .so-lb-ent-preview { display: -webkit-box; }
+.so-lb-ent-preview.is-empty { opacity: 0.4; font-style: italic; }
 .so-lb-ent-empty { font-size: 0.8em; opacity: 0.55; padding: 4px 2px; }
 /* per-book header shown when editing "all active books" (grouped entry picker) */
 .so-lb-book-head {

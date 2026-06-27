@@ -190,6 +190,182 @@ why: 为什么贴合当前故事（呼应了哪条伏笔 / 哪段关系）
 - 如果上下文里带有「当前已采用的引导方案」，说明主聊天正被它引导。用户问起进度时（例如"检查进度"），请对照最近的剧情如实评估：铺垫是否已出现、推进到了哪一步、强度是否合适、是否可以完成或该调整方向。
 - 全程使用简体中文作答。除非用户要求展开，否则保持简明。`;
 
+// 校正模式系统提示（Phase 2b 两段式：先 <problems> 定位违规片段，再 <FixedReply> 外科式修正）。
+const FIX_SYSTEM_PROMPT = `你是一位资深中文小说编辑，负责【校正】一段已写好的角色扮演回复。请在一次回复里分两步完成：
+
+第一步【定位】：通读 <text_to_transform> 的正文，按下面给出的校正要求/指令，逐一找出【确实违规】的片段。每条都【原样引用】出问题的原文片段——所引片段必须【逐字出现在 <text_to_transform> 原文里】，不得从校正要求里的示例 / 禁用词表中抄词，也不得臆造原文没有的句子——并注明违反了哪一类、为什么。只列【明确】违规的；拿不准就不列（宁可放过，不可错杀）。一段回复通常只有少数几处明显问题；你若列出很多条，多半已在过度修正，回头只留最确凿的。一处问题都没有就留空。
+
+第二步【修正】：只改你在第一步列出的片段，其余一律【逐字保留】。尤其不要动：对白（一个字都不要改，除非某条要求明确点名对白）、已经发生的剧情与事件、时态与人称、角色既有的声音与文风。构成该角色 / 该篇独特声音的解读性旁白（如宫斗里点破言下之意），拿不准是不是 AI 腔就保留。哪条都没命中，就把原文原样返回。
+
+只输出下面两个区块，不要任何解释、寒暄或区块以外的话：
+<problems>
+- "（原文片段）" —— [类别] 原因
+</problems>
+<FixedReply>
+（修正后的完整回复正文，保持与原文相同的排版与分段；只动上面列出的片段）
+</FixedReply>`;
+
+// ✨ 手动模式系统提示（2026-06-26 手动/自动分家；CoT 版）。手动 = 在输入框直接说要改什么（自由发挥 / 引导式，
+// 仿 GuidedGenerations 的 Guided Swipe / Corrections）：按用户那一条要求改写最新回复，只改为满足要求所必需处、其余逐字
+// 保留、不做额外润色。先在 <fix_think> 走三步（① 复述要求 → ② 定位要改的段落 → ③ 下笔前自检），再出 <FixedReply>——【定位】把改动钉在
+// 用户要求的范围内（修「越界改了旁白」），【复述】把意图 / 范围讲清（修「软要求时原样返回」）。不产出 <problems>；
+// parseFixedReply 只取 <FixedReply>、忽略 <fix_think>。自动模式仍用 FIX_SYSTEM_PROMPT / FIX_SYSTEM_PROMPT_TIGHTEN。
+const FIX_SYSTEM_PROMPT_MANUAL = `你是一位资深中文小说编辑。<text_to_transform> 是一段已写好的角色扮演回复；用户会给出一条【修改要求】。用户明确提出了这条要求，你的任务就是【确实落实它、做出相应的改动】，让结果满足要求——但【只改为满足该要求所必需的地方】，其余一律【逐字保留】。
+
+先在 <fix_think> 里想清楚三步（简短即可），再给最终稿：
+1.【复述要求】用你自己的话说一遍：用户想修正这条回复的什么？（若要求限定了对象 / 范围，如「只改对话」，一并点明。）
+2.【定位目标】在原文里把与该要求相关的段落 / 句子【原样引用】出来——这些、且仅这些是你要改的；没被引用的部分一概不动。
+3.【自检】下笔前再核一遍：每处改动都落在②圈定的片段内吗？范围外是否一字未动？要求是否真的满足了？
+
+铁律：
+- 严格按用户的要求改；要求没提到的内容，一个字都不要动。
+- 保留原有的文风、角色声音、叙事人称与时态，以及已经发生的剧情、事件与其顺序（除非用户的要求明确要动这些）。
+- 不要顺手「润色」「优化」或精简用户没要求改的句子；不做任何额外改动。
+- 若附带了角色卡 / 世界书 / 剧情概要 / 前文，仅当作背景，帮你把要求落实准确（如对上设定、对齐前文）——不据此自行扩写或改写要求之外的内容。
+- 不要因为求稳或拿不准就拒绝改动 / 原样返回——拿不准时，也要按要求做出最小但到位的改动。仅当要求所指的改动【确实已存在于原文】时，才原样返回。
+- 保持与原文相同的排版与分段。
+
+按顺序输出下面两个区块，不要寒暄或区块以外的话：
+<fix_think>
+1. 复述要求：……
+2. 定位目标：……（原样引用要改的片段）
+3. 自检：……
+</fix_think>
+<FixedReply>
+（改写后的完整回复正文）
+</FixedReply>`;
+
+// ✨ 收紧版系统提示（「✂️ 收紧」toggle 开启时用，默认开）。仿 recast 的「先出完整稿、再精修」两道独立工序，但塞进一次调用：
+// 第一步【定位】→ 第二步【修正】先写出 <修正稿>（理科/伪精确/八股 catch 落定）→ 第三步【精修收紧】再在修正稿上自由删冗词/
+// 过度描写（收紧是最后一道，最狠），对白 + 情节 + 关键动作不动。<FixedReply> = 收紧后最终稿；parseFixedReply 忽略 <修正稿>。
+// 四种排序的对比 + revert 见 docs/superpowers/specs/2026-06-25-reply-fixer-tighten-variants.md（这是 v4；切 v3/v2 替换本常量即可）。
+const FIX_SYSTEM_PROMPT_TIGHTEN = `你是一位资深中文小说编辑，负责【校正】一段已写好的角色扮演回复。请在一次回复里分三步、像几道独立工序那样完成：
+
+第一步【定位】：通读 <text_to_transform> 的正文，按下面给出的校正要求/指令，逐一找出【确实违规】的片段。每条都【原样引用】出问题的原文片段——所引片段必须【逐字出现在 <text_to_transform> 原文里】，不得从校正要求里的示例 / 禁用词表中抄词，也不得臆造原文没有的句子——并注明违反了哪一类、为什么。只列【明确】违规的；拿不准就不列（宁可放过，不可错杀）。通常只有少数几处明显问题。一处都没有就留空。
+
+第二步【修正】：只改你在第一步列出的片段，其余一律【逐字保留】。尤其不要动：对白（除非某条要求明确点名对白）、已发生的剧情与事件、时态与人称、角色既有的声音与文风；构成该角色 / 该篇独特声音的解读性旁白拿不准就保留。把这版【完整】修正稿写进 <修正稿>…</修正稿>，它就是第三步的工作对象。
+
+第三步【精修收紧】：在 <修正稿> 的基础上，把文字收紧、读感变好——删掉没有信息量的填充词 / 废话 / 可有可无的修饰，收紧啰嗦冗长的句子，消除重复句式（尤其连续同开头的句子），过度铺陈的景物 / 神态 / 动作描写一笔带过，长短句交错、流动顺滑优先于短促碎句，去掉对白末尾多余的「等待」。【铁律】对白一个字都不改；情节、事件顺序、人物关键动作与反应不增不删；时态人称不变。<FixedReply> 输出的是【收紧后】的最终稿。
+
+只输出下面三个区块，不要任何解释、寒暄或区块以外的话：
+<problems>
+- "（原文片段）" —— [类别] 原因
+</problems>
+<修正稿>
+（完整的修正稿：只改上面列出的片段，其余逐字保留）
+</修正稿>
+<FixedReply>
+（最终稿：在修正稿基础上收紧读感）
+</FixedReply>`;
+
+// 校正目标模块（语料首版；冷代理另行调优）。t1=仅凭这条回复可执行；t2=需卡/前文/世界书作依据（见 compileFixTargets 门控）。
+const FIX_TARGET_MODULES = {
+    slop: { label: 'AI 八股 / 套话',
+        t1: '- 砍掉"不是A而是B"及变体（不是…是…/与其说…不如说…/并非…而是…）：删否定前半句，直接陈述。（仅限叙述层；对白里口语的「不是…就是…」「不是说…」是正常说话，别动。）\n'
+          + '- 删 AI 套路应激模板与 DeepSeek 高频部位词（指节泛白、弧度、指尖、嘴角、睫毛、喉结、纽扣、呼吸一滞、倒吸一口凉气、一丝 / 一抹 / 一些 / 一种、不易察觉、四肢百骸、如遭雷击、大脑空白、心如刀绞）：换成具体可见的动作或不写。\n'
+          + '- 删陈词滥调与 DS 滥用喻体（像石子投入心湖、湖面涟漪、拉满的弓、像触电般）；能直接写就别比喻。\n'
+          + '- 不强行升华收尾（"那一刻，他明白了…"）；停在动作或对白上。\n'
+          + '- 删作者预知腔（这预示着 / 后来才明白 / 命运早已安排）。\n'
+          + '- 不用语气 / 神态标签（冷冷地说、皱眉、嘴角上扬）；用行为、对白、可观察结果呈现情绪。\n'
+          + '- 别让单句反复成段（如「没有废话。没有说话。只有脚步。」）：把连续的单句短段并回流动的段落。',
+        t2: '- 删掉的套路应激反应，换成"该角色独有、且不与前文重复"的小动作（依据角色卡与前文）。' },
+    dialogue: { label: '对话机械 / 不自然',
+        t1: '- 对白后不要补语气描述（她语气平淡 / 冷冷地说 / 声音不大）：只留台词，至多配一个动作。\n'
+          + '- 台词口语化、带语气词（嘛/呗/啦/呀/吧），别翻译腔、书面腔、播报腔。\n'
+          + '- 不用旁白概括能直接说出的话（"他解释了几句"）——直接写台词。\n'
+          + '- 禁数据包 / 清单式汇报：以说话者关心的重点切入，带个人判断、省略、情绪。',
+        t2: '- 让台词贴合该角色已确立的声音（删掉说话人名也能认出是谁）。判断声音的依据优先级：示例对白 > 性格 > 描述 > 场景上下文。' },
+    precision: { label: '过度精确（数学论文腔）',
+        t1: '- 精确数字 / 测量换成描写（188 身高→高大的身躯；度数 / 厘米 / 罩杯→可感描述）。\n'
+          + '- 机械时间（"几秒过去了""一分钟后""零点几秒"）换成动作 / 环境暗示，或"呼吸之间 / 片刻 / 须臾"。\n'
+          + '- 禁逐帧计数（握紧三次拳头、敲两下）与微动作拆解（先收紧、再发白、又松开）：用整体动作或结果取代。\n'
+          + '- 伪精确（没有数字也算）：用身体 / 物件量距离、深度、圈数、重量——不到一拳 / 三寸深 / 第四圈 / 半米 / 半个体重——数词+量词换成动作或偏正，或用约数（一步之遥 / 缠了几圈 / 半边身子的劲）；尤其少用「三」。\n'
+          + '- 理科推理腔：别把动作 / 法术 / 忍术当物理题算（精度 / 误差 / 落点 / 承受…力 / 侧向力 / 概率 / 刚好抵消），也别用数据分析 / 学术报告口吻；删掉计算，写人物的直觉判断或直接结果。\n'
+          + '- 一句话准绳：正文要像小说片段，不像镜头分析、心理报告或写作规范展示。\n'
+          + '- 不影响表意时去掉精确量词。',
+        t2: '' },
+    magic: { label: '魔法被写成理科',
+        t1: '- 把闯入的理科词（分子/原子/能量守恒/参数/数据/算法/系统/信号/DNA/酶/神经元/电压…）换成奇幻措辞（魔力流动 / 元素激荡 / 符文 / 血脉 / 精魂 / 灵韵）。\n'
+          + '- 写超自然时写代价、限制与神秘，不写公式化机制；不要把法术 / 炼金写成现代化学或数据读数。\n'
+          + '- 比喻不用现代 / 理科喻体（钢铁、岩石、计算机、代码），用这个世界里的事物。\n'
+          + '（仅在奇幻 / 超自然设定下勾选此项。）',
+        t2: '- 用本卡世界书里真实存在的魔法 / 设定词汇与典故替换，而非泛化的"魔力 / 符文"（依据世界书）。' },
+    pacing: { label: '描写拖沓 / 流水账',
+        t1: '- 描写服务剧情推进、人物心理或核心矛盾；平庸过渡一笔带过，一个场景最多 1 个关键细节（以质代量）。\n'
+          + '- 默认"中景"写人，不扫脸 / 不扫手 / 不扫身体局部，落在行为与整体气场上，别近景逐一扫描眼睛 / 嘴角 / 手指 / 呼吸。\n'
+          + '- 删流水账动作、空间说明、环境穷举、说明文式心理剖析、气氛总结、动机解释、无意义过渡；克制总结气氛与解释动机的冲动。',
+        t2: '' },
+};
+const FIX_TARGETS_LEAD = '按以下校正目标，在 <text_to_transform> 里定位并修正问题（其余原样保留，没命中就原样返回）：';
+
+// 自动模式「成本门」用的禁词正则（高召回、低精度；命中只【授权】一次 LLM 调用，绝不强制改动）。
+// 禁词逐字取自语料 §7（实验/意识流/克劳德禁词表、测试禁用词表、双人成行 anatomy/sci-fi、TGbreak 词集），
+// 按目标键归并：slop=八股/套话、dialogue=对话机械、precision=过度精确、magic=魔法理科化、pacing=详略得当（解剖名词弱信号）。
+// 每条都是粗粒度的「字面量 OR」——每条回复都要跑，必须便宜。仅对【勾选】的目标运行（见 fixPreFilter）。
+const FIX_PREFILTER_PATTERNS = {
+    // 八股 / 套话：否定对仗模板 + 应激套路 + 前缀候选 + 全知作者腔 + 陈词比喻
+    slop: /不是.{0,12}(而是|，?是|却是)|没有.{0,10}(而是|只是|有的只是)|与其说.{0,12}不如说|并非.{0,12}而是|一(丝|抹|缕|阵|种|些)|不易察觉|微不可查|难以察觉|不易觉察|几不可察|不着痕迹|不容(置疑|置喙|拒绝|抗拒|质疑)|指节(泛|发)白|弧度|睫毛|嘴角|纽扣|喉结|呼吸一滞|倒吸一口(凉|冷)气|瞳孔(骤|猛)缩|四肢百骸|身子一僵|这(预示|意味)着|后来.{0,4}(才|方)(明白|知道|懂得)|命运早已|殊不知|却不知|石子.{0,6}(心湖|湖面)|拉满的弓|弓弦|像触电|如遭雷击|大脑(一?片)?空白|心如刀绞/,
+    // 对话机械 / 不自然：语气标签 + 旁白概括式对白
+    dialogue: /(语气|声音|声线|嗓音|语调|音色)(平淡|冰冷|低沉|沙哑|颤抖|淡漠)|(冷冷|淡淡|幽幽|轻轻|缓缓)地(说|道)|(解释了|表达了|争执了|安慰|交代了|说明了).{0,6}(几句|一?会儿|一番|一通)/,
+    // 过度精确（数学论文腔）：数字+单位 + 机械秒/分计时 + 罩杯 + 逐项计数
+    // 数字原子统一用 [0-9０-９] 兼容【全角数字】（中文 RP 常见，如「１８８厘米」）；它是 \d(=ASCII[0-9]) 的严格超集 → 不引入新的假阳。
+    precision: /[0-9０-９]+(\.[0-9０-９]+)?\s*(°C|℃|度|厘米|cm|毫米|mm|米|公斤|kg|斤|秒|分钟|小时)|[一二三四五六七八九十两0-9０-９]+\s*秒(钟)?(过去了|后|内)|[0-9０-９]+\s*分钟(过去了|后)|[0-9０-９]+\s*(身高|罩杯)|[A-Ea-e]\s*罩杯|第[一二三四五六七八九十0-9０-９]+(根|个|次|下|圈|步|拳)|[一二三四五六七八九十两半0-9０-９]+\s*(寸|拳|圈|步|指)|精度|误差|落点|侧向力|概率|承受.{0,4}力/,
+    // 魔法被写成理科（仅奇幻 / 超自然设定勾选）：闯入的理科词汇
+    magic: /分子|原子|离子|电子|量子|波长|频率|共振|催化剂|氧化|浓度|密度|能量|熵|电磁|细胞|基因|DNA|蛋白质|神经元|突触|代谢|免疫|参数|数据|算法|系统|模块|信号|功率|电压|电流|构型|拓扑|矿化|检测到|解析|逻辑|代码|功能模块|数据包|压力过载|神经信号/,
+    // 描写拖沓 / 详略失当（语料注：难正则化，仅作弱信号）：解剖 / 骨骼名词扫描
+    pacing: /脊椎|尾椎|下颌骨|颧骨|肩胛骨|肋骨|髋骨|桡骨|胫骨/,
+};
+
+// 纯函数：自动模式发 LLM 调用前的成本门。返回 false = 不值得调用（直接跳过该回复）。
+// 规则：文本字符数 < minChars（CJK 按【字符】数，用展开符）→ false；否则当 (a) 任一【勾选】目标的禁词
+// 命中文本，或 (b) constraints.knowledge / guardrails 非空（有约束总是值得查）→ true；都不满足 → false。
+// 入参可空（targets/constraints 缺省为 {}，minChars 缺省 0，text 缺省 ''）。可单测。
+function fixPreFilter(text, targets, constraints, minChars) {
+    const s = String(text || '');
+    const min = Number(minChars) || 0;
+    if ([...s].length < min) return false;
+    const t = targets || {};
+    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing']) {
+        if (!t[key]) continue;
+        const re = FIX_PREFILTER_PATTERNS[key];
+        if (re && re.test(s)) return true;
+    }
+    const con = constraints || {};
+    if (String(con.knowledge || '').trim()) return true;
+    if (String(con.guardrails || '').trim()) return true;
+    return false;
+}
+
+// 纯函数：校正稿相对原文是否「无实质改动」（仅空白差异）。去掉所有空白后逐字比较，相等 → true（视为无操作）。
+// 入参可空（按 '' 处理）。可单测。
+function fixNoOp(originalProse, fixedProse) {
+    const norm = (x) => String(x || '').replace(/\s+/g, '').trim();
+    return norm(originalProse) === norm(fixedProse);
+}
+
+// 纯函数：勾选目标 + 非空约束 → 校正指令。T1 总附；T2 仅当依据上下文在场（八股需卡+前文、对话需卡、魔法需世界书）。
+// 无目标且两约束皆空 → ''。可单测。
+function compileFixTargets(targets, ctx, constraints) {
+    const t = targets || {}, c = ctx || {}, con = constraints || {};
+    const gate = { slop: c.card && c.context, dialogue: c.card, magic: c.world };
+    const blocks = [];
+    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing']) {
+        if (!t[key]) continue;
+        const m = FIX_TARGET_MODULES[key];
+        if (!m) continue;
+        let body = '【' + m.label + '】\n' + m.t1;
+        if (m.t2 && gate[key]) body += '\n' + m.t2;
+        blocks.push(body);
+    }
+    const know = String(con.knowledge || '').trim();
+    if (know) blocks.push('【角色知识边界】把以下当成关于角色已知 / 未知的事实约束，逐句检查：任何角色用到边界外的信息，'
+        + '就改成 ta 表现出不知道 / 疑惑 / 需要去查，自然不生硬；无法判断是否违反就保留原样。\n约束：' + know);
+    const guard = String(con.guardrails || '').trim();
+    if (guard) blocks.push('【剧情护栏】遵守以下剧情规则，只纠正违反之处，不擅改其他剧情：\n' + guard);
+    if (!blocks.length) return '';
+    return FIX_TARGETS_LEAD + '\n\n' + blocks.join('\n\n');
+}
+
 // 强度三档：label 用于按钮、caption 用于界面说明、directive 拼进注入指令。
 // label 即指令的浓缩版——界面承诺与注入现实保持一致。
 const ADVISOR_INTENSITIES = {
@@ -332,7 +508,7 @@ const ENABLE_ARC = true;
 //   · 诊断按钮退回原始两态（关 ↔ 诊断，AUTO 不可达）；· 后台 message_received 监听器空转、绝不调用模型、
 //   · 绝不自动写 MVU；· 按钮的红色 AUTO 视觉不出现；· 若历史上有人开过 AUTO，下次点按钮会顺手清掉残留的
 //   s.autoDiagnoseEnabled。手动诊断模式完全不受影响。被 toggleDiagnose / updateDiagButtonVisual /
-//   maybeAutoDiagnose 实读（非装饰；constants-meta 元测试守它确实被引用，避免 ENABLE_ADVISOR_MODE 式空开关）。
+//   maybePostReply（回复后编排，经 postReplyPlan 读）实读（非装饰；constants-meta 元测试守它确实被引用，避免 ENABLE_ADVISOR_MODE 式空开关）。
 const ENABLE_AUTO_DIAGNOSE = true;
 
 // 自动诊断【写回 / 状态栏刷新】开关。auto 诊断走 Mvu.replaceMvuData，它【不发】VARIABLE_UPDATE_ENDED
@@ -389,6 +565,9 @@ const STAGE_B_EVOLVE_GOAL = true;
 // ACHIEVE_SYSTEM_PROMPT 实读（constants-meta 守）。
 const ENABLE_TYPE_ROTATION = false;
 
+// 真正的杀死开关：整套「校正」模式（mode #5，修复最新一条 AI 回复）。关 → 模式按钮 no-op、不可进入。
+const ENABLE_REPLY_FIX = true;
+
 // 各模式可在设置里查看 / 修改的系统提示词。剧情参谋（advisor）暂不纳入——它仍是
 // 实验性功能，提示词保持内置、不开放修改。
 // chat 沿用旧行为：提示词正文直接存在 `systemPrompt` 里。
@@ -434,6 +613,31 @@ const defaults = {
     personaId: 'plain',        // 说话人格皮肤；见 PERSONAS。普通 = 不叠加任何皮肤
     contextDepth: 30,          // last N non-system messages; -1 = entire chat; 0 = none
     includeCard: true,
+    // ✨ 校正模式 手动/自动 分家（2026-06-26）：两套独立设置（前缀 fixM_ / fixA_），同名设置互不串味
+    // （例如手动与自动各自的「前文条数」）。fixSettingsView = 「校正设置」面板当前显示哪套（纯 UI 视图偏好，
+    // 全局、不进 per-chat 覆盖）。归一由 resolveFixModeCfg 完成；校正代码一律读它的输出。
+    fixSettingsView: 'manual',
+    // 手动模式（在输入框直接说要改什么，像引导式 swipe）——一次性精修、质量优先，故默认带上丰富上下文。单稿、无目标。
+    fixM_contextDepth: -1,       // 加载前文条数；-1 = 全部，0 = 不带
+    fixM_includeCard: true,      // 带上角色卡
+    fixM_includeWorld: true,     // 带上当前激活世界书
+    fixM_includeSummary: true,   // 带上 📜剧情概要
+    // 自动模式（按目标校正按钮 + 每条新回复自动校正）——跑得勤，故默认精简省钱：只发回复正文 + 目标，按需才加上下文。
+    fixA_includeCard: false, fixA_includeContext: false, fixA_contextDepth: 30, fixA_includeWorld: false, fixA_includeSummary: false,
+    // 目标默认开（除魔法——仅奇幻设定才需要）：八股 / 对话 / 精确 / 详略。
+    fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: true, fixA_targetMagic: false, fixA_targetPacing: true,
+    fixA_knowledgeBoundary: '', fixA_guardrails: '',
+    fixA_keepTags: '', fixA_dropTags: '',
+    fixA_tighten: true,          // ✨ 收紧：自动校正后再精修一遍（删冗词废话 / 过度描写，读感更紧）；默认开
+    // ✨ 校正模式 Phase 3：自动校正（开启后每条新主聊天 AI 回复后台跑一次校正、自动应用为新 swipe；
+    // 经 maybePostReply 编排 → runAutoFix）。默认关。fixAutoMinChars = 成本门最小字符数（短回复不值得发调用，见
+    // fixPreFilter）。共享 settle 仍复用 autoDiagnoseDelayMs（不另加延时）。
+    autoFixEnabled: false,
+    fixAutoMinChars: 200,
+    // ✨ 校正模式 Phase 4：全局命名套餐库——把【当前生效】的校正配置存成一个具名套餐（如「硬核西幻」），
+    // 之后在任何聊天里一键加载到本聊天的 per-chat 覆盖。形如 [{ name, cfg:{<FIX_CFG_KEYS 子集> } }]。
+    // 全局（跨聊天）存设置；加载时写本聊天元数据（setFixCfg），不污染全局默认。
+    fixBundles: [],
     // 普通模式附带 MVU 实时变量状态（stat_data）。这是数值问题的唯一权威来源：
     // 没有它，模型会从剧情里的状态栏残影 / 自身想象中自信地编出数值（v1.14.6）。
     // 大状态卡 + 频繁提问会吃 token，可在设置里关掉（关掉后会改为如实拒答数值）。
@@ -444,20 +648,29 @@ const defaults = {
     chatIncludeWorld: true,
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
     // 自动诊断（用户功能请求）：开启后，每收到一条新的主聊天 AI 回复，就在后台跑一次诊断
-    // 并自动应用修复（见 maybeAutoDiagnose / runAutoDiagnose）。autoDiagnoseWarned 记录「不再
+    // 并自动应用修复（见 maybePostReply 编排 → runAutoDiagnose）。autoDiagnoseWarned 记录「不再
     // 提示」那次警告。delayMs 给 MVU 先处理完该回复的更新、再读取权威状态的缓冲时间。
     autoDiagnoseEnabled: false,
     autoDiagnoseWarned: false,
     autoDiagnoseDelayMs: 1200,
     worldInfoMode: 'off',      // 'off' | 'st' (constant + keyword) | 'all' (every entry)
+    // 读取隐藏楼层（用户功能请求）：默认关。开启后神谕读取主聊天时也纳入被 /hide 隐藏的消息。
+    // 只影响「神谕读取对话记录」的所有模式；不影响世界书关键词扫描，也不影响弧线节奏计数。
+    includeHiddenFloors: false,
     sendTemperature: true,     // include temperature in the request (some models reject it)
     showChatBarButton: false,  // 用户功能请求：在 ST 聊天输入栏（☰ 旁）放一个 🌙 快捷按钮一键开 / 关神谕窗口；默认关、设置里开
     // Lorebook mode: which book(s) to load. '' = every currently-active book;
     // otherwise the exact name of a single world book.
     lorebookTarget: '',
+    // 世界书多选（用户功能请求）：lorebook 模式要操作哪些书。[] = 当前激活的全部世界书；
+    // 否则就是选中的那几本书名。旧的标量 lorebookTarget 仅用于一次性迁移（见 getSettings）。
+    lorebookTargets: [],
     // Whether lorebook mode also feeds the recent story transcript as context
     // (off by default — lorebook mode focuses on the books, not the RP).
     lorebookIncludeStory: false,
+    // 用户功能请求：世界书选条目器里展示每条条目的内容预览（一行短摘要）。默认关——开后
+    // 整列每条标题下多一行 entryPreviewText(content)；纯展示，不影响喂给模型的内容。
+    lbShowEntryPreview: false,
     // Whether lorebook mode runs THROUGH the user's curated chat-completion preset
     // (the lore-manager directive is layered on top). Off by default — only useful
     // when the model needs the preset's jailbreak to do the edit. The preset's
@@ -470,6 +683,9 @@ const defaults = {
     // Whether advisor mode runs THROUGH the curated preset (directive layered on
     // top, RP markers skipped) — same opt-in pattern as lorebookUsePreset.
     advisorUsePreset: false,
+    // ✨ 校正模式（手动 + 自动）是否经【自定义补全预设】发送——仅破限 / 越狱用（同 advisorUsePreset 模式：保留预设的
+    // 文本块 + 角色、跳过 RP 内容标记，把校正调用塞到 chatHistory 位）。默认关；全局（不进 per-chat 覆盖）。
+    fixM_usePreset: false, fixA_usePreset: false,
     // Floating plan strip position (when the oracle window is closed while a
     // plan is steering). null = default top-right docking until first drag.
     planFloatLeft: null,
@@ -514,6 +730,21 @@ let lbBookNames = [];       // names of the books included in the current contex
 // always derived from it at registration time, so clearing the metadata provably
 // kills the steering.
 let advisorMode = false;
+// Reply-fix mode state (校正). Plain on/off mode like lorebook — no AUTO sub-state.
+let fixMode = false;
+// 退出某个子模式（世界书 / 参谋 / 校正）时回到「进来之前」的模式，而不是一律掉回普通聊天。
+// 用户功能请求：自动诊断 → 开世界书 → 退世界书，应回到诊断而非普通聊天。'chat' = 默认。
+let priorOracleMode = 'chat';
+let fixTargetIdx = -1;        // 待校正回复在 ctx.chat 中的下标（捕获时记下）
+let fixOriginalReply = '';    // 待校正回复的【完整】原文（含机制块，应用时再接回）
+let fixTargetProse = '';      // 剥掉机制块 + CoT 后的正文（喂给校正模型）
+let fixCardBlock = '';     // 校正：角色卡块（送 prompt 前在异步 prep 里填）
+let fixContextBlock = '';  // 校正：前文上下文块
+let fixWorldBlock = '';    // 校正：激活世界书块
+let fixSummaryBlock = '';  // 校正：📜剧情概要块（手动默认带 / 自动可选；buildFixEnvelope 包成 <story_summary>）
+let fixExtraKeep = '';
+let fixTightenActive = true;   // ✨ 收紧 toggle 生效值（captureFixContext 经 resolveFixModeCfg 设：手动恒 false，自动按 fixA_tighten）；on → buildFixPrompt 用 FIX_SYSTEM_PROMPT_TIGHTEN
+let fixActiveMode = 'manual';  // 当前校正调用是哪套（captureFixContext 设）：'manual' → buildFixPrompt 用 FIX_SYSTEM_PROMPT_MANUAL；'auto' → FIX_SYSTEM_PROMPT(_TIGHTEN)
 let advStatData = '';       // stringified current MVU stat_data for advisor sends
                             // (computed fresh in generateReply, '' when no MVU)
 let chatStatData = '';      // same, for NORMAL mode (gated by s.chatIncludeStat)
@@ -563,16 +794,49 @@ async function uiConfirm(message) {
     return typeof confirm === 'function' ? confirm(message) : true;
 }
 
+// 统一文本输入弹窗（同 uiConfirm 风格）：优先 ST 主题化 INPUT 弹窗，不可用时回退原生 prompt。
+// 返回 Promise<string|null>：取消 / 关闭 → null（ST 取消回 false，统一收敛成 null）。套餐「保存为…」起名用。
+async function uiPrompt(message, defaultValue = '') {
+    try {
+        const ctx = getCtx();
+        if (ctx && typeof ctx.callGenericPopup === 'function' && ctx.POPUP_TYPE) {
+            const result = await ctx.callGenericPopup(message, ctx.POPUP_TYPE.INPUT, defaultValue, {
+                okButton: '确定',
+                cancelButton: '取消',
+            });
+            // INPUT：确定回输入字符串（可能空串）；取消 / 关闭回 false / null。
+            return (result === false || result == null) ? null : String(result);
+        }
+    } catch (e) {
+        console.warn('[Story Oracle] uiPrompt 弹窗失败，回退原生 prompt：', e);
+    }
+    return typeof prompt === 'function' ? prompt(message, defaultValue) : null;
+}
+
 function getSettings() {
     const ctx = getCtx();
     if (!ctx.extensionSettings[MODULE] || typeof ctx.extensionSettings[MODULE] !== 'object') {
         ctx.extensionSettings[MODULE] = {};
     }
     const s = ctx.extensionSettings[MODULE];
+    // 一次性迁移（须在填默认值之前——否则下面的默认填充会先把分家键设成 false，迁移就判不出旧值）：
+    // 旧版单个全局 fixUsePreset（手动 + 自动共用）→ 手动/自动分家的 fixM_/fixA_usePreset；删旧键，幂等。
+    if (s.fixUsePreset !== undefined) {
+        if (s.fixM_usePreset === undefined) s.fixM_usePreset = s.fixUsePreset;
+        if (s.fixA_usePreset === undefined) s.fixA_usePreset = s.fixUsePreset;
+        delete s.fixUsePreset;
+    }
     // Fill in any missing defaults IN PLACE so the reference stays stable.
     // (Rebuilding the object here would orphan the values written by event handlers.)
     for (const [k, v] of Object.entries(defaults)) {
         if (!(k in s)) s[k] = v;
+    }
+    // 一次性迁移：旧版单选 lorebookTarget（标量）→ 新版多选 lorebookTargets（数组）。
+    // 迁移后清空标量，使本块幂等、不会在用户清空多选（= 全部激活）后又被旧值重新种回。
+    if (typeof s.lorebookTarget === 'string' && s.lorebookTarget &&
+        (!Array.isArray(s.lorebookTargets) || s.lorebookTargets.length === 0)) {
+        s.lorebookTargets = [s.lorebookTarget];
+        s.lorebookTarget = '';
     }
     return s;
 }
@@ -597,11 +861,11 @@ function init() {
         if (ctx.eventSource && typeof ctx.eventSource.on === 'function') {
             ctx.eventSource.on(et.CHAT_CHANGED || 'chat_id_changed', onChatChanged);
             ctx.eventSource.on(et.MESSAGE_RECEIVED || 'message_received', checkPlanReminder);
-            // 用户功能请求：自动诊断 —— 每条新回复后台诊断 + 自动修复（仅在自动模式开启时动作）。
+            // 回复后编排：每条新 AI 回复在共享锁下先自动校正、后自动诊断（各自仅在其自动模式开启时动作）。
             // 必须「即发即忘」：ST 的 eventSource.emit 会 await 监听器，直接挂上 async 的
-            // maybeAutoDiagnose 会让每条回复都卡住整个诊断往返。包一层、不把 promise 交回去。
+            // maybePostReply 会让每条回复都卡住整个校正 + 诊断往返。包一层、不把 promise 交回去。
             ctx.eventSource.on(et.MESSAGE_RECEIVED || 'message_received', (id) => {
-                Promise.resolve(maybeAutoDiagnose(id)).catch((e) => console.warn('[Story Oracle] 自动诊断调度失败：', e));
+                Promise.resolve(maybePostReply(id)).catch((e) => console.warn('[Story Oracle] 回复后编排调度失败：', e));
             });
         }
     } catch (e) {
@@ -695,6 +959,12 @@ async function getWiScanBudget() {
  * never mentioned them — used by the arc calls to surface lore about the arc's
  * own subject (throughline / waypoints / direction; see arcScanText).
  */
+// 把 worldInfoMode 设置映射成 buildWorldInfo() 的模式，供「要带世界书」的调用点用（'off' 由调用方门控）。
+// 'char' = 仅角色 / 对话相关世界书（排除全局 + 人设）。
+function wiContextMode(s) {
+    const m = s.worldInfoMode;
+    return m === 'all' ? 'all' : (m === 'char' ? 'char' : 'st');
+}
 async function buildWorldInfo(forceMode, extraScanText) {
     const ctx = getCtx();
     const s = getSettings();
@@ -712,6 +982,25 @@ async function buildWorldInfo(forceMode, extraScanText) {
                 .join('\n\n');
             // Mechanism rules are Diagnose-only; see stripMvuRuleContents.
             return await stripMvuRuleContents(allBlock);
+        }
+
+        if (mode === 'char') {
+            // 仅角色 / 对话相关世界书：跑 ST 的真实扫描拿到【当前被激活】的条目（蓝灯 + 命中绿灯），
+            // 再按书名筛到角色 + 对话书集合（全局 / 人设书不在集合里 → 自然排除）。关键词匹配仍由 ST 决定。
+            const mod = await getWiEditApi();
+            const bookSet = new Set(await getCharChatBookNames());
+            if (!mod || !bookSet.size) return '';
+            const active = await getActiveScanUids();   // { 书名: Set<uid> }
+            const blocks = [];
+            for (const name of Object.keys(active)) {
+                if (!bookSet.has(name)) continue;
+                let data; try { data = await mod.loadWorldInfo(name); } catch (e) { continue; }
+                const entries = Object.values((data && data.entries) || {})
+                    .filter((e) => e && active[name].has(Number(e.uid)) && !e.disable && typeof e.content === 'string' && e.content.trim())
+                    .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)));
+                if (entries.length) blocks.push(entries.map((e) => e.content.trim()).join('\n\n'));
+            }
+            return await stripMvuRuleContents(blocks.join('\n\n').trim());
         }
 
         // 'st' mode — replicate ST's scan input.
@@ -784,6 +1073,10 @@ async function buildWorldInfoSplit(forceMode) {
 
     if (mode === 'all') {
         return { before: await buildWorldInfo('all'), after: '' };
+    }
+
+    if (mode === 'char') {
+        return { before: await buildWorldInfo('char'), after: '' };
     }
 
     try {
@@ -1055,6 +1348,65 @@ async function getAllBookNames() {
     return [...names].filter(Boolean);
 }
 
+// 「角色 + 对话相关」书名（纯）：卡内嵌 ∪ charLore 绑定 ∪ 对话绑定，再 ∩ 现存书；去重、保序。
+// 全局多选 / 人设书靠调用方根本不传进来而排除。
+function pickCharChatBooks(cardWorld, charLoreExtra, chatWorldNames, allBookNames) {
+    const all = new Set(allBookNames || []);
+    const out = [];
+    const seen = new Set();
+    const add = (n) => { if (n && all.has(n) && !seen.has(n)) { seen.add(n); out.push(n); } };
+    add(cardWorld);
+    (Array.isArray(charLoreExtra) ? charLoreExtra : []).forEach(add);
+    (Array.isArray(chatWorldNames) ? chatWorldNames : []).forEach(add);
+    return out;
+}
+
+// 从 ST 收集原始来源、归一化，交给纯选择器。组聊 / 无角色 / 老版本 ST 时各来源自然退化为空。
+async function getCharChatBookNames() {
+    const ctx = getCtx();
+    const mod = await loadWorldInfoModule();
+    let cardWorld = null;
+    const charLoreExtra = [];
+    const chatWorldNames = [];
+    try {
+        const chid = ctx.characterId;
+        const ch = (ctx.characters || [])[chid];
+        cardWorld = (ch && ch.data && ch.data.extensions && ch.data.extensions.world) || null;
+        const charLore = mod && mod.world_info ? mod.world_info.charLore : null;
+        if (Array.isArray(charLore) && ch) {
+            const fname = typeof ctx.getCharaFilename === 'function'
+                ? ctx.getCharaFilename(chid)
+                : (ch.avatar ? String(ch.avatar).replace(/\.[^.]+$/, '') : null);
+            const rec = fname ? charLore.find((e) => e && e.name === fname) : null;
+            if (rec && Array.isArray(rec.extraBooks)) rec.extraBooks.forEach((b) => b && charLoreExtra.push(b));
+        }
+    } catch (e) { /* group chat / no character */ }
+    try {
+        const cw = (ctx.chatMetadata || {}).world_info;
+        if (typeof cw === 'string') chatWorldNames.push(cw);
+        else if (Array.isArray(cw)) cw.forEach((b) => b && chatWorldNames.push(b));
+        else if (cw && typeof cw === 'object') {
+            if (cw.primary) chatWorldNames.push(cw.primary);
+            if (Array.isArray(cw.additional)) cw.additional.forEach((b) => b && chatWorldNames.push(b));
+        }
+    } catch (e) { /* no chat-bound book */ }
+    const all = await getAllBookNames();
+    return pickCharChatBooks(cardWorld, charLoreExtra, chatWorldNames, all);
+}
+
+// 世界书多选：把「选中集合」解析成实际操作的书名列表。空 = 跟随当前激活（动态）；
+// 否则取选中里仍存在于磁盘的那些（去重、保序）。纯函数，便于单测。
+function resolveLbTargetNames(targets, allBookNames, activeBookNames) {
+    if (!Array.isArray(targets) || targets.length === 0) return (activeBookNames || []).slice();
+    const all = new Set(allBookNames || []);
+    const out = [];
+    const seen = new Set();
+    for (const n of targets) {
+        if (n && all.has(n) && !seen.has(n)) { seen.add(n); out.push(n); }
+    }
+    return out;
+}
+
 const LB_POSITION_LABEL = {
     0: '角色定义之前',
     1: '角色定义之后',
@@ -1104,20 +1456,13 @@ async function buildLorebookContext() {
         return;
     }
 
-    let names;
-    if (s.lorebookTarget) {
-        const all = await getAllBookNames();
-        names = all.includes(s.lorebookTarget) ? [s.lorebookTarget] : [];
-        if (!names.length) {
-            lbContextText = `（找不到名为「${s.lorebookTarget}」的世界书。请在上方重新选择，或点刷新。）`;
-            return;
-        }
-    } else {
-        names = await getActiveBookNames();
-        if (!names.length) {
-            lbContextText = '（当前没有激活任何世界书。可在上方下拉里直接选择某一本来编辑。）';
-            return;
-        }
+    const [allNames, activeNames] = await Promise.all([getAllBookNames(), getActiveBookNames()]);
+    const names = resolveLbTargetNames(s.lorebookTargets, allNames, activeNames);
+    if (!names.length) {
+        lbContextText = (Array.isArray(s.lorebookTargets) && s.lorebookTargets.length)
+            ? '（选中的世界书都找不到了。请在上方重新勾选，或点刷新。）'
+            : '（当前没有激活任何世界书。可在上方勾选某一本来编辑。）';
+        return;
     }
 
     const ctx = getCtx();
@@ -1547,6 +1892,10 @@ const SUMMARY_META_KEY = MODULE + '_summary';
 // 用户功能请求：诊断模式「精选世界书条目」按【当前聊天】持久化（与 plan/convo/summary 同风格）。
 //   形状：{ use:bool（L1 主开关）, hybrid:bool（L2 混合）, target:''（书目标，''=全部激活）, sel:{ [书名]:uid[] } }
 const DIAG_WI_META_KEY = MODULE + '_diagwi';
+// ✨ 校正模式 Phase 4：把校正配置（目标 / 约束 / 上下文开关 / 自动）按【当前聊天】持久化——每个聊天记住
+// 自己的校正设定（chat A 的目标不会渗进 chat B）。形状 = 只存被覆盖的 fix* 键（其余现场回退全局 getSettings 默认）；
+// 没有任何覆盖时删键，保持元数据干净（同 setDiagWiMeta 风格）。生效配置经 getEffectiveFixCfg 合并、是校正代码的唯一读取入口。
+const FIX_CFG_META_KEY = MODULE + '_fixcfg';
 
 function getChatMetadataSafe() {
     try {
@@ -1692,6 +2041,133 @@ function setDiagWiMeta(obj) {
 function persistDiagSel() {
     const cur = getDiagWiMeta();
     setDiagWiMeta({ use: cur.use, hybrid: cur.hybrid, target: cur.target, sel: serializeDiagSel(diagEntrySel) });
+}
+
+/* ------------------------------------------------------------------ *
+ * ✨ 校正模式 Phase 4：校正配置按【当前聊天】持久化（同 plan/convo/summary/diagwi 风格）。
+ * 元数据只存被【显式覆盖】的 fix* 键（getEffectiveFixCfg 现场回退到全局 getSettings 默认）；空 = 删键。
+ * getEffectiveFixCfg 是纯函数（合并全局 s + 本聊天 md），是校正代码读取配置的唯一入口。
+ * ------------------------------------------------------------------ */
+// 迁到 per-chat 的校正键（全局 getSettings 默认仍是回退值）。autoDiagnoseEnabled 不在此列——自动诊断不迁移、仍走全局。
+const FIX_CFG_KEYS = [
+    // 手动模式（per-chat 可覆盖）
+    'fixM_contextDepth', 'fixM_includeCard', 'fixM_includeWorld', 'fixM_includeSummary',
+    // 自动模式（per-chat 可覆盖）
+    'fixA_includeCard', 'fixA_includeContext', 'fixA_contextDepth', 'fixA_includeWorld', 'fixA_includeSummary',
+    'fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing',
+    'fixA_knowledgeBoundary', 'fixA_guardrails', 'fixA_keepTags', 'fixA_dropTags', 'fixA_tighten',
+    'autoFixEnabled', 'fixAutoMinChars',
+];
+
+// 纯函数：把全局设置 s 与本聊天元数据 md（或 null/undefined）合并成生效校正配置。
+// 每个 fix* 键：md 用 hasOwnProperty 显式拥有该键就取 md 的值（尊重显式 false / 0 / ''），否则回退 s。
+// 校正代码一律读这里返回的对象，绝不直读 s.fix*（否则 per-chat 覆盖会被绕过——这正是本任务要根治的 bug）。
+function getEffectiveFixCfg(s, md) {
+    const out = {};
+    const g = s || {};
+    const m = (md && typeof md === 'object') ? md : null;
+    for (const k of FIX_CFG_KEYS) {
+        out[k] = (m && Object.prototype.hasOwnProperty.call(m, k)) ? m[k] : g[k];
+    }
+    return out;
+}
+
+// ✨ 校正：「经自定义补全预设发送」开关按模式取值——手动/自动分家后各自独立（用户功能请求 2026-06-27）。
+// 全局键 fixM_usePreset / fixA_usePreset；非 'auto' 一律看手动键；s 缺失容错为 false。纯判定，便于单测。
+function fixUsePresetFor(s, mode) {
+    return !!(s && s[mode === 'auto' ? 'fixA_usePreset' : 'fixM_usePreset']);
+}
+
+// 纯函数：把 getEffectiveFixCfg 的【原始 fixM_*/fixA_* 键】归一成校正代码消费的统一形状（按 mode 取对应一套）。
+// 校正代码（captureFixContext / runFixByTargets / runAutoFix）一律读这里的输出，不直读 fixM_/fixA_ 原始键——
+// 这样手动 / 自动两套设置彻底独立（同名设置互不串味），且收紧/目标的「仅自动」规则集中在此一处。
+// 手动：上下文按 fixM_*（depth=0 视作不带前文）、永不收紧、无目标 / 约束 / 排除区（纯指令驱动，省时间）。
+// 自动：上下文 / 目标 / 约束 / 排除区 / 收紧全按 fixA_*（收紧默认开，显式 false 才关）。可单测。
+function resolveFixModeCfg(e, mode) {
+    const c = e || {};
+    if (mode === 'auto') {
+        return {
+            includeCard: !!c.fixA_includeCard, includeContext: !!c.fixA_includeContext,
+            contextDepth: (c.fixA_contextDepth | 0) || 30, includeWorld: !!c.fixA_includeWorld,
+            includeSummary: !!c.fixA_includeSummary, tighten: c.fixA_tighten !== false,
+            targets: {
+                slop: !!c.fixA_targetSlop, dialogue: !!c.fixA_targetDialogue, precision: !!c.fixA_targetPrecision,
+                magic: !!c.fixA_targetMagic, pacing: !!c.fixA_targetPacing,
+            },
+            knowledge: c.fixA_knowledgeBoundary || '', guardrails: c.fixA_guardrails || '',
+            keepTags: c.fixA_keepTags || '', dropTags: c.fixA_dropTags || '',
+        };
+    }
+    // 手动：depth 显式 0 = 不带前文；其余非正数 / 缺省 = -1（全部）。
+    const depth = (c.fixM_contextDepth === 0) ? 0 : ((c.fixM_contextDepth | 0) || -1);
+    return {
+        includeCard: !!c.fixM_includeCard, includeContext: depth !== 0, contextDepth: depth,
+        includeWorld: !!c.fixM_includeWorld, includeSummary: !!c.fixM_includeSummary, tighten: false,
+        targets: { slop: false, dialogue: false, precision: false, magic: false, pacing: false },
+        knowledge: '', guardrails: '', keepTags: '', dropTags: '',
+    };
+}
+
+// 读本聊天保存的校正覆盖（始终回对象，可能为空 {}）。喂给 getEffectiveFixCfg 当 md。
+function getFixCfg() {
+    const md = getChatMetadataSafe();
+    return (md && md[FIX_CFG_META_KEY]) || {};
+}
+
+// 把 patch 合并进本聊天的校正覆盖并写回。合并后为空 = 删键（保持元数据干净，同 setDiagWiMeta）。
+// 只存被覆盖的 fix* 键——读取时 getEffectiveFixCfg 现场回退全局默认，故无需在此存全量。
+function setFixCfg(patch) {
+    const md = getChatMetadataSafe();
+    if (!md) return false;
+    const cur = (md[FIX_CFG_META_KEY] && typeof md[FIX_CFG_META_KEY] === 'object') ? md[FIX_CFG_META_KEY] : {};
+    const merged = { ...cur, ...(patch || {}) };
+    if (Object.keys(merged).length) md[FIX_CFG_META_KEY] = merged;
+    else delete md[FIX_CFG_META_KEY];
+    saveChatMetadata();
+    return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * ✨ 校正模式 Phase 4：全局命名套餐库（save / load / delete）。
+ * 套餐存全局设置（getSettings().fixBundles，跨聊天可用）；加载时把套餐里的配置写进【本聊天】
+ * 的 per-chat 覆盖（setFixCfg）。快照只取 FIX_CFG_KEYS 的生效值（getEffectiveFixCfg 合并后），
+ * 故套餐里永远是「当前用户实际看到的那套配置」，与 per-chat 覆盖机制一致。
+ * ------------------------------------------------------------------ */
+// 把【当前生效】校正配置快照成一个具名套餐，存进全局 fixBundles（同名则替换）。name 必填、去空白。
+function saveFixBundle(name) {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return false;
+    const eff = getEffectiveFixCfg(getSettings(), getFixCfg());
+    const cfg = {};
+    for (const k of FIX_CFG_KEYS) cfg[k] = eff[k];
+    const s = getSettings();
+    if (!Array.isArray(s.fixBundles)) s.fixBundles = [];
+    const idx = s.fixBundles.findIndex((b) => b && b.name === trimmed);
+    if (idx >= 0) s.fixBundles[idx] = { name: trimmed, cfg };
+    else s.fixBundles.push({ name: trimmed, cfg });
+    save();
+    return true;
+}
+
+// 把某个具名套餐加载进【本聊天】的校正覆盖（setFixCfg）并回填控件（loadFixCfgForChat）。
+function loadFixBundle(name) {
+    const s = getSettings();
+    const bundle = (Array.isArray(s.fixBundles) ? s.fixBundles : []).find((b) => b && b.name === name);
+    if (!bundle || !bundle.cfg) return false;
+    setFixCfg(bundle.cfg);   // 写本聊天 per-chat 覆盖（全局默认仍是回退）
+    loadFixCfgForChat();     // 重新种子校正控件，UI 立刻反映
+    return true;
+}
+
+// 从全局 fixBundles 删除一个具名套餐。
+function deleteFixBundle(name) {
+    const s = getSettings();
+    if (!Array.isArray(s.fixBundles)) return false;
+    const before = s.fixBundles.length;
+    s.fixBundles = s.fixBundles.filter((b) => !(b && b.name === name));
+    if (s.fixBundles.length === before) return false;
+    save();
+    return true;
 }
 
 // 纯函数：选中的条目里是否含至少一条 [mvu_update] 变量规则条目（按 comment 匹配，复用 MVU_UPDATE_TAG）。
@@ -1894,6 +2370,7 @@ function onChatChanged() {
     loadConvoForChat();   // 用户功能请求：把本聊天保存的侧聊历史载入窗口（per-chat 持久化）
     refreshSummaryUI();   // 用户功能请求：刷新本聊天的运行概要编辑器
     loadDiagSelForChat(); // 用户功能请求：载入本聊天的诊断「精选世界书条目」选择
+    loadFixCfgForChat();  // ✨ 校正模式 Phase 4：把校正控件重置成本聊天的生效配置（per-chat 持久化）
 }
 
 /* ------------------------------------------------------------------ *
@@ -2719,7 +3196,7 @@ async function callCompiler(arc, waypoint, opts) {
     let statStr = '';
     try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
     let wiStr = '';
-    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(wiContextMode(s), arcScanText(arc)); } catch (e) { /* no WI */ } }
     const messages = buildCompilerMessages(arc, waypoint, opts, statStr, wiStr);
     const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);
     return await arcCall(messages, maxTokens);   // 护栏 + 实时缓冲 + 流式分发
@@ -2882,7 +3359,7 @@ async function callWaypointDrafter(spec) {
         let statStr = '';
         try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
         let wiStr = '';
-        try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(spec)); } catch (e) { /* no WI */ }
+        try { wiStr = await buildWorldInfo(wiContextMode(s), arcScanText(spec)); } catch (e) { /* no WI */ }
         extra = fullContextBlocks(ctx, s, wiStr);   // 角色卡 + 世界书
         if (statStr) extra.push('=== 当前变量状态（剧情硬事实，骨架不得与之矛盾）===\n' + statStr);
         const transcript = buildTranscript(ctx, { ...s, contextDepth: -1 });
@@ -2942,7 +3419,7 @@ async function checkBeatFulfilled(arc) {
     let statStr = '';
     try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
     let wiStr = '';
-    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(wiContextMode(s), arcScanText(arc)); } catch (e) { /* no WI */ } }
     const messages = buildCheckMessages(arc, beat, statStr, wiStr);
     const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);   // 核验也跑判定 CoT，同享 8192 预算
     let text = '';
@@ -3062,7 +3539,7 @@ async function callAchieve(arc, nextWp) {
     let statStr = '';
     try { const st = await getMvuStatData(); if (st) statStr = JSON.stringify(st, null, 2); } catch (e) { /* no MVU */ }
     let wiStr = '';
-    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st', arcScanText(arc)); } catch (e) { /* no WI */ } }
+    if (COMPILER_FULL_CONTEXT) { try { wiStr = await buildWorldInfo(wiContextMode(s), arcScanText(arc)); } catch (e) { /* no WI */ } }
     const messages = buildAchieveMessages(arc, nextWp, statStr, wiStr);
     const maxTokens = Math.max(Number(s.maxTokens) || 0, ARC_CALL_MAX_TOKENS);
     return await arcCall(messages, maxTokens);   // 护栏 + 实时缓冲 + 流式分发
@@ -3357,9 +3834,188 @@ function getLatestAiMessageText() {
     return getLatestAiMessage().text;
 }
 
+// 纯函数（数据变更）：把 text 作为【新 swipe】追加到消息 m 上并切到它——非破坏性，原 m.mes 留在
+// swipe 0。若消息还没有 swipes 数组，先用当前 m.mes 播种 swipe 0。info（swipe 元数据）由调用方传入，
+// 便于纯函数确定性单测。返回新的 swipe_id；m 无效返回 -1。可单测。
+function addSwipeToMessage(m, text, info) {
+    if (!m || typeof m !== 'object') return -1;
+    if (!Array.isArray(m.swipes) || m.swipes.length === 0) {
+        m.swipes = [typeof m.mes === 'string' ? m.mes : ''];
+        m.swipe_info = [Array.isArray(m.swipe_info) && m.swipe_info[0] ? m.swipe_info[0] : {}];
+        m.swipe_id = 0;
+    }
+    if (!Array.isArray(m.swipe_info)) m.swipe_info = m.swipes.map(() => ({}));
+    m.swipes.push(String(text == null ? '' : text));
+    m.swipe_info.push(info || {});
+    m.swipe_id = m.swipes.length - 1;
+    m.mes = m.swipes[m.swipe_id];
+    return m.swipe_id;
+}
+
 function extractUpdateBlock(text) {
     const m = (text || '').match(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/i);
     return m ? m[0] : '';
+}
+
+// 纯函数：把"排除标签"输入解析成标签名数组。每行 / 逗号分隔一项；项可写成开标签 <konatan_planning~> 或裸名 konatan_planning。
+function parseExcludeTagNames(str) {
+    return String(str || '').split(/[,\n]+/)
+        .map((s) => { const m = s.trim().replace(/^<\/?/, '').match(/^[A-Za-z0-9_一-龥-]+/); return m ? m[0] : ''; })
+        .filter(Boolean);
+}
+
+// 纯函数：从 reply 里抠出用户指定的"排除区"。keep 标签的 <tag>…</tag> 块（含截断未闭合）抠出后收进 keep 串（原样放回用）；
+// drop 标签的块抠出后丢弃。返回 { prose, keep } —— prose 送去校正，keep 是要原样接回的串。可单测。
+function extractExcludedSections(reply, keepStr, dropStr) {
+    let prose = String(reply || '');
+    const keepParts = [];
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nb = '(?![A-Za-z0-9_\\u4e00-\\u9fa5-])';   // 标签名后不得再跟名字字符（避免 <plan> 误匹配 <planning>；兼容中文标签）
+    const pull = (name, collect) => {
+        const n = esc(name);
+        prose = prose.replace(new RegExp('<' + n + nb + '[^>]*>[\\s\\S]*?<\\/' + n + nb + '[^>]*>', 'gi'), (m) => { if (collect) keepParts.push(m); return ''; });
+        prose = prose.replace(new RegExp('<' + n + nb + '[^>]*>[\\s\\S]*$', 'i'), (m) => { if (collect) keepParts.push(m); return ''; });
+    };
+    for (const name of parseExcludeTagNames(keepStr)) pull(name, true);
+    for (const name of parseExcludeTagNames(dropStr)) pull(name, false);
+    prose = prose.replace(/\n{3,}/g, '\n\n').trim();
+    return { prose, keep: keepParts.join('\n\n') };
+}
+
+/* ------------------------------------------------------------------ *
+ * ✨ 校正模式 Phase 4 —— 「看改动」卡片背后的前后差异引擎。
+ * 纯函数，无时钟、无 DOM、确定。replies 很短，O(n·m) DP 足矣。
+ * ------------------------------------------------------------------ */
+
+// 纯函数：把文本切成适合做差异的 token。目标：一句中文逐字 diff，但拉丁词整块不被拆成单字母。
+// 规则：① CJK 单字（含常见 CJK 标点 / 全角区）各自成一个 token；② ASCII/拉丁【字母+数字】连续串
+// 合成一个 token；③ 每段空白（含全角空格交给 CJK 规则）合成一个 token；④ 其余任意单字符（标点 /
+// 符号）各自成一个 token。把返回的 token 顺序拼接必须【逐字还原】原文。nullish 安全。
+function tokenizeForDiff(text) {
+    const s = String(text == null ? '' : text);
+    const tokens = [];
+    // CJK：统一表意文字 + 扩展 A + 兼容表意 + CJK 符号标点(　-〿) + 全角 / 半角形式(＀-￯)。
+    // 单字成 token = 逐字 diff 的关键。
+    const isCJK = (cp) =>
+        (cp >= 0x4e00 && cp <= 0x9fff) ||   // CJK Unified Ideographs（一-鿿）
+        (cp >= 0x3400 && cp <= 0x4dbf) ||   // CJK Ext-A
+        (cp >= 0xf900 && cp <= 0xfaff) ||   // CJK Compatibility Ideographs
+        (cp >= 0x3000 && cp <= 0x303f) ||   // CJK Symbols & Punctuation（　-〿，含。、「」等）
+        (cp >= 0xff00 && cp <= 0xffef);     // Halfwidth & Fullwidth Forms（＀-￯，含全角！？，等）
+    // 拉丁词字符：ASCII 字母 + 数字（连成一个整词，不逐字母 diff）。
+    const isWord = (cp) =>
+        (cp >= 0x30 && cp <= 0x39) ||       // 0-9
+        (cp >= 0x41 && cp <= 0x5a) ||       // A-Z
+        (cp >= 0x61 && cp <= 0x7a);         // a-z
+    const isSpace = (ch) => /\s/.test(ch);
+
+    let i = 0;
+    while (i < s.length) {
+        const cp = s.codePointAt(i);
+        const ch = String.fromCodePoint(cp);
+        const step = ch.length;             // 代理对占 2 个 UTF-16 单元
+        if (isCJK(cp)) {                     // ① CJK 单字成 token
+            tokens.push(ch);
+            i += step;
+        } else if (isWord(cp)) {             // ② 拉丁字母 / 数字串整块
+            let j = i;
+            while (j < s.length && isWord(s.codePointAt(j))) j += 1;
+            tokens.push(s.slice(i, j));
+            i = j;
+        } else if (isSpace(ch)) {            // ③ 空白串整块
+            let j = i;
+            while (j < s.length) {
+                const c = String.fromCodePoint(s.codePointAt(j));
+                if (!isSpace(c)) break;
+                j += c.length;
+            }
+            tokens.push(s.slice(i, j));
+            i = j;
+        } else {                             // ④ 其余单字符（标点 / 符号 / 非 CJK 表意外字）各自成 token
+            tokens.push(ch);
+            i += step;
+        }
+    }
+    return tokens;
+}
+
+// 纯函数：算出 before→after 的差异段。先各自分词，对两串 token 做最长公共子序列（O(n·m) DP），
+// 回溯成 equal/del/ins 段，相邻同型合并，每段把 token 拼回成 text。确定、可复现。
+// 一个被替换的跨度【先发 del（before 的 token）后发 ins（after 的 token）】。nullish → 同空串处理。
+function diffSegments(before, after) {
+    const a = tokenizeForDiff(before);   // before tokens（del 的来源）
+    const b = tokenizeForDiff(after);    // after tokens（ins 的来源）
+    const n = a.length;
+    const m = b.length;
+
+    // LCS DP 表：dp[i][j] = a[i..] 与 b[j..] 的最长公共子序列长度（从尾部建表，便于正向回溯）。
+    const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i -= 1) {
+        for (let j = m - 1; j >= 0; j -= 1) {
+            dp[i][j] = a[i] === b[j]
+                ? dp[i + 1][j + 1] + 1
+                : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+
+    // 正向回溯成原始（未合并）操作序列。平手时优先「向下」(del) 再「向右」(ins)，
+    // 保证被替换跨度里 del 整体排在 ins 之前。
+    const raw = [];   // { type, text }，每个 text 是单个 token
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) {
+            raw.push({ type: 'equal', text: a[i] });
+            i += 1;
+            j += 1;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            raw.push({ type: 'del', text: a[i] });
+            i += 1;
+        } else {
+            raw.push({ type: 'ins', text: b[j] });
+            j += 1;
+        }
+    }
+    while (i < n) { raw.push({ type: 'del', text: a[i] }); i += 1; }   // before 尾巴 → 全删
+    while (j < m) { raw.push({ type: 'ins', text: b[j] }); j += 1; }   // after 尾巴 → 全增
+
+    // 合并相邻同型段，把每段的 token 拼回 text。
+    const segments = [];
+    for (const op of raw) {
+        const last = segments[segments.length - 1];
+        if (last && last.type === op.type) last.text += op.text;
+        else segments.push({ type: op.type, text: op.text });
+    }
+    return segments;
+}
+
+// 把 diffSegments(before, after) 渲染成一张内联差异卡（<div.so-diff-card>）：equal 段普通文字、del 段
+// 划掉红、ins 段绿。文本一律走 textContent（差异文本不可信，绝不 innerHTML）。返回未挂载的元素，由调用方插入。
+function renderDiffCard(before, after) {
+    const card = document.createElement('div');
+    card.className = 'so-diff-card';
+    for (const seg of diffSegments(String(before == null ? '' : before), String(after == null ? '' : after))) {
+        const span = document.createElement('span');
+        if (seg.type === 'del') span.className = 'so-diff-del';
+        else if (seg.type === 'ins') span.className = 'so-diff-ins';
+        span.textContent = seg.text;
+        card.appendChild(span);
+    }
+    return card;
+}
+
+// 纯函数：把原回复里的机制块（<UpdateVariable> + 状态栏占位符）原样接回校正稿，让校正后的 swipe
+// 仍携带 MVU 更新 + 触发状态栏。CoT 不接回——那是原回复的推理，与校正无关。幂等。可单测。
+// keepSections（用户「排除·保留」区）原样接回，先于机制块。
+function composeFixedReply(fixedProse, originalReply, keepSections) {
+    let out = String(fixedProse || '').trim();
+    const orig = String(originalReply || '');
+    const keep = String(keepSections || '').trim();
+    if (keep && !out.includes(keep)) out = out.trimEnd() + '\n\n' + keep;   // 用户"排除·保留"区原样接回（先于机制块）
+    const block = extractUpdateBlock(orig);
+    if (block && !out.includes(block)) out = out.trimEnd() + '\n\n' + block;
+    if (orig.includes(STATUS_PLACEHOLDER) && !out.includes(STATUS_PLACEHOLDER)) out = out.trimEnd() + '\n\n' + STATUS_PLACEHOLDER;
+    return out;
 }
 
 // Apply a corrective <UpdateVariable> block through MVU's own pipeline.
@@ -3391,37 +4047,59 @@ async function undoFix(snapshot) {
 }
 
 /* ------------------------------------------------------------------ *
- * 用户功能请求：自动诊断 —— 每收到一条新的主聊天 AI 回复，就在后台跑一次诊断、确有错误时自动
- * 应用修复。与窗口的手动诊断共用底层（buildDiagnosePromptFrom + MVU 管线），但全程无界面：
- * 自建提示词（不碰窗口共享状态）、非流式调用、仅在确有改动时写入，并用可撤销的 toast 告知。
- * ⚠ 与 MVU「额外模型解析」不兼容（那时更新由另一模型异步解析、不在正文里）——开启时已警告。
+ * 用户功能请求：自动诊断 + ✨ 校正模式 Phase 3 —— 统一的「回复后编排」。
+ * 每收到一条新的主聊天 AI 回复，就在【单一共享锁】下按固定顺序跑：先自动校正（润色 / 换 swipe），
+ * 后自动诊断（确有错误时经 MVU 自动应用修复）。诊断【在后】是刻意的：它读到的是已校正后的正文（§5.10）。
+ * 两者各自全程无界面：自建提示词（不碰窗口共享状态）、非流式调用，仅在确有改动时落地。
+ * ⚠ 诊断与 MVU「额外模型解析」不兼容（那时更新由另一模型异步解析、不在正文里）——开启时已警告。
  * ------------------------------------------------------------------ */
-let autoDiagBusy = false;          // 防重入：一次只跑一个后台诊断
-let autoDiagErrorToasted = false;  // 错误 toast 每会话只弹一次，免得每条回复都打扰
+let postReplyBusy = false;         // 单一共享锁：自动校正与自动诊断不得并发抢占同一条回复
+let autoDiagErrorToasted = false;  // 诊断错误 toast 每会话只弹一次，免得每条回复都打扰
 
-// message_received 监听：仅在自动模式开启、且这是一条 AI 回复时，安排一次后台诊断。
-async function maybeAutoDiagnose(messageId) {
-    if (!ENABLE_AUTO_DIAGNOSE) return;     // 杀死开关：后台自动诊断整体停摆，绝不调用模型 / 绝不写 MVU
+// 纯决策核（零回归证据核，单测在 fix-orchestrator.test.mjs）：给定两个杀死开关 flags={fix,diag}
+// 与设置 s，返回按执行顺序排好的处理器名数组。'fix' 在前、'diag' 在后；某项要跑当且仅当
+// 「杀死开关开 且 对应设置开」。【false 开关压过 true 设置】。nullish 安全（flags / s 缺省即按未开处理）。
+// 诊断单开（autoFixEnabled:false）时计划恒为 ['diag']，与旧 maybeAutoDiagnose 的门控严格等价。
+function postReplyPlan(flags, s) {
+    const plan = [];
+    if (flags && flags.fix && s && s.autoFixEnabled) plan.push('fix');
+    if (flags && flags.diag && s && s.autoDiagnoseEnabled) plan.push('diag');
+    return plan;
+}
+
+// message_received 监听的落点：在共享锁下，对一条 AI 回复按 postReplyPlan 顺序跑校正 / 诊断。
+async function maybePostReply(messageId) {
+    const ctx = getCtx(); if (!ctx) return;
     const s = getSettings();
-    if (!s.autoDiagnoseEnabled || autoDiagBusy) return;
-    const ctx = getCtx();
-    const chat = ctx.chat || [];
-    const idx = Number.isInteger(messageId) ? messageId : chat.length - 1;
-    const m = chat[idx];
-    if (!m || m.is_user || m.is_system) return;             // 只处理 AI 回复
-    autoDiagBusy = true;
+    // 编排门控：autoFixEnabled 走【本聊天】生效配置（Phase 4 per-chat 迁移）；autoDiagnoseEnabled
+    // 不迁移、仍读全局 s。postReplyPlan 保持纯函数——这里把两者拼成它要读的 {autoFixEnabled, autoDiagnoseEnabled}。
+    const cfg = getEffectiveFixCfg(s, getFixCfg());
+    const gate = { autoFixEnabled: cfg.autoFixEnabled, autoDiagnoseEnabled: s.autoDiagnoseEnabled };
+    const plan = postReplyPlan({ fix: ENABLE_REPLY_FIX, diag: ENABLE_AUTO_DIAGNOSE }, gate);
+    if (!plan.length) return;                               // 两个杀死开关 / 两个设置都没开 → 不做事、不动模型
+    if (postReplyBusy || isGenerating) return;              // 共享锁 + 不在主聊天生成中途插手
+    const idx = Number(messageId); const m = (ctx.chat || [])[idx];
+    if (!m || m.is_user || m.is_system) return;             // 只处理 AI 回复（排除用户 / 系统消息）
+    postReplyBusy = true;
     try {
-        // 给 MVU 先消化这条回复的更新，再读取权威状态（额外模型解析模式本就不支持）。
+        // 给 MVU 先消化这条回复的更新，再读取权威状态（诊断的额外模型解析模式本就不支持）。
+        // 校正与诊断共用这一次 settle（不另加延时），复用诊断既有的 autoDiagnoseDelayMs。
         await new Promise((r) => setTimeout(r, Math.max(0, (s.autoDiagnoseDelayMs | 0) || 1200)));
-        await runAutoDiagnose(ctx, s);
-    } catch (e) {
-        console.warn('[Story Oracle] 自动诊断失败：', e);
-        if (!autoDiagErrorToasted) {
-            autoDiagErrorToasted = true;
-            try { window.toastr && window.toastr.warning && window.toastr.warning('故事神谕：自动诊断这一轮没跑成（详见控制台）。后续回复会继续尝试。', '自动诊断'); } catch (e2) { /* ignore */ }
+        for (const step of plan) {
+            try {
+                if (step === 'fix') await runAutoFix(ctx, s);
+                else await runAutoDiagnose(ctx, s);
+            } catch (e) {
+                console.warn(`[Story Oracle] 自动${step === 'fix' ? '校正' : '诊断'}失败：`, e);
+                // 沿用诊断的「每会话一次」错误 toast（校正的失败已在其侧聊记录里反映，不再额外打扰）。
+                if (step === 'diag' && !autoDiagErrorToasted) {
+                    autoDiagErrorToasted = true;
+                    try { window.toastr && window.toastr.warning && window.toastr.warning('故事神谕：自动诊断这一轮没跑成（详见控制台）。后续回复会继续尝试。', '自动诊断'); } catch (e2) { /* ignore */ }
+                }
+            }
         }
     } finally {
-        autoDiagBusy = false;
+        postReplyBusy = false;
     }
 }
 
@@ -3439,7 +4117,7 @@ async function runAutoDiagnose(ctx, s) {
         // 精选模式（用户功能请求）：只喂本聊天挑选的条目（无视启用 / 禁用；L2 混合并入当前命中绿灯），不自动补规则。
         wiBlock = (await buildDiagSelectedWi()).block;
     } else {
-        wiBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
+        wiBlock = await buildWorldInfo(wiContextMode(s));
         const mvuRules = await collectMvuUpdateRules(wiBlock);
         if (mvuRules.length) wiBlock = [wiBlock, ...mvuRules].filter(Boolean).join('\n\n');
     }
@@ -3529,29 +4207,132 @@ function refreshMessageBar(idx) {
     } catch (e) { console.warn('[Story Oracle] 自动诊断后发 MESSAGE_UPDATED 失败：', e); }
 }
 
+// 纯函数：把 block（+ 可选状态栏占位符 placeholder）幂等追加到 m.mes，并【镜像到当前 swipe 槽】。
+// 为什么要镜像：校正模式把校正稿换成了新 swipe（addSwipeToMessage），此时 m.mes 与 m.swipes[swipe_id]
+// 指向同一文本；若只改 m.mes 不改槽，下一次 swipe 重渲染会从 m.swipes[swipe_id] 取回旧文本 → 追加的更新块
+// 被丢弃。故：追加完 m.mes 后，若有 swipes 数组且当前槽是字符串，把当前槽对齐成 m.mes。
+// 幂等（!includes 守卫）；无 swipes 时退化为「只动 m.mes」（与改写前的写回逐字节相同）。返回新的 m.mes。
+function applyBlockToCurrentSwipe(m, block, placeholder) {
+    if (!m || typeof m.mes !== 'string') return m ? m.mes : '';
+    if (block && !m.mes.includes(block)) {                   // 幂等：已写过就不重复追加
+        m.mes = m.mes.trimEnd() + '\n\n' + block;
+    }
+    // 再补上 MVU 状态栏占位符（衍生情形 MVU 没跑、不会自己加它）——否则有更新块也不出状态栏（见 STATUS_PLACEHOLDER）。
+    if (placeholder && !m.mes.includes(placeholder)) {
+        m.mes = m.mes.trimEnd() + '\n\n' + placeholder;
+    }
+    // 镜像到当前 swipe 槽（仅当存在 swipes 数组且当前槽本就是字符串）——非 swipe 消息上此步为 no-op。
+    if (Array.isArray(m.swipes) && typeof m.swipes[m.swipe_id] === 'string') {
+        m.swipes[m.swipe_id] = m.mes;
+    }
+    return m.mes;
+}
+
 // 衍生（乙）情形专用：把推导出的 <UpdateVariable> 块 + MVU 状态栏占位符写回这条 AI 消息（让消息像官方 MVU
 // 更新那样【携带】更新记录 + 触发状态栏；块默认被卡片「去除变量更新」正则在显示 / 提示词里隐藏，占位符由卡片
 // 显示正则渲染成状态栏，二者都跨重载存活，故 saveChat），再调 refreshMessageBar 重渲染。核验（甲）情形不走这里
-// （消息里已有块 + 占位符，再追加会重复），只 refreshMessageBar。
+// （消息里已有块 + 占位符，再追加会重复），只 refreshMessageBar。写回经 applyBlockToCurrentSwipe → 同时落在
+// m.mes 与【当前 swipe 槽】（校正换 swipe 后不丢块；非 swipe 消息上镜像是 no-op，行为与旧实现逐字节相同）。
 async function writeUpdateBlockToMessage(idx, block) {
     const ctx = getCtx();
     const m = (ctx.chat || [])[idx];
     if (!m || typeof m.mes !== 'string' || !block) return;
-    let changed = false;
-    if (!m.mes.includes(block)) {                            // 幂等：已写过就不重复追加
-        m.mes = m.mes.trimEnd() + '\n\n' + block;
-        changed = true;
-    }
-    // 再补上 MVU 状态栏占位符（衍生情形 MVU 没跑、不会自己加它）——否则有更新块也不出状态栏（见 STATUS_PLACEHOLDER）。
-    if (!m.mes.includes(STATUS_PLACEHOLDER)) {
-        m.mes = m.mes.trimEnd() + '\n\n' + STATUS_PLACEHOLDER;
-        changed = true;
-    }
-    if (changed) {
+    const before = m.mes;
+    applyBlockToCurrentSwipe(m, block, STATUS_PLACEHOLDER);
+    if (m.mes !== before) {                                  // 确有追加才存盘
         try { if (typeof ctx.saveChat === 'function') await ctx.saveChat(); }
         catch (e) { console.warn('[Story Oracle] 自动诊断写回消息后保存失败：', e); }
     }
     refreshMessageBar(idx);
+}
+
+// 把校正稿作为【新 swipe】写入第 idx 条消息（非破坏性，原文留在 swipe 0），保存、重渲染、补发
+// MESSAGE_SWIPED/UPDATED（让酒馆助手重建状态栏 iframe，与 refreshMessageBar 同理）。返回 true=成功。
+// 2026-06-26 两个真机 bug 的修复（手动与自动校正共用本函数，一处修两处都好）：
+//  · Bug 1（计数停在 1/1、滑不回原文，得重载才变 2/2）：updateMessageBlock 只重渲染 .mes_text，不碰 ST
+//    的 .swipes-counter / 左右箭头；补发 MESSAGE_SWIPED 也不刷新计数。故加一刀 ctx.swipe.refresh(true)
+//    （= refreshSwipeButtons(updateCounters=true)）——更新「X/Y」文字、并在 swipes.length>1 时点亮左箭头
+//    （swipes_visible），于是无需重载即可滑回原文。
+//  · Bug 2（机制块随校正稿带过来了，但 stats 没应用）：MVU 只在 MESSAGE_RECEIVED/SENT 解析更新块，新 swipe
+//    是代码造的，MVU 不会给它建变量快照 → 状态栏读不到原回复那次更新。修法：把【原回复已生效】的 MVU 整盘
+//    状态【拷贝】到新 swipe（换前 getMvuData 抓快照、换后 replaceMvuData 写回 latest）。是【拷贝】不是
+//    【重解析】——绝不会把「好感度 += 5」这类相对更新二次累加；最坏情形（被某 MVU 监听覆盖）也只是没刷新 =
+//    与修复前一致，绝不会改坏存档。真实卡片上的状态栏【数值】仍需肉眼复核（MVU 的 swipe 语义此处测不到）。
+async function applyFixAsSwipe(idx, finalText) {
+    const ctx = getCtx();
+    const m = (ctx.chat || [])[idx];
+    if (!m || typeof m.mes !== 'string') return false;
+
+    // Bug 2 ①：换 swipe 前，抓住当前（= 被校正那条 swipe 已生效）的 MVU 整盘状态，待会儿原样拷给新 swipe。
+    let mvuSnapshot = null;
+    try {
+        const Mvu = await getMvu();
+        if (Mvu && typeof Mvu.getMvuData === 'function') {
+            const cur = Mvu.getMvuData({ type: 'message', message_id: 'latest' });
+            if (cur) mvuSnapshot = JSON.parse(JSON.stringify(cur));
+        }
+    } catch (e) { console.warn('[Story Oracle] 校正前读取 MVU 状态失败：', e); }
+
+    const now = new Date();
+    const info = { send_date: now.toISOString(), gen_started: null, gen_finished: now.toISOString(), extra: { story_oracle_fix: true } };
+    addSwipeToMessage(m, finalText, info);
+    try { if (typeof ctx.saveChat === 'function') await ctx.saveChat(); }
+    catch (e) { console.warn('[Story Oracle] 校正写入 swipe 后保存失败：', e); return false; }
+
+    // Bug 2 ②：把抓到的状态【拷贝】到新 swipe（它现在已是 latest）。replaceMvuData 同时写 stat_data +
+    // display_data，下面 updateMessageBlock 重渲染时状态栏即读到正确值。放在补发事件【之前】，尽量先于
+    // MVU 可能的 swipe 监听落定。
+    if (mvuSnapshot) {
+        try {
+            const Mvu = await getMvu();
+            if (Mvu && typeof Mvu.replaceMvuData === 'function') {
+                await Mvu.replaceMvuData(mvuSnapshot, { type: 'message', message_id: 'latest' });
+            }
+        } catch (e) { console.warn('[Story Oracle] 校正后写回 MVU 状态失败：', e); }
+    }
+
+    try { if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(idx, m); }
+    catch (e) { console.warn('[Story Oracle] 校正后重渲染失败：', e); }
+
+    // Bug 1：刷新 ST 的 swipe 计数 + 左右箭头（updateMessageBlock 不管这块）。ctx.swipe.refresh 即
+    // refreshSwipeButtons；传 true 连「X/Y」文字一起更新。带回退以防个别 ST 构建把它摆在别处。
+    try {
+        const swipeRefresh = (ctx.swipe && ctx.swipe.refresh) || ctx.refreshSwipeButtons;
+        if (typeof swipeRefresh === 'function') swipeRefresh(true);
+    } catch (e) { console.warn('[Story Oracle] 校正后刷新 swipe 计数失败：', e); }
+
+    try {
+        const et = ctx.eventTypes || ctx.event_types || {};
+        if (ctx.eventSource && typeof ctx.eventSource.emit === 'function') {
+            Promise.resolve(ctx.eventSource.emit(et.MESSAGE_SWIPED || 'message_swiped', idx)).catch(() => {});
+            Promise.resolve(ctx.eventSource.emit(et.MESSAGE_UPDATED || 'message_updated', idx)).catch(() => {});
+        }
+    } catch (e) { console.warn('[Story Oracle] 校正后发事件失败：', e); }
+    return true;
+}
+
+// 非破坏性地把某条消息切到一个【已存在的】swipe（不新增、不删除——只换 swipe_id + mes）。Task 3 的
+// 「用原文」会用它切回原文 swipe；现在仅作为已挂载的 async 函数存在。swipeId 越界 / 不是字符串 → 返回
+// false（不动）。命中后复用 applyFixAsSwipe 的保存 / 重渲染 / 发事件尾巴（saveChat → updateMessageBlock →
+// emit MESSAGE_SWIPED + MESSAGE_UPDATED），让状态栏 iframe 随之刷新。
+async function selectSwipe(idx, swipeId) {
+    const ctx = getCtx();
+    const m = (ctx.chat || [])[idx];
+    if (!m || !Array.isArray(m.swipes) || typeof m.swipes[swipeId] !== 'string') return false;
+    m.swipe_id = swipeId;
+    m.mes = m.swipes[swipeId];
+    try { if (typeof ctx.saveChat === 'function') await ctx.saveChat(); }
+    catch (e) { console.warn('[Story Oracle] 校正写入 swipe 后保存失败：', e); return false; }
+    try { if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(idx, m); }
+    catch (e) { console.warn('[Story Oracle] 校正后重渲染失败：', e); }
+    try {
+        const et = ctx.eventTypes || ctx.event_types || {};
+        if (ctx.eventSource && typeof ctx.eventSource.emit === 'function') {
+            Promise.resolve(ctx.eventSource.emit(et.MESSAGE_SWIPED || 'message_swiped', idx)).catch(() => {});
+            Promise.resolve(ctx.eventSource.emit(et.MESSAGE_UPDATED || 'message_updated', idx)).catch(() => {});
+        }
+    } catch (e) { console.warn('[Story Oracle] 校正后发事件失败：', e); }
+    return true;
 }
 
 // 纯函数：拼一条自动诊断侧聊记录的正文。status: applied（带补丁）/ nochange（无需改动）/ failed
@@ -3566,6 +4347,22 @@ function autoDiagNoteContent({ status, patch, stamp }) {
         return `⚠️ 自动诊断${t} —— 跑完了，但这条更新没能解析 / 应用（已跳过，未改动状态）。`;
     }
     return `🩺 自动诊断${t} —— 已检查最新回复，本回合无需改动。`;   // nochange
+}
+
+// 纯函数：拼一条自动【校正】侧聊记录的正文（仿 autoDiagNoteContent）。status: fixed（已校正、已作为新
+// swipe 应用）/ nochange（成本门 / 无操作，未改动）/ failed（没解析出 <FixedReply>，未改动）。fixed 提示
+// 向左划可看原文（原文留在 swipe 0，本扩展不破坏它），并附上「发现并修正」摘要（problems，可空）。
+// stamp 由调用方传入（纯函数不读时钟，便于单测）。可单测。
+function autoFixNoteContent({ status, problems, stamp }) {
+    const t = stamp ? ' · ' + stamp : '';
+    if (status === 'fixed') {
+        const body = (problems && String(problems).trim()) ? `\n发现并修正：\n${String(problems).trim()}` : '';
+        return `✨ 自动校正${t} —— 已校正最新回复，并作为新 swipe 应用（向左划可看原文）。${body}`;
+    }
+    if (status === 'failed') {
+        return `⚠️ 自动校正${t} —— 跑完了，但没能从模型回复里解析出校正稿（已跳过，未改动回复）。`;
+    }
+    return `✨ 自动校正${t} —— 已检查最新回复，无需校正（未改动）。`;   // nochange
 }
 
 // 自动诊断跑完一轮后的提示。用户功能请求：每轮都在侧聊里留一条【持久】记录（含「无需改动」）；改动
@@ -3663,6 +4460,65 @@ function addNoteUndoControls(wrap, initialSnapshot, patch) {
     });
 }
 
+// ✨ 校正 Phase 4：自动校正【已应用】记录上的「用原文 / 看改动」按钮条（仿 addNoteUndoControls 的结构）。
+// info = { idx, before, after, fixSwipeId }。自动校正在创建记录时已把校正稿作为新 swipe 应用，原文留在
+// swipe 0。两个按钮：
+//   · 用原文：切回 swipe 0（selectSwipe(idx,0)），成功后改标签为「用校正稿」并把动作翻到切回 fixSwipeId——
+//     原文 ↔ 校正稿 的二态开关（本会话内）。selectSwipe 返回 false（swipe 已不在，例如用户重 roll 了）→
+//     状态写「无法切换」并禁用按钮。
+//   · 看改动：懒构建一次 renderDiffCard(before, after) 接到 wrap 上，之后切 hidden 复用（与手动卡同款）。
+function addAutoFixControls(wrap, info) {
+    const bar = document.createElement('div');
+    bar.className = 'so-apply-bar so-note-undo';
+    const swapBtn = document.createElement('button');
+    swapBtn.className = 'so-apply-btn';
+    swapBtn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> 用原文';
+    const diffBtn = document.createElement('button');
+    diffBtn.className = 'so-apply-btn';
+    diffBtn.innerHTML = '<i class="fa-solid fa-eye"></i> 看改动';
+    const status = document.createElement('span');
+    status.className = 'so-apply-status';
+    bar.appendChild(swapBtn);
+    bar.appendChild(diffBtn);
+    bar.appendChild(status);
+    wrap.appendChild(bar);
+
+    // 原文 ↔ 校正稿 二态开关。showingOriginal=false = 当前显示校正稿（记录创建时即此态）。
+    let showingOriginal = false;
+    swapBtn.addEventListener('click', async () => {
+        status.classList.remove('so-hint-error');
+        swapBtn.disabled = true;
+        const targetSwipe = showingOriginal ? info.fixSwipeId : 0;
+        const ok = await selectSwipe(info.idx, targetSwipe);
+        if (!ok) {
+            // swipe 不在了（用户重 roll / 删了）——这条记录的切换不再可靠，停用。
+            status.textContent = '无法切换（原 swipe 已不在）。';
+            status.classList.add('so-hint-error');
+            return;   // 留 disabled
+        }
+        showingOriginal = !showingOriginal;
+        if (showingOriginal) {
+            swapBtn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> 用校正稿';
+            status.textContent = '已切回原文。';
+        } else {
+            swapBtn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> 用原文';
+            status.textContent = '已切回校正稿。';
+        }
+        swapBtn.disabled = false;
+    });
+
+    let diffCard = null;
+    diffBtn.addEventListener('click', () => {
+        if (!diffCard) {
+            diffCard = renderDiffCard(info.before, info.after);
+            wrap.appendChild(diffCard);
+        } else {
+            diffCard.hidden = !diffCard.hidden;
+        }
+        scrollToBottom();
+    });
+}
+
 function injectWandButton() {
     const menu = document.getElementById('extensionsMenu');
     if (!menu || document.getElementById('so-wand-button')) return;
@@ -3735,10 +4591,17 @@ function buildWindow() {
                 <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋 —— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
                 <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
                 <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）"><i class="fa-solid fa-stethoscope"></i><span class="so-auto-tag">AUTO</span></div>
+                <div class="so-iconbtn" id="so-fix-btn" title="校正模式 —— 修一修最新这条回复（AI 味 / 对话 / 设定 / 详略…），应用后原文仍在"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
                 <span class="so-hdr-div" aria-hidden="true"></span>
-                <div class="so-iconbtn" id="so-summary-btn" title="剧情概要 —— 粘贴你的运行总结 / 前情提要，神谕会在最近对话前读到它"><i class="fa-solid fa-scroll"></i></div>
-                <div class="so-iconbtn" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i></div>
-                <div class="so-iconbtn" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i></div>
+                <div class="so-tools-wrap">
+                    <div class="so-iconbtn" id="so-tools-btn" aria-haspopup="true" aria-expanded="false" title="更多 —— 剧情概要 / 调试提示词 / 设置"><i class="fa-solid fa-ellipsis"></i></div>
+                    <div id="so-tools-menu" aria-label="更多工具">
+                        <div class="so-iconbtn so-tools-item" id="so-normalchat-btn" title="回到普通聊天（自动诊断如已开启会继续在后台运行）"><i class="fa-solid fa-comment"></i><span>普通聊天</span></div>
+                        <div class="so-iconbtn so-tools-item" id="so-summary-btn" title="剧情概要 —— 粘贴你的运行总结 / 前情提要，神谕会在最近对话前读到它"><i class="fa-solid fa-scroll"></i><span>剧情概要</span></div>
+                        <div class="so-iconbtn so-tools-item" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i><span>调试提示词</span></div>
+                        <div class="so-iconbtn so-tools-item" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i><span>设置</span></div>
+                    </div>
+                </div>
                 <span class="so-hdr-div" aria-hidden="true"></span>
                 <div class="so-iconbtn" id="so-clear-btn" title="清空对话"><i class="fa-solid fa-trash-can"></i></div>
                 <div class="so-iconbtn" id="so-close-btn" title="关闭"><i class="fa-solid fa-xmark"></i></div>
@@ -3814,12 +4677,14 @@ function buildWindow() {
                     <label class="so-check"><input id="so-card" type="checkbox"><span>包含角色卡（描述 / 性格 / 场景）</span></label>
                     <label class="so-check"><input id="so-stat" type="checkbox"><span>附带变量状态（MVU stat_data，普通模式）—— 数值问题的权威来源；关掉则如实拒答数值</span></label>
                     <label class="so-check"><input id="so-world" type="checkbox"><span>附带「世界引擎」后台世界状态（普通 / 参谋模式）—— 目前仅适配世界引擎（World Engine，含本机改版）的当前版本；其它世界状态类扩展需日后单独适配。喂完整数据较吃 token，未识别到相关扩展时无开销</span></label>
+                    <label class="so-check"><input id="so-hidden" type="checkbox"><span>读取隐藏楼层（被 /hide 隐藏的消息）—— 默认关；开启后神谕读对话时也会看到隐藏楼层（不影响世界书关键词扫描与弧线节奏）</span></label>
                     <label class="so-check"><input id="so-regex" type="checkbox"><span>应用剧情正则（剥离思维链 / 状态栏、使用总结）—— 与主聊天保持一致</span></label>
 
                     <label class="so-row"><span>世界书 / 知识库</span>
                         <select id="so-wi">
                             <option value="off">关闭</option>
                             <option value="st">常驻 + 关键词匹配（ST 默认行为）</option>
+                            <option value="char">仅角色相关世界书（排除全局）</option>
                             <option value="all">全部条目（规划用 —— 忽略关键词）</option>
                         </select>
                     </label>
@@ -3904,13 +4769,75 @@ function buildWindow() {
             </details>
         </div>
 
+        <div id="so-fix-bar">
+            <details class="so-mode-collapse" id="so-fix-collapse" open>
+                <summary class="so-mode-collapse-sum"><i class="fa-solid fa-wand-magic-sparkles"></i><span>校正设置</span></summary>
+                <div class="so-mode-collapse-body">
+                    <label class="so-check so-lb-check"><span>校正模式</span>&nbsp;<select id="so-fix-mode-select" title="手动 = 在输入框直接说要改什么（单稿、快）；自动 = 按目标 / 每条新回复后台校正（双稿收紧）"><option value="manual">手动（说要改哪里）</option><option value="auto">自动（按目标 / 每条新回复）</option></select></label>
+                    <div class="so-hint">⚠ 「经自定义补全预设发送（破限 / 越狱用）」：仅在你的模型 / 中转会【拒绝】校正请求、需要破限 / 越狱时才开。需先在【设置】里选好并「精选」一个补全预设。手动与自动【各自独立】开关（见下方各模式设置）；开启的那一套会套上该预设的文本块与角色（跳过角色卡 / 世界书等 RP 内容标记），可能更慢 / 更贵。不需要破限就别开。</div>
+
+                    <!-- 手动模式：在下方输入框直接说要改什么。默认带上丰富上下文（一次性精修、质量优先）。单稿、无目标。 -->
+                    <div id="so-fix-manual">
+                        <label class="so-check so-lb-check"><input id="so-fixm-preset" type="checkbox"><span>经自定义补全预设发送（破限 / 越狱用）</span></label>
+                        <label class="so-check so-lb-check"><span>加载前文条数（-1 = 全部）</span>&nbsp;<input id="so-fixm-depth" type="number" min="-1" max="100" style="width:64px;"></label>
+                        <label class="so-check so-lb-check"><input id="so-fixm-card" type="checkbox"><span>带上角色卡（描述 / 性格 / 场景）</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fixm-world" type="checkbox"><span>带上当前激活世界书</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fixm-summary" type="checkbox"><span>带上 📜剧情概要</span></label>
+                        <div class="so-hint">手动：在下方输入框直接说要改哪里（如「换种写法重写这段」「她这里不该笑」），只改最新这一条回复，单稿、更快。</div>
+                    </div>
+
+                    <!-- 自动模式：按目标校正按钮（手动跑一次）+ 每条新回复自动校正。双稿收紧、目标驱动、默认精简省钱。 -->
+                    <div id="so-fix-auto-wrap">
+                        <button type="button" id="so-fix-run" class="so-fix-run-btn"><i class="fa-solid fa-wand-magic-sparkles"></i> 按目标校正最新回复</button>
+                        <label class="so-check so-lb-check"><input id="so-fix-auto" type="checkbox"><span>自动校正每条新回复（实验）</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fixa-preset" type="checkbox"><span>经自定义补全预设发送（破限 / 越狱用）</span></label>
+                        <div class="so-fix-targets-head">校正目标</div>
+                        <label class="so-check so-lb-check"><input id="so-fix-tgt-slop" type="checkbox"><span>AI 八股 / 套话</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fix-tgt-dialogue" type="checkbox"><span>对话机械 / 不自然</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fix-tgt-precision" type="checkbox"><span>过度精确（数学论文腔）</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fix-tgt-magic" type="checkbox"><span>魔法被写成理科（仅奇幻设定）</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fix-tgt-pacing" type="checkbox"><span>描写拖沓 / 流水账</span></label>
+                        <div class="so-fix-targets-head">排除区（这些标签的整段不送去校正，省时间）。每行写一个【起始】标记即可，如 &lt;thinking&gt;——不用写结束的 &lt;/thinking&gt;。</div>
+                        <textarea id="so-fix-keep" rows="2" placeholder="保留区标签（每行一个，如 <status>）：不改，原样留在回复里"></textarea>
+                        <textarea id="so-fix-drop" rows="2" placeholder="丢弃区标签（每行一个，如 <thinking>）：不改，也不放回（思考块这类）"></textarea>
+                        <textarea id="so-fix-know" rows="2" placeholder="角色知识边界（可空）：例如「主角不知道自己的真实身世」"></textarea>
+                        <textarea id="so-fix-guard" rows="2" placeholder="剧情护栏 / 自定义（可空）：例如「保持慢热，不要时间跳跃」"></textarea>
+                        <label class="so-check so-lb-check"><input id="so-fix-tighten" type="checkbox"><span>✂️ 收紧（默认开）：校正后再精修一遍（删冗词废话 / 过度描写，读感更紧）。</span></label>
+                        <details class="so-mode-collapse" id="so-fix-ctx-adv">
+                            <summary class="so-fix-targets-head" style="cursor:pointer;">上下文（默认关，点开）</summary>
+                            <div class="so-hint">⚠ 默认关闭以省时间。仅当你的「知识边界 / 剧情护栏」需要参考前文 / 角色卡 / 世界书才能判断时，才勾选。</div>
+                            <label class="so-check so-lb-check"><input id="so-fix-card" type="checkbox"><span>带上角色卡（描述 / 性格 / 场景）</span></label>
+                            <label class="so-check so-lb-check"><input id="so-fix-ctx" type="checkbox"><span>带上前文上下文（最近若干条主聊天）</span></label>
+                            <label class="so-check so-lb-check" style="margin-left:18px;"><span>条数（-1=全部）</span>&nbsp;<input id="so-fix-ctx-depth" type="number" min="-1" max="100" style="width:64px;"></label>
+                            <label class="so-check so-lb-check"><input id="so-fix-world" type="checkbox"><span>带上激活世界书（蓝灯 + 本条命中的绿灯）</span></label>
+                            <label class="so-check so-lb-check"><input id="so-fixa-summary" type="checkbox"><span>带上 📜剧情概要</span></label>
+                        </details>
+                        <div class="so-fix-bundle-row">
+                            <select id="so-fix-bundle" title="已存的校正套餐（全局，跨聊天可用）"></select>
+                            <button type="button" id="so-fix-bundle-load" class="so-fix-run-btn">加载</button>
+                            <button type="button" id="so-fix-bundle-save" class="so-fix-run-btn">保存为…</button>
+                            <button type="button" id="so-fix-bundle-del" class="so-fix-run-btn">删除</button>
+                        </div>
+                        <div class="so-hint">套餐＝把当前这套自动校正配置（目标 / 约束 / 上下文 / 收紧）存成一个名字（如「硬核西幻」），换聊天后一键加载回来。</div>
+                    </div>
+                </div>
+            </details>
+        </div>
+
         <div id="so-lb-bar">
             <details class="so-mode-collapse" id="so-lb-collapse" open>
                 <summary class="so-mode-collapse-sum"><i class="fa-solid fa-book"></i><span>世界书设置</span></summary>
                 <div class="so-mode-collapse-body">
             <div class="so-lb-row">
                 <i class="fa-solid fa-book so-lb-icon"></i>
-                <select id="so-lb-book" title="选择要聊 / 编辑的世界书"></select>
+                <details id="so-lb-bookpick" class="so-lb-bookpick">
+                    <summary id="so-lb-bookpick-sum" title="选择要聊 / 编辑的世界书（可多选；不选＝当前激活的全部）">全部激活的世界书</summary>
+                    <div class="so-lb-bookpick-tools">
+                        <button type="button" class="so-lb-mini" id="so-lb-book-all">全选</button>
+                        <button type="button" class="so-lb-mini" id="so-lb-book-none">全不选（＝全部激活）</button>
+                    </div>
+                    <div id="so-lb-book-list" class="so-lb-book-list"></div>
+                </details>
                 <div class="so-iconbtn" id="so-lb-refresh" title="刷新世界书列表"><i class="fa-solid fa-rotate-right"></i></div>
             </div>
             <label class="so-check so-lb-check"><input id="so-lb-story" type="checkbox"><span>同时带上最近剧情对话</span></label>
@@ -3928,6 +4855,7 @@ function buildWindow() {
                     <button type="button" class="so-lb-mini so-lb-mini-blue" id="so-lb-blue" title="只选常驻（蓝灯）条目，不含已禁用">仅蓝灯</button>
                     <button type="button" class="so-lb-mini so-lb-mini-green" id="so-lb-green" title="只选关键词触发（绿灯）条目，不含已禁用">仅绿灯</button>
                     <button type="button" class="so-lb-mini so-lb-mini-off" id="so-lb-disabled" title="只选已禁用条目">仅禁用</button>
+                    <button type="button" class="so-lb-mini so-lb-mini-eye" id="so-lb-preview-toggle" title="显示 / 隐藏每条条目的内容预览">👁 内容预览</button>
                 </div>
                 <input type="text" id="so-lb-entries-filter" class="so-lb-entries-filter" placeholder="筛选条目（标题 / 关键词 / uid）…">
                 <div id="so-lb-entries-list" class="so-lb-entries-list"></div>
@@ -4101,6 +5029,7 @@ function bindControls() {
     win.querySelector('#so-diagnose-btn').addEventListener('click', toggleDiagnose);
     win.querySelector('#so-lorebook-btn').addEventListener('click', toggleLorebook);
     win.querySelector('#so-advisor-btn').addEventListener('click', toggleAdvisor);
+    win.querySelector('#so-fix-btn').addEventListener('click', toggleFix);
     win.querySelector('#so-adv-preset').addEventListener('change', (e) => {
         const s2 = getSettings();
         s2.advisorUsePreset = e.target.checked;
@@ -4181,12 +5110,16 @@ function bindControls() {
             : '路标（每行一个，意图级——透明弧你看得到每一拍，需自己填写）';
     });
     win.querySelector('#so-lb-refresh').addEventListener('click', () => populateLorebookBooks(true));
-    win.querySelector('#so-lb-book').addEventListener('change', (e) => {
-        const s2 = getSettings();
-        s2.lorebookTarget = e.target.value; // '' = all active
-        save();
-        updateLbHint();
-        populateLorebookEntries();           // refresh the per-entry picker for the new book
+    win.querySelector('#so-lb-book-list').addEventListener('change', (e) => {
+        if (e.target && e.target.matches('input[type="checkbox"]')) onLbBookSelectionChange();
+    });
+    win.querySelector('#so-lb-book-all').addEventListener('click', () => {
+        win.querySelectorAll('#so-lb-book-list input[type="checkbox"]').forEach((b) => { b.checked = true; });
+        onLbBookSelectionChange();
+    });
+    win.querySelector('#so-lb-book-none').addEventListener('click', () => {
+        win.querySelectorAll('#so-lb-book-list input[type="checkbox"]').forEach((b) => { b.checked = false; });
+        onLbBookSelectionChange();
     });
     win.querySelector('#so-lb-story').addEventListener('change', (e) => {
         getSettings().lorebookIncludeStory = e.target.checked;
@@ -4207,7 +5140,7 @@ function bindControls() {
     });
     // 手机上把模式工具栏（诊断 / 世界书的配置栏）默认折叠，先把聊天区露出来；桌面保持展开。用户随后可自行开合。
     if (window.matchMedia && window.matchMedia('(max-width: 600px)').matches) {
-        win.querySelectorAll('#so-lb-collapse, #so-diag-collapse').forEach((d) => { d.open = false; });
+        win.querySelectorAll('#so-lb-collapse, #so-diag-collapse, #so-fix-collapse').forEach((d) => { d.open = false; });
     }
     win.querySelector('#so-lb-all').addEventListener('click', () => setAllLbEntries(true));
     win.querySelector('#so-lb-none').addEventListener('click', () => setAllLbEntries(false));
@@ -4215,6 +5148,7 @@ function bindControls() {
     win.querySelector('#so-lb-blue').addEventListener('click', () => setLbEntriesByType('blue'));
     win.querySelector('#so-lb-green').addEventListener('click', () => setLbEntriesByType('green'));
     win.querySelector('#so-lb-disabled').addEventListener('click', () => setLbEntriesByType('off'));
+    win.querySelector('#so-lb-preview-toggle').addEventListener('click', () => toggleLbPreview());
     win.querySelector('#so-lb-entries-filter').addEventListener('input', (e) => filterLbEntries(e.target.value));
     // 诊断「精选世界书条目」绑定（用户功能请求；ENABLE_DIAG_WI_PICKER）。关掉时隐藏整条栏、不挂任何处理器。
     if (ENABLE_DIAG_WI_PICKER) {
@@ -4241,6 +5175,47 @@ function bindControls() {
         const bar = win.querySelector('#so-diag-bar');
         if (bar) bar.style.display = 'none';
     }
+    // 标题栏「⋯」工具下拉：把 剧情概要 / 调试 / 设置 三个次级按钮收进一个下拉里。它们的 id 与各自
+    // 的点击处理保持不变（只是被挪进菜单内），所以下面 openDebug / 设置开关 / openSummary 的绑定照旧生效。
+    const toolsBtn = win.querySelector('#so-tools-btn');
+    const toolsMenu = win.querySelector('#so-tools-menu');
+    const closeToolsMenu = () => {
+        if (!toolsMenu) return;
+        toolsMenu.classList.remove('open');
+        if (toolsBtn) toolsBtn.setAttribute('aria-expanded', 'false');
+    };
+    if (toolsBtn && toolsMenu) {
+        toolsBtn.addEventListener('click', () => {
+            const open = toolsMenu.classList.toggle('open');
+            toolsBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+        // 点菜单里的任意一项后收起（该项自己的处理仍会照常触发，打开对应面板 / 设置）。
+        toolsMenu.addEventListener('click', (e) => {
+            if (e.target.closest('.so-tools-item')) closeToolsMenu();
+        });
+        // 点别处或按 Esc 收起。
+        document.addEventListener('click', (e) => {
+            if (toolsMenu.classList.contains('open') && !e.target.closest('.so-tools-wrap')) closeToolsMenu();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && toolsMenu.classList.contains('open')) closeToolsMenu();
+        });
+    }
+    // 「普通聊天」菜单项：从任何模式一键回普通聊天（仅切换视图——自动诊断如开启会继续在后台跑，
+    // 诊断按钮仍红；要停自动诊断请点诊断按钮）。菜单收起由上面的 .so-tools-item 监听统一处理。
+    win.querySelector('#so-normalchat-btn')?.addEventListener('click', () => {
+        if (currentOracleMode() === 'chat') {
+            // 已在普通聊天：自动诊断后台武装时，本项当开关用——再点一次回到诊断视图（否则普通聊天是死胡同）。
+            if (diagShouldReveal(diagnoseMode, ENABLE_AUTO_DIAGNOSE && !!getSettings().autoDiagnoseEnabled)) {
+                setOracleMode('diagnose');
+                if (inputEl) inputEl.focus();
+            }
+            return;
+        }
+        priorOracleMode = 'chat';
+        setOracleMode('chat');
+        modeEntryNote('已返回普通聊天模式。');
+    });
     win.querySelector('#so-debug-btn').addEventListener('click', openDebug);
     win.querySelector('#so-debug-close').addEventListener('click', () => win.querySelector('#so-debug').classList.remove('open'));
     win.querySelector('#so-debug-copy').addEventListener('click', async () => {
@@ -4320,6 +5295,76 @@ function bindControls() {
     bind('#so-card', 'includeCard');
     bind('#so-stat', 'chatIncludeStat');
     bind('#so-world', 'chatIncludeWorld');
+    bind('#so-hidden', 'includeHiddenFloors');
+    // ✨ 校正模式 Phase 4：校正配置按【当前聊天】持久化（chat A 的目标不渗进 chat B）。专用 bindFix——
+    // 写到 setFixCfg（per-chat 元数据）而非 getSettings()；不写全局、不调 save()（setFixCfg 自己触发 saveChatMetadata）。
+    const bindFix = (id, key, parse = (v) => v) => {
+        const el = win.querySelector(id);
+        const evt = (el.type === 'checkbox') ? 'change' : 'input';
+        el.addEventListener(evt, () => {
+            setFixCfg({ [key]: el.type === 'checkbox' ? el.checked : parse(el.value) });
+        });
+    };
+    // ✨ 校正 手动/自动 分家（2026-06-26）：下拉只切「显示哪套设置」（纯 UI 视图，全局存 fixSettingsView，不进 per-chat）。
+    const fixModeSel = win.querySelector('#so-fix-mode-select');
+    if (fixModeSel) {
+        fixModeSel.addEventListener('change', () => {
+            getSettings().fixSettingsView = (fixModeSel.value === 'auto') ? 'auto' : 'manual';
+            save();
+            applyFixModeView();
+        });
+    }
+    // ✨ 经预设发送（破限 / 越狱用）—— 全局开关（不进 per-chat），同 advisorUsePreset 写法（写 getSettings + save）。
+    const fixmPresetCb = win.querySelector('#so-fixm-preset');
+    if (fixmPresetCb) fixmPresetCb.addEventListener('change', () => { getSettings().fixM_usePreset = fixmPresetCb.checked; save(); applyFixPresetLock(); });
+    const fixaPresetCb = win.querySelector('#so-fixa-preset');
+    if (fixaPresetCb) fixaPresetCb.addEventListener('change', () => { getSettings().fixA_usePreset = fixaPresetCb.checked; save(); applyFixPresetLock(); });
+    // 数字框条数 parse：非数字 / 非正数 → -1（全部），正数原样。手动 / 自动各一份独立存储。
+    const depthParse = (v) => { const n = parseInt(v, 10); return (Number.isNaN(n) || n <= 0) ? -1 : n; };
+    // 手动模式控件（fixM_*）——上下文条数 / 卡 / 世界书 / 概要。
+    bindFix('#so-fixm-depth', 'fixM_contextDepth', depthParse);
+    bindFix('#so-fixm-card', 'fixM_includeCard');
+    bindFix('#so-fixm-world', 'fixM_includeWorld');
+    bindFix('#so-fixm-summary', 'fixM_includeSummary');
+    // 自动模式控件（fixA_*）——目标 / 排除区 / 约束 / 收紧 / 折叠上下文 + 运行按钮 + 自动开关。
+    bindFix('#so-fix-tgt-slop', 'fixA_targetSlop');
+    bindFix('#so-fix-tgt-dialogue', 'fixA_targetDialogue');
+    bindFix('#so-fix-tgt-precision', 'fixA_targetPrecision');
+    bindFix('#so-fix-tgt-magic', 'fixA_targetMagic');
+    bindFix('#so-fix-tgt-pacing', 'fixA_targetPacing');
+    win.querySelector('#so-fix-keep').addEventListener('input', (e) => { setFixCfg({ fixA_keepTags: e.target.value }); });
+    win.querySelector('#so-fix-drop').addEventListener('input', (e) => { setFixCfg({ fixA_dropTags: e.target.value }); });
+    win.querySelector('#so-fix-know').addEventListener('input', (e) => { setFixCfg({ fixA_knowledgeBoundary: e.target.value }); });
+    win.querySelector('#so-fix-guard').addEventListener('input', (e) => { setFixCfg({ fixA_guardrails: e.target.value }); });
+    bindFix('#so-fix-tighten', 'fixA_tighten');
+    bindFix('#so-fix-card', 'fixA_includeCard');
+    bindFix('#so-fix-ctx', 'fixA_includeContext');
+    bindFix('#so-fix-ctx-depth', 'fixA_contextDepth', depthParse);
+    bindFix('#so-fix-world', 'fixA_includeWorld');
+    bindFix('#so-fixa-summary', 'fixA_includeSummary');
+    win.querySelector('#so-fix-run').addEventListener('click', () => { runFixByTargets(); });
+    bindFix('#so-fix-auto', 'autoFixEnabled');   // 自动校正每条新回复（message_received 编排读 cfg.autoFixEnabled）
+    win.querySelector('#so-fix-auto')?.addEventListener('change', updateFixButtonVisual);   // 改开关 → ✨ 金色指示即时对齐
+    // ✨ 校正 Phase 4：全局命名套餐库——加载 / 保存为… / 删除（saveFixBundle / loadFixBundle / deleteFixBundle + populateFixBundles）。
+    win.querySelector('#so-fix-bundle-load').addEventListener('click', () => {
+        const sel = win.querySelector('#so-fix-bundle');
+        const name = sel && sel.value;
+        if (!name) { toastr.info('先选一个已存套餐'); return; }
+        if (loadFixBundle(name)) toastr.success(`已加载套餐「${name}」到本聊天`);
+    });
+    win.querySelector('#so-fix-bundle-save').addEventListener('click', async () => {
+        const name = await uiPrompt('给这套校正配置起个名字（如「硬核西幻」）：', '');
+        const trimmed = (name || '').trim();
+        if (!trimmed) return;   // 取消 / 空 = no-op
+        if (saveFixBundle(trimmed)) { populateFixBundles(); const sel = win.querySelector('#so-fix-bundle'); if (sel) sel.value = trimmed; toastr.success(`已保存套餐「${trimmed}」`); }
+    });
+    win.querySelector('#so-fix-bundle-del').addEventListener('click', async () => {
+        const sel = win.querySelector('#so-fix-bundle');
+        const name = sel && sel.value;
+        if (!name) { toastr.info('先选一个要删的套餐'); return; }
+        if (!(await uiConfirm(`删除套餐「${name}」？`))) return;
+        if (deleteFixBundle(name)) { populateFixBundles(); toastr.success(`已删除套餐「${name}」`); }
+    });
     bind('#so-regex', 'applyRegex');
     bind('#so-wi', 'worldInfoMode');
     bind('#so-sendtemp', 'sendTemperature');
@@ -4374,6 +5419,7 @@ function bindControls() {
 
     // 用户功能请求：反映持久化的自动诊断状态（重载后若 AUTO 仍开着，按钮显示红色 + AUTO）。
     updateDiagButtonVisual();
+    updateFixButtonVisual();
 }
 
 function loadSettingsIntoForm() {
@@ -4390,12 +5436,18 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-card').checked = !!s.includeCard;
     win.querySelector('#so-stat').checked = !!s.chatIncludeStat;
     win.querySelector('#so-world').checked = !!s.chatIncludeWorld;
+    win.querySelector('#so-hidden').checked = !!s.includeHiddenFloors;
+    // ✨ 校正模式 Phase 4：校正控件从【本聊天】生效配置读种子（per-chat 覆盖全局）——不直读 s.fix*。
+    seedFixControls();
+    populateFixBundles();   // ✨ 校正 Phase 4：填充全局命名套餐下拉
     win.querySelector('#so-chatbar-toggle').checked = !!s.showChatBarButton;
     win.querySelector('#so-regex').checked = !!s.applyRegex;
     win.querySelector('#so-wi').value = s.worldInfoMode;
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
     win.querySelector('#so-lb-story').checked = !!s.lorebookIncludeStory;
     win.querySelector('#so-lb-preset').checked = !!s.lorebookUsePreset;
+    reflectLbPreview();   // 「👁 内容预览」开关按钮初始高亮跟随保存的设置
+
     win.querySelector('#so-adv-preset').checked = !!s.advisorUsePreset;
     updateWiHint();
     populatePersonas();
@@ -4445,6 +5497,8 @@ function updateWiHint() {
         hint.textContent = '像主提示词一样扫描聊天：蓝色（常驻）条目始终注入，绿色（关键词）条目在其关键词匹配时注入。';
     } else if (mode === 'all') {
         hint.textContent = '无视关键词，发送所有已启用的世界书条目。适合做规划，但可能会消耗大量 token。';
+    } else if (mode === 'char') {
+        hint.textContent = '只扫描角色相关世界书（角色卡内嵌 + 角色绑定 + 本对话绑定），排除全局与人设世界书；蓝灯常驻 + 绿灯关键词匹配照常。';
     } else {
         hint.textContent = '';
     }
@@ -5168,6 +6222,7 @@ const MODE_PLACEHOLDERS = {
     diagnose: '描述哪里看起来不对，或让我检查最新一次更新 / 审计当前状态…',
     lorebook: '问问这本世界书，或让我改写 / 新增 / 删除某个条目…',
     advisor: '聊聊剧情接下来可以怎么走…（出方案后可一键开始引导）',
+    fix: '想怎么改最新这条回复都行——重写、删改、换语气、调节奏、改设定…说出来，我来改一版…',
 };
 
 // 各模式的空状态：模式图标 + 引导语 +（可选）副标题 + 示例 chip。点一下 chip 把问题填进输入框
@@ -5195,26 +6250,46 @@ const MODE_EMPTY = {
         lead: '一起构思剧情接下来怎么走。',
         chips: ['接下来剧情可以怎么走？给我几个方向。', '基于现在的局势，提一个值得推进的转折。'],
     },
+    // icon 是 Font Awesome 类名（renderEmptyState 拼成 `fa-solid ${icon}`），与上面各模式一致——
+    // 用与校正按钮同款的 fa-wand-magic-sparkles（不是 emoji，emoji 拼进 class 会渲染空白）。
+    fix: {
+        icon: 'fa-wand-magic-sparkles',
+        lead: '手动：在下方输入框直接说要改哪里，只改这一条回复（快、单稿）。<br>自动：每条新回复后台自动清 AI 味——「校正设置」切到「自动」、开「自动校正每条新回复」。',
+        chips: ['这个角色不该知道这件事，重写他的对话', '这个事件的日期不对，回看上下文改正', '这个角色的台词太机械，重写得更像真人', '扩写这一段，补充更多剧情细节'],
+    },
 };
 
 function currentOracleMode() {
-    return diagnoseMode ? 'diagnose' : (lorebookMode ? 'lorebook' : (advisorMode ? 'advisor' : 'chat'));
+    return diagnoseMode ? 'diagnose' : (lorebookMode ? 'lorebook' : (advisorMode ? 'advisor' : (fixMode ? 'fix' : 'chat')));
+}
+
+function modeReturnNote(mode) {
+    if (mode === 'diagnose') return '已返回诊断模式。';
+    if (mode === 'advisor') return '已返回剧情参谋模式。';
+    if (mode === 'fix') return '已返回校正模式。';
+    if (mode === 'lorebook') return '已返回世界书模式。';
+    return '已返回普通聊天模式。';
 }
 
 function setOracleMode(target) {
     diagnoseMode = target === 'diagnose';
     lorebookMode = target === 'lorebook';
     advisorMode = target === 'advisor';
+    fixMode = target === 'fix';
     win.classList.toggle('so-diag-on', diagnoseMode);
     win.classList.toggle('so-lb-on', lorebookMode);
     win.classList.toggle('so-adv-on', advisorMode);
+    win.classList.toggle('so-fix-on', fixMode);
     win.querySelector('#so-diagnose-btn').classList.toggle('so-diag-active', diagnoseMode);
     win.querySelector('#so-lorebook-btn').classList.toggle('so-lb-active', lorebookMode);
     win.querySelector('#so-advisor-btn').classList.toggle('so-adv-active', advisorMode);
+    win.querySelector('#so-fix-btn').classList.toggle('so-fix-active', fixMode);
     inputEl.placeholder = MODE_PLACEHOLDERS[target] || MODE_PLACEHOLDERS.chat;
     if (ENABLE_DIAG_WI_PICKER) refreshDiagPickerUI();   // 诊断「精选条目」栏随模式刷新（用户功能请求）
     // 空侧聊时切换模式要刷新空状态（每模式自带一组引导语 + 示例 chip）；有内容则保留现有记录不动。
     if (messagesEl && !convo.length) { messagesEl.innerHTML = ''; renderEmptyState(); }
+    updateDiagButtonVisual();   // 诊断按钮（含红色 AUTO）状态随模式切换始终对齐（含从子模式回到诊断时）
+    updateFixButtonVisual();    // ✨ 校正按钮：自动校正开启时图标染金（随模式切换对齐）
 }
 
 // 用户功能请求：诊断按钮三态循环 —— 关 → 诊断 → 诊断·自动(AUTO) → 关。两个纯函数便于单测：
@@ -5224,6 +6299,11 @@ function diagButtonState(diagOn, autoOn) {
 }
 function nextDiagState(state) {
     return state === 'off' ? 'diagnose' : (state === 'diagnose' ? 'auto' : 'off');
+}
+// 纯判定：自动诊断已武装、但当前不在诊断视图（从 ⋯「普通聊天」或子模式过来）时，诊断控件应先【回到
+// 诊断视图】（保持自动武装），而不是推进三态循环 → 否则离开诊断视图后再无返回入口（用户报告的死胡同 bug）。
+function diagShouldReveal(diagOn, autoOn) {
+    return autoOn && !diagOn;
 }
 
 // 诊断按钮点击：算出下一态；进入 auto 且还没看过警告时，先弹一次性警告（确认后才真正开启）。
@@ -5238,6 +6318,13 @@ function toggleDiagnose() {
             ? '诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，然后给出一份你可以一键应用的纠正补丁。可以让我检查它、指出哪里看起来不对，或者直接说“审计整个状态”。'
             : '已返回普通聊天模式。');
         updateDiagButtonVisual();
+        if (inputEl) inputEl.focus();
+        return;
+    }
+    // 修复死胡同：自动诊断武装、但当前不在诊断视图（从 ⋯「普通聊天」或子模式过来）→ 点诊断按钮先回到诊断
+    // 视图（保持自动武装），而非按三态循环掉到「关」。再点一次（此时已在诊断视图）才走循环关掉自动。
+    if (diagShouldReveal(diagnoseMode, !!s.autoDiagnoseEnabled)) {
+        setOracleMode('diagnose');
         if (inputEl) inputEl.focus();
         return;
     }
@@ -5279,6 +6366,20 @@ function updateDiagButtonVisual() {
         : '诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）';
 }
 
+// 校正按钮视觉（用户功能请求）：自动校正开启时把 ✨ 图标染金，作为「小指示」。读【本聊天生效】的 autoFixEnabled
+// （getEffectiveFixCfg，与 maybePostReply 同源），所以指示永远跟「实际会不会自动校正」一致。init / 切模式 / 改开关 /
+// 换聊天后调用对齐（与 updateDiagButtonVisual 同款 win 守卫）。
+function updateFixButtonVisual() {
+    if (!win) return;
+    const btn = win.querySelector('#so-fix-btn');
+    if (!btn) return;
+    const auto = ENABLE_REPLY_FIX && !!getEffectiveFixCfg(getSettings(), getFixCfg()).autoFixEnabled;
+    btn.classList.toggle('so-fix-auto', auto);
+    btn.title = auto
+        ? '校正模式 · 自动校正已开启（金色）—— 每条新回复都会自动校正（在校正模式设置里关闭）'
+        : '校正模式 —— 修一修最新这条回复（AI 味 / 对话 / 设定 / 详略…），应用后原文仍在';
+}
+
 // 首次开启自动模式前的一次性警告弹窗（含「不再提示」+ 与 MVU「额外模型解析」不兼容的提醒）。
 function openAutoDiagWarn() {
     if (!win) return;
@@ -5289,30 +6390,52 @@ function openAutoDiagWarn() {
 }
 
 function toggleLorebook() {
-    const entering = !lorebookMode;
-    setOracleMode(entering ? 'lorebook' : 'chat');
-    if (entering) {
-        populateLorebookBooks();
-        modeEntryNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
-    } else {
-        modeEntryNote('已返回普通聊天模式。');
+    if (lorebookMode) {
+        const back = priorOracleMode || 'chat';
+        priorOracleMode = 'chat';
+        setOracleMode(back);
+        modeEntryNote(modeReturnNote(back));
+        inputEl.focus();
+        return;
     }
+    priorOracleMode = currentOracleMode();
+    setOracleMode('lorebook');
+    populateLorebookBooks();
+    modeEntryNote('世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。');
     inputEl.focus();
 }
 
-function toggleAdvisor() {
-    const entering = !advisorMode;
-    setOracleMode(entering ? 'advisor' : 'chat');
-    if (entering) {
-        modeEntryNote('剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
-            + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : ''));
-        // 桥接：从普通模式聊到一半切过来时（侧聊有内容、且还没有方案在引导），
-        // 给一个一键把刚才的讨论正式化成方案的入口。出现时机是确定性的——
-        // 只在这一刻、只在这个条件下，绝不靠关键词探测。
-        if (convoForPrompt().length > 0 && !getPlan()) addBridgeChip();
-    } else {
-        modeEntryNote('已返回普通聊天模式。');
+// 校正模式按钮：进入 / 退出（普通两态，无 AUTO）。杀死开关关闭时 no-op（不可进入）。
+function toggleFix() {
+    if (!ENABLE_REPLY_FIX) return;
+    if (fixMode) {
+        const back = priorOracleMode || 'chat';
+        priorOracleMode = 'chat';
+        setOracleMode(back);
+        modeEntryNote(modeReturnNote(back));
+        if (inputEl) inputEl.focus();
+        return;
     }
+    priorOracleMode = currentOracleMode();
+    setOracleMode('fix');
+    modeEntryNote('校正模式已开启。我会读取最新一条 AI 回复，按你说的把它改一版——你想怎么改都行：重写某段、改语气、调节奏、删减、改掉某个设定或不合适的描写……任何要求都可以。直接说你想改什么，我给出一份可一键应用的校正稿（应用后原文仍在，左滑即可看回）。');
+    if (inputEl) inputEl.focus();
+}
+
+function toggleAdvisor() {
+    if (advisorMode) {
+        const back = priorOracleMode || 'chat';
+        priorOracleMode = 'chat';
+        setOracleMode(back);
+        modeEntryNote(modeReturnNote(back));
+        inputEl.focus();
+        return;
+    }
+    priorOracleMode = currentOracleMode();
+    setOracleMode('advisor');
+    modeEntryNote('剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选择强度（只铺垫 / 自然推进 / 尽快引爆），主聊天的 AI 就会被悄悄引导着把剧情推向那个方向。引导随时可在上方的方案条里查看、调整或停止。'
+        + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : ''));
+    if (convoForPrompt().length > 0 && !getPlan()) addBridgeChip();
     inputEl.focus();
 }
 
@@ -5704,10 +6827,10 @@ function placePlanBar() {
     }
 }
 
-// Fill the book dropdown: "all active" + every known book (active ones marked).
+// Fill the book checklist: every known book as a checkbox (active ones marked ★).
 async function populateLorebookBooks(announce) {
-    const sel = win.querySelector('#so-lb-book');
-    if (!sel) return;
+    const listEl = win.querySelector('#so-lb-book-list');
+    if (!listEl) return;
     const s = getSettings();
     let active = [];
     let all = [];
@@ -5715,38 +6838,66 @@ async function populateLorebookBooks(announce) {
         [active, all] = await Promise.all([getActiveBookNames(), getAllBookNames()]);
     } catch (e) { /* leave empty */ }
 
-    sel.innerHTML = '';
-    const optAll = document.createElement('option');
-    optAll.value = '';
-    optAll.textContent = active.length ? `① 当前激活的全部世界书（${active.length} 本）` : '① 当前激活的全部世界书（无）';
-    sel.appendChild(optAll);
+    // Prune selections that no longer exist on disk.
+    if (Array.isArray(s.lorebookTargets) && s.lorebookTargets.length) {
+        const allSet = new Set(all);
+        const kept = s.lorebookTargets.filter((n) => allSet.has(n));
+        if (kept.length !== s.lorebookTargets.length) { s.lorebookTargets = kept; save(); }
+    }
 
+    const chosen = new Set(Array.isArray(s.lorebookTargets) ? s.lorebookTargets : []);
     const activeSet = new Set(active);
-    for (const name of all) {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = activeSet.has(name) ? `★ ${name}` : name;
-        sel.appendChild(opt);
-    }
-
-    // Restore selection if it still exists; otherwise fall back to "all active".
-    if (s.lorebookTarget && all.includes(s.lorebookTarget)) {
-        sel.value = s.lorebookTarget;
+    listEl.innerHTML = '';
+    if (!all.length) {
+        listEl.innerHTML = '<div class="so-lb-ent-empty">（没有找到任何世界书。）</div>';
     } else {
-        if (s.lorebookTarget) { s.lorebookTarget = ''; save(); }
-        sel.value = '';
+        for (const name of all) {
+            const row = document.createElement('label');
+            row.className = 'so-lb-book-opt';
+            row.dataset.book = name;
+            const star = activeSet.has(name) ? '★ ' : '';
+            row.innerHTML = `<input type="checkbox"${chosen.has(name) ? ' checked' : ''}><span class="so-lb-book-name"></span>`;
+            row.querySelector('.so-lb-book-name').textContent = star + name;
+            listEl.appendChild(row);
+        }
     }
+    updateLbBookSummary();
     updateLbHint();
     populateLorebookEntries();
     if (announce) addSystemNote('已刷新世界书列表。');
 }
 
+// Summary text on the picker's <summary>: "全部激活的世界书" or "已选 N 本".
+function updateLbBookSummary() {
+    const sum = win.querySelector('#so-lb-bookpick-sum');
+    if (!sum) return;
+    const t = getSettings().lorebookTargets;
+    sum.textContent = (Array.isArray(t) && t.length) ? `已选 ${t.length} 本世界书` : '全部激活的世界书';
+}
+
+// Recompute lorebookTargets from the checked rows; refresh dependent UI.
+function onLbBookSelectionChange() {
+    const s = getSettings();
+    const picked = [];
+    for (const box of win.querySelectorAll('#so-lb-book-list input[type="checkbox"]')) {
+        if (box.checked) {
+            const row = box.closest('.so-lb-book-opt');
+            if (row && row.dataset.book) picked.push(row.dataset.book);
+        }
+    }
+    s.lorebookTargets = picked;
+    save();
+    updateLbBookSummary();
+    updateLbHint();
+    populateLorebookEntries();
+}
+
 function updateLbHint() {
     const hint = win.querySelector('#so-lb-hint');
     if (!hint) return;
-    const s = getSettings();
-    hint.textContent = s.lorebookTarget
-        ? `将聊 / 编辑：「${s.lorebookTarget}」这一本。`
+    const t = getSettings().lorebookTargets;
+    hint.textContent = (Array.isArray(t) && t.length)
+        ? `将聊 / 编辑：已选 ${t.length} 本世界书（${t.join('、')}）。可在下方按条目精选以控制 token。`
         : '将聊 / 编辑：当前角色卡 / 聊天 / 全局所激活的全部世界书。可在下方按条目精选（含仅蓝灯 / 仅绿灯等快捷选择）以控制 token 消耗。';
 }
 
@@ -5878,6 +7029,33 @@ function updateLbFilteredBtn() {
     btn.disabled = !(f && f.value && f.value.trim());
 }
 
+// 纯函数：把一条世界书条目的 raw content 压成选条目器里展示的一行短摘要——折叠所有空白
+// （含换行 / 制表 / 全角空格）为单空格、首尾去空白、超过 cap 字裁断加省略号；空 / 纯空白回空串。
+// 宏（{{user}} 等）字面保留——这是只读预览、不喂模型、不做锚点，遵循世界书模式的逐字原则。可单测。
+function entryPreviewText(content, cap = 200) {
+    const s = String(content == null ? '' : content).replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    return s.length > cap ? s.slice(0, cap) + '…' : s;
+}
+
+// 把「内容预览」开关的当前状态映射到 DOM：给条目列加 / 去 .so-lb-show-preview（CSS 据此整列显隐预览行），
+// 并同步顶部开关按钮的 .active 高亮。在渲染条目、点开关、初始化绑定时各调一次。
+function reflectLbPreview() {
+    const on = !!getSettings().lbShowEntryPreview;
+    const list = win.querySelector('#so-lb-entries-list');
+    const btn = win.querySelector('#so-lb-preview-toggle');
+    if (list) list.classList.toggle('so-lb-show-preview', on);
+    if (btn) btn.classList.toggle('active', on);
+}
+
+// 点「👁 内容预览」：翻转设置、持久化、刷新 DOM。纯展示开关，不重建列表（预览行始终在 DOM 里、靠 CSS 显隐）。
+function toggleLbPreview() {
+    const s = getSettings();
+    s.lbShowEntryPreview = !s.lbShowEntryPreview;
+    save();
+    reflectLbPreview();
+}
+
 // Build / refresh the entry checklist. A specific target -> just that book's
 // entries. "All active books" ('') -> every active book's entries, grouped under
 // per-book headers (the same book set buildLorebookContext feeds in all-active
@@ -5887,17 +7065,16 @@ async function populateLorebookEntries() {
     const box = win.querySelector('#so-lb-entries');
     const list = win.querySelector('#so-lb-entries-list');
     if (!box || !list) return;
-    const target = getSettings().lorebookTarget;
-
+    const s = getSettings();
     let books;
-    if (target) {
-        books = [target];
-    } else {
-        try { books = await getActiveBookNames(); } catch (e) { books = []; }
-    }
+    try {
+        const [allNames, activeNames] = await Promise.all([getAllBookNames(), getActiveBookNames()]);
+        books = resolveLbTargetNames(s.lorebookTargets, allNames, activeNames);
+    } catch (e) { books = []; }
     if (!books.length) { box.classList.remove('shown'); return; }
     box.classList.add('shown');
-    const grouped = !target;   // per-book headers only when showing every active book
+    reflectLbPreview();   // 把「内容预览」开关状态贴到列表 + 按钮（每次渲染都对齐）
+    const grouped = books.length > 1;   // per-book headers whenever more than one book is shown
 
     list.innerHTML = '<div class="so-lb-ent-empty">读取条目中…</div>';
     const mod = await getWiEditApi();
@@ -5959,8 +7136,14 @@ async function populateLorebookEntries() {
             row.dataset.type = e.disable ? 'off' : (e.constant ? 'blue' : 'green');
             row.innerHTML = `<input type="checkbox" data-uid="${e.uid}"${checked ? ' checked' : ''}>` +
                 `<span class="so-lb-ent-type so-lb-type-${e.disable ? 'off' : (e.constant ? 'blue' : 'green')}"></span>` +
-                `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>`;
+                `<span class="so-lb-ent-uid">#${e.uid}</span><span class="so-lb-ent-title"></span>` +
+                `<span class="so-lb-ent-preview"></span>`;
             row.querySelector('.so-lb-ent-title').textContent = title;
+            // 内容预览（开关在 .so-lb-show-preview 上；textContent 不走 innerHTML —— raw lore 绝不当 HTML 解析）。
+            const prevEl = row.querySelector('.so-lb-ent-preview');
+            const prevText = entryPreviewText(e.content);
+            prevEl.textContent = prevText || '（空条目）';
+            if (!prevText) prevEl.classList.add('is-empty');
             row.querySelector('input').addEventListener('change', (ev) => toggleLbEntry(name, e.uid, ev.target.checked));
             list.appendChild(row);
         }
@@ -6262,6 +7445,110 @@ function loadDiagSelForChat() {
     refreshDiagPickerUI();
 }
 
+/* ------------------------------------------------------------------ *
+ * ✨ 校正模式 Phase 4：把校正控件（#so-fix-bar 里的目标 / 约束 / 上下文开关 / 自动）
+ * 与【本聊天】生效配置对齐。loadSettingsIntoForm 初次填表、切聊天（onChatChanged）都调 seedFixControls。
+ * ------------------------------------------------------------------ */
+// 校正设置面板：按 fixSettingsView 显示手动 / 自动那一套（纯视图切换，不改任何行为）。窗口未建好时静默跳过。
+function applyFixModeView() {
+    if (!win) return;
+    const view = (getSettings().fixSettingsView === 'auto') ? 'auto' : 'manual';
+    const sel = win.querySelector('#so-fix-mode-select');
+    if (sel) sel.value = view;
+    const man = win.querySelector('#so-fix-manual');
+    const auto = win.querySelector('#so-fix-auto-wrap');
+    if (man) man.style.display = (view === 'manual') ? '' : 'none';
+    if (auto) auto.style.display = (view === 'auto') ? '' : 'none';
+}
+
+// 经【自定义补全预设】发送时（fixM_/fixA_usePreset，手动 / 自动各自独立），角色卡 / 世界书由预设的 charDescription / worldInfo 标记提供 →
+// 校正设置里的「带角色卡 / 带世界书」勾选会被忽略，故置灰（disabled + 变淡 + 悬停说明）。手动 + 自动两组都处理。
+// 概要 / 前文仍走 slim 信封（不由预设标记提供），故不灰。
+function applyFixPresetLock() {
+    if (!win) return;
+    const s = getSettings();
+    const lockIds = (ids, locked) => {
+        for (const id of ids) {
+            const el = win.querySelector(id);
+            if (!el) continue;
+            el.disabled = locked;
+            const label = el.closest('label');
+            if (label) {
+                label.style.opacity = locked ? '0.45' : '';
+                label.title = locked ? '已由自定义补全预设的标记提供（角色卡 / 世界书）——预设模式下此项被忽略' : '';
+            }
+        }
+    };
+    lockIds(['#so-fixm-card', '#so-fixm-world'], fixUsePresetFor(s, 'manual'));   // 手动组按 fixM_usePreset
+    lockIds(['#so-fix-card', '#so-fix-world'], fixUsePresetFor(s, 'auto'));       // 自动组按 fixA_usePreset
+}
+
+// 用【本聊天】生效配置（per-chat 覆盖全局）回填校正控件（手动 fixM_* + 自动 fixA_*），并按 fixSettingsView 切视图。
+// 控件未建好（窗口未初始化）时静默跳过。
+function seedFixControls() {
+    if (!win) return;
+    const cfg = getEffectiveFixCfg(getSettings(), getFixCfg());
+    const set = (id, prop, val) => { const el = win.querySelector(id); if (el) el[prop] = val; };
+    // 手动（fixM_*）
+    set('#so-fixm-depth', 'value', cfg.fixM_contextDepth);
+    set('#so-fixm-card', 'checked', !!cfg.fixM_includeCard);
+    set('#so-fixm-world', 'checked', !!cfg.fixM_includeWorld);
+    set('#so-fixm-summary', 'checked', !!cfg.fixM_includeSummary);
+    // 自动（fixA_*）
+    set('#so-fix-tgt-slop', 'checked', !!cfg.fixA_targetSlop);
+    set('#so-fix-tgt-dialogue', 'checked', !!cfg.fixA_targetDialogue);
+    set('#so-fix-tgt-precision', 'checked', !!cfg.fixA_targetPrecision);
+    set('#so-fix-tgt-magic', 'checked', !!cfg.fixA_targetMagic);
+    set('#so-fix-tgt-pacing', 'checked', !!cfg.fixA_targetPacing);
+    set('#so-fix-keep', 'value', cfg.fixA_keepTags || '');
+    set('#so-fix-drop', 'value', cfg.fixA_dropTags || '');
+    set('#so-fix-know', 'value', cfg.fixA_knowledgeBoundary || '');
+    set('#so-fix-guard', 'value', cfg.fixA_guardrails || '');
+    set('#so-fix-tighten', 'checked', cfg.fixA_tighten !== false);
+    set('#so-fix-card', 'checked', !!cfg.fixA_includeCard);
+    set('#so-fix-ctx', 'checked', !!cfg.fixA_includeContext);
+    set('#so-fix-ctx-depth', 'value', cfg.fixA_contextDepth);
+    set('#so-fix-world', 'checked', !!cfg.fixA_includeWorld);
+    set('#so-fixa-summary', 'checked', !!cfg.fixA_includeSummary);
+    set('#so-fix-auto', 'checked', !!cfg.autoFixEnabled);
+    set('#so-fixm-preset', 'checked', !!getSettings().fixM_usePreset);   // 全局开关（手动）；不在 cfg / FIX_CFG_KEYS 里
+    set('#so-fixa-preset', 'checked', !!getSettings().fixA_usePreset);   // 全局开关（自动）
+    applyFixPresetLock();   // 预设模式下置灰「带角色卡 / 带世界书」（由预设标记提供）
+    applyFixModeView();
+}
+
+// 切聊天时把校正控件重置成新聊天的生效配置（同 loadConvoForChat / loadDiagSelForChat 风格）。
+function loadFixCfgForChat() {
+    seedFixControls();
+    updateFixButtonVisual();   // 切聊天后按本聊天生效的 autoFixEnabled 对齐 ✨ 金色指示
+}
+
+// ✨ 校正模式 Phase 4：用全局 fixBundles 的名字填充套餐下拉。窗口打开时 + 每次存 / 删后调用。
+function populateFixBundles() {
+    if (!win) return;
+    const sel = win.querySelector('#so-fix-bundle');
+    if (!sel) return;
+    const prev = sel.value;
+    const bundles = (Array.isArray(getSettings().fixBundles) ? getSettings().fixBundles : []);
+    sel.innerHTML = '';
+    if (!bundles.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '（暂无已存套餐）';
+        sel.appendChild(opt);
+    } else {
+        for (const b of bundles) {
+            if (!b || !b.name) continue;
+            const opt = document.createElement('option');
+            opt.value = b.name;
+            opt.textContent = b.name;
+            sel.appendChild(opt);
+        }
+        // 尽量保留原选中项（存 / 删后列表变了仍停在合理位置）。
+        if (prev && bundles.some((b) => b && b.name === prev)) sel.value = prev;
+    }
+}
+
 // 让选条目器 UI（两个开关 + 可见性 + 列表）与本聊天元数据对齐。进入诊断模式 / 切聊天时调用。
 function refreshDiagPickerUI() {
     if (!win || !ENABLE_DIAG_WI_PICKER) return;
@@ -6308,6 +7595,7 @@ function buildSystemPrompt() {
     if (diagnoseMode) return buildDiagnosePrompt(ctx, s);
     if (lorebookMode) return buildLorebookPrompt(ctx, s);
     if (advisorMode) return buildAdvisorPrompt(ctx, s);
+    if (fixMode) return buildFixPrompt(ctx, s);
 
     const parts = [resolveSystemPrompt(s)];
 
@@ -6427,6 +7715,39 @@ function buildDiagnosePrompt(ctx, s) {
     return buildDiagnosePromptFrom(ctx, s, {
         wiBlock: worldInfoBlock, statStr: diagStatData, latestBlock: diagLatestUpdate,
     });
+}
+
+// 纯函数：把可选上下文块（角色卡 / 激活世界书 / 前文）+ 待校正正文拼成校正调用信封。空块省略；
+// <text_to_transform> 始终存在。顺序：characters → world_info → scene_context → text_to_transform。可单测。
+function buildFixEnvelope(blocks) {
+    const b = blocks || {};
+    const parts = [];
+    const card = String(b.card || '').trim();
+    const world = String(b.world || '').trim();
+    const summary = String(b.summary || '').trim();   // 📜剧情概要 / 前情提要（用户提供）
+    const context = String(b.context || '').trim();
+    if (card) parts.push('<characters>\n' + card + '\n</characters>');
+    if (world) parts.push('<world_info>\n' + world + '\n</world_info>');
+    // 概要在前情、scene_context 是最近对话——按时间线放在世界书之后、最近对话之前。
+    if (summary) parts.push('<story_summary>\n' + summary + '\n</story_summary>');
+    if (context) parts.push('<scene_context>\n' + context + '\n</scene_context>');
+    parts.push('<text_to_transform>\n' + String(b.reply || '').trim() + '\n</text_to_transform>');
+    return parts.join('\n\n');
+}
+
+// 校正系统提示 = 基础规则（可被 s.fixSystemPrompt 覆盖，空 = 用内置常量）+ 内嵌的【待校正正文】。
+function buildFixPrompt(ctx, s) {
+    const override = (s.fixSystemPrompt || '').trim();
+    const base = override || (fixActiveMode === 'manual'
+        ? FIX_SYSTEM_PROMPT_MANUAL
+        : (fixTightenActive ? FIX_SYSTEM_PROMPT_TIGHTEN : FIX_SYSTEM_PROMPT));
+    let subst = (t) => t;
+    if (ctx && typeof ctx.substituteParams === 'function') {
+        subst = (t) => { try { return ctx.substituteParams(t); } catch (e) { return t; } };
+    }
+    const reply = fixTargetProse || '（未捕获到待校正的回复——请确认主聊天里已有一条 AI 回复）';
+    const envelope = buildFixEnvelope({ card: fixCardBlock, world: fixWorldBlock, summary: fixSummaryBlock, context: fixContextBlock, reply });
+    return subst(base) + '\n\n' + envelope;
 }
 
 // 无状态版诊断提示词构建器（用入参而非模块变量）——这样「自动诊断」后台运行能自建提示词、
@@ -6623,12 +7944,18 @@ function buildCardSection(ctx) {
     return cardLines.length ? '=== 角色 / 设定 ===\n' + cardLines.join('\n\n') : '';
 }
 
+// 一条主聊天消息是否进入喂给神谕的剧情记录。默认排除 /hide 的隐藏楼层（is_system）；
+// includeHidden（用户设置 includeHiddenFloors）勾选后纳入。纯谓词，便于单测。
+function messageVisibleForTranscript(m, includeHidden) {
+    return !!m && (includeHidden || !m.is_system) && typeof m.mes === 'string';
+}
+
 // Story-context turns as role-tagged objects {role:'user'|'assistant', name, text}.
 // Mirrors ST's prompt builder: drop system messages, run each through the regex
 // engine (isPrompt, depth relative to full chat), trim empties, take last N.
 function buildTranscriptTurns(ctx, s, keepMechanism = diagnoseMode) {
     if (s.contextDepth === 0) return [];
-    const coreChat = (ctx.chat || []).filter((m) => m && !m.is_system && typeof m.mes === 'string');
+    const coreChat = (ctx.chat || []).filter((m) => messageVisibleForTranscript(m, s.includeHiddenFloors));
     const useRegex = s.applyRegex && regexEngine && regexEngine.getRegexedString;
 
     let processed = coreChat.map((m, index) => {
@@ -6747,7 +8074,10 @@ function buildMessages() {
     if (advisorMode && s.advisorUsePreset && presetCurationActive(s)) {
         return buildAdvisorPresetMessages(s);
     }
-    if (!diagnoseMode && !lorebookMode && !advisorMode && presetCurationActive(s)) {
+    if (fixMode && fixUsePresetFor(s, 'manual') && presetCurationActive(s)) {
+        return buildFixPresetMessages(s);   // 自由发挥（手动）：用户那句话在 convoForPrompt() 里，directive 省略
+    }
+    if (!diagnoseMode && !lorebookMode && !advisorMode && !fixMode && presetCurationActive(s)) {
         return buildPresetMessages(s);
     }
     return [{ role: 'system', content: buildSystemPrompt() }, ...convoForPrompt()];
@@ -6892,6 +8222,47 @@ function buildLorebookPresetMessages(s) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 校正模式（手动 + 自动）THROUGH a curated preset（opt-in: fixM_/fixA_usePreset，各自独立；仅破限 / 越狱用）。
+ * 保留预设的【文本块（含其角色——破限 / 框架 / 格式 / few-shot 都照旧）】，并【展开 RP 内容标记】（charDescription /
+ * worldInfo / scenario / 示例 / 人格 照预设位置 expandMarker）——这样校正模型能看到角色卡 / 世界书（改对话 / 知不知道
+ * 某事都用得上）。把校正调用塞到 chatHistory 位：system = buildFixPrompt（信封已 slim：仅 reply + 概要 + 前文 + 指令；
+ * 卡 / 世界书不在此、由上面标记提供——captureFixContext 在预设模式已把信封的卡 / 世界书置空、免重复），紧跟 user =
+ * directive（手动那句话 / 按目标 / 自动的指令）。directive 省略时（自由发挥手动经 buildMessages 进来）用 convoForPrompt()。
+ * buildFixPrompt 仍按 fixActiveMode 选系统提示；captureFixContext 已先跑（含 wiBefore/wiAfter 备槽给 worldInfo 标记）。
+ * ------------------------------------------------------------------ */
+function buildFixPresetMessages(s, directive) {
+    const ctx = getCtx();
+    const snap = getCuratedSnapshot(s, s.sysPromptPresetName);
+    const items = (snap && snap.items) || [];
+    const out = [];
+
+    let placed = false;
+    const placeFix = () => {
+        if (placed) return;
+        pushMsg(out, 'system', buildFixPrompt(ctx, s));
+        if (directive != null) pushMsg(out, 'user', directive);
+        else for (const m of convoForPrompt()) pushMsg(out, m.role, m.content);
+        placed = true;
+    };
+
+    for (const it of items) {
+        if (it.kind === 'marker') {
+            // chatHistory 槽 = 校正调用（slim 信封）；其余 RP 内容标记照预设位置展开（卡 / 世界书 / 场景 / 示例 / 人格），
+            // 让校正模型看到角色 / 世界设定（改对话 / 知不知道某事都用得上），且只出现一次（信封已 slim）。
+            if (it.identifier === 'chatHistory') placeFix();
+            else expandMarker(out, it.identifier, ctx, s);
+        } else {
+            pushMsg(out, it.role || 'system', subst(ctx, it.content));
+        }
+    }
+    placeFix(); // 预设里没有 chatHistory marker -> 追加到末尾
+
+    return out.length ? out : (directive != null
+        ? [{ role: 'system', content: buildFixPrompt(ctx, s) }, { role: 'user', content: directive }]
+        : [{ role: 'system', content: buildFixPrompt(ctx, s) }, ...convoForPrompt()]);
+}
+
+/* ------------------------------------------------------------------ *
  * Advisor mode THROUGH a curated preset (opt-in: s.advisorUsePreset).
  * Same skeleton as buildLorebookPresetMessages: keep the preset's TEXT blocks
  * (jailbreak / formatting / framing), skip the RP markers (the advisor block
@@ -6954,6 +8325,12 @@ async function onSend() {
     await generateReply();
 }
 
+// 纯判定：这次生成失败算不算用户主动「停止」（AbortError）。是 → 不给「重试」按钮（中止是有意的）；
+// 其余错误（429 限流 / 网络 / 空回复传 null）都不是中止 → 给重试。容错：无错误对象按非中止处理。
+function isUserAbort(err) {
+    return err?.name === 'AbortError';
+}
+
 // Generate one assistant reply for the current tail of `convo` (which must already
 // end with the user turn being answered). Shared by send / edit / regenerate.
 async function generateReply() {
@@ -6973,7 +8350,7 @@ async function generateReply() {
         } else {
             // 原行为：强制一次世界书扫描（保留 'all' 选择），再从原始书补回 [mvu_update] 规则——buildWorldInfo
             // 按设计会剥掉它们（聊天 / 参谋不想要），且 MVU 额外模型解析模式还会把它们从扫描里藏掉，而诊断正需要它们。
-            worldInfoBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
+            worldInfoBlock = await buildWorldInfo(wiContextMode(s));
             const mvuRules = await collectMvuUpdateRules(worldInfoBlock);
             if (mvuRules.length) {
                 worldInfoBlock = [worldInfoBlock, ...mvuRules].filter(Boolean).join('\n\n');
@@ -6991,11 +8368,14 @@ async function generateReply() {
         // card's blue entries + keyword-matched green entries are always present
         // (keep 'all' if the user chose it) — gives the arc lore to recall.
         // Builds its own full-history transcript inside buildAdvisorPrompt.
-        worldInfoBlock = await buildWorldInfo(s.worldInfoMode === 'all' ? 'all' : 'st');
+        worldInfoBlock = await buildWorldInfo(wiContextMode(s));
         // Live MVU variable state (好感度 / 时间 / 资源…) — hard story facts the
         // proposed beats must not contradict. Silently absent for non-MVU cards.
         const stat = await getMvuStatData();
         advStatData = stat ? JSON.stringify(stat, null, 2) : '';
+    } else if (fixMode) {
+        // 校正模式（手动 / 引导式：在输入框直接说要改什么）：抓待校正回复 + 手动那套上下文（卡 / 世界书 / 概要 / 全部前文）。
+        await captureFixContext(s, { mode: 'manual' });
     } else if (presetCurationActive(s)) {
         // Faithful assembly needs WI split into the Before/After-Char-Defs slots.
         const split = await buildWorldInfoSplit();
@@ -7009,7 +8389,7 @@ async function generateReply() {
     // Normal chat mode only: fetch the authoritative variable state (or leave ''
     // so the prompt builders emit the honest-refusal caveat instead).
     chatStatData = '';
-    if (!diagnoseMode && !lorebookMode && !advisorMode && s.chatIncludeStat) {
+    if (!diagnoseMode && !lorebookMode && !advisorMode && !fixMode && s.chatIncludeStat) {
         const st = await getMvuStatData();
         chatStatData = st ? JSON.stringify(st, null, 2) : '';
     }
@@ -7017,7 +8397,7 @@ async function generateReply() {
     // 外部扩展世界信息（世界引擎等）——普通聊天与剧情参谋两种模式都附带（用户功能请求）；
     // 诊断 / 世界书模式不需要。无相关扩展时 assembleExternalWorld() 返回 ''，整段省略。
     chatWorldData = '';
-    if (!diagnoseMode && !lorebookMode && s.chatIncludeWorld) {
+    if (!diagnoseMode && !lorebookMode && !fixMode && s.chatIncludeWorld) {
         chatWorldData = assembleExternalWorld();
     }
 
@@ -7025,7 +8405,7 @@ async function generateReply() {
     // Snapshot the exact prompt for the debug viewer (both modes).
     lastPrompt = messages.map((m) => ({ role: m.role, content: m.content }));
     lastPromptMeta = {
-        mode: diagnoseMode ? '诊断' : (lorebookMode ? '世界书' : (advisorMode ? '参谋' : '聊天')),
+        mode: diagnoseMode ? '诊断' : (lorebookMode ? '世界书' : (advisorMode ? '参谋' : (fixMode ? '校正' : '聊天'))),
         target: s.mode === 'direct' ? (s.model || '直连') : '配置文件',
         chars: lastPrompt.reduce((n, m) => n + (m.content ? m.content.length : 0), 0),
         time: new Date().toLocaleTimeString(),
@@ -7044,7 +8424,7 @@ async function generateReply() {
         // "thinking" before any visible output — too small a cap yields an empty
         // reply (budget gone during thinking) or a patch cut off mid-token. Give
         // Diagnose a generous floor so a full 审计 has room to finish.
-        const effMaxTokens = diagnoseMode ? Math.max(s.maxTokens, 4096) : s.maxTokens;
+        const effMaxTokens = (diagnoseMode || fixMode) ? Math.max(s.maxTokens, 4096) : s.maxTokens;
         if (s.mode === 'direct') {
             const url = normalizeUrl(s.endpoint);
             const body = {
@@ -7092,6 +8472,7 @@ async function generateReply() {
                 ? '(空回复) — 审计可能把 token 预算用光了（推理也算在内）。调大设置里的「最大 token 数」，或问得更聚焦一点（比如只审某一类变量）。'
                 : '(空回复) — 多半是「最大 token 数」太小、或被模型思考占满了。到设置里调大它再试。';
             contentEl.classList.add('so-error');
+            addRetryControl(assistantEl, aEntry);   // 空回复也给「↻ 重试」（与真实失败一致）
         } else {
             // Strip main-chat mechanism blocks (<UpdateVariable>) the preset's
             // output contract may have coaxed out of the model — display AND
@@ -7147,19 +8528,270 @@ async function generateReply() {
             } else if (advisorMode) {
                 const plans = parseStoryPlans(cleanText);
                 if (plans.length) addPlanControls(assistantEl, plans);
+            } else if (fixMode) {
+                // 失败时 .so-content 已显示剥离机制/思维链后的 cleanText，不覆盖它——只补一条说明 note。
+                if (!renderFixCard(assistantEl, contentEl, aEntry, finalText)) {
+                    addSystemNote('没能从模型回复里解析出 <FixedReply> 校正稿，已原样保留。请检查连接/模型，或换一句指令重试。');
+                }
             }
         }
     } catch (err) {
         clearTyping();
-        const aborted = err?.name === 'AbortError';
+        const aborted = isUserAbort(err);
         contentEl.textContent = aborted ? '(已停止)' : `错误：${err?.message || err}`;
-        if (!aborted) contentEl.classList.add('so-error');
+        if (!aborted) {
+            contentEl.classList.add('so-error');
+            addRetryControl(assistantEl, aEntry);   // 失败（429 等）→ 常显「↻ 重试」，点它重发那一轮（不用重打）
+        }
         console.error('[Story Oracle]', err);
     } finally {
         setGenerating(false);
         abortCtl = null;
         scrollToBottom();
     }
+}
+
+// 抓取待校正回复 + 按开关备好上下文块。含前文用 buildTranscriptTurns 多取一条再去掉末条——末条就是待校正回复本身
+// （已在 <text_to_transform>，不重复喂；与 recast 的 slice(-(N+1),-1) 同理）。generateReply 的 fixMode 分支与 runFixByTargets 共用。
+// mode='manual'（在输入框直接说要改什么）或 'auto'（按目标校正按钮 / 每条新回复自动校正）。两套设置经
+// resolveFixModeCfg 归一后彻底独立：手动=上下文丰富 / 无目标 / 不收紧 / 无排除区；自动=按 fixA_* 的目标 + 上下文 +
+// 排除区 + 收紧。排除区仅自动有（手动 keepTags/dropTags 恒空）；MVU 机制块两模式都自动剥离（composeFixedReply 原样接回）。
+async function captureFixContext(s, { mode = 'manual' } = {}) {
+    const ctx = getCtx();
+    // 走【本聊天】生效值（per-chat 覆盖全局 s），再按 mode 归一成手动 / 自动各自的一套——绝不直读 fixM_/fixA_ 原始键。
+    const norm = resolveFixModeCfg(getEffectiveFixCfg(s, getFixCfg()), mode);
+    const latest = getLatestAiMessage();
+    fixTargetIdx = latest.idx;
+    fixOriginalReply = latest.text;
+    const ex = extractExcludedSections(latest.text, norm.keepTags, norm.dropTags);   // 排除区（仅自动）；思考块去留由用户「保留/丢弃」决定
+    fixTargetProse = stripMechanismBlocks(ex.prose);   // 仍自动剥离 MVU 机制块（<UpdateVariable>，composeFixedReply 会原样接回）
+    fixExtraKeep = ex.keep;
+    fixSummaryBlock = norm.includeSummary ? getSummary() : '';   // 📜剧情概要（手动默认带、自动可选）；buildFixEnvelope 包成 <story_summary>
+    fixTightenActive = norm.tighten;   // ✨ 收紧：手动恒 false（单稿省时间）；自动按 ✂️收紧 开关（默认开）
+    fixActiveMode = mode;              // buildFixPrompt 据此选系统提示：手动 → FIX_SYSTEM_PROMPT_MANUAL；自动 → FIX_SYSTEM_PROMPT(_TIGHTEN)
+    if (norm.includeContext) {
+        const depth = norm.contextDepth | 0;              // -1（或任何非正数）= 全部前文
+        const fetchDepth = depth > 0 ? depth + 1 : -1;    // 多取 1 条以便下面去掉待校正回复；非正数→-1 取全部
+        const turns = buildTranscriptTurns(ctx, { ...s, contextDepth: fetchDepth }, false);
+        const prior = turns.slice(0, -1);   // 去掉末条（待校正回复本身）
+        fixContextBlock = prior.map((l) => `${l.name}: ${l.text}`).join('\n\n');
+    } else {
+        fixContextBlock = '';
+    }
+    // 卡 / 世界书：经【自定义补全预设】发送时（fixM_/fixA_usePreset + 已精选预设），由预设的 charDescription / worldInfo 标记在
+    // 各自位置提供（见 buildFixPresetMessages 的 expandMarker），故信封里【不再带】卡 / 世界书（slim，免重复）——
+    // 改备 before/after 两槽给那两个标记。否则（普通发送）按 fix 模式上下文开关带卡 / 世界书。概要 / 前文两模式都仍在信封里。
+    if (fixUsePresetFor(s, mode) && presetCurationActive(s)) {
+        fixCardBlock = '';
+        fixWorldBlock = '';
+        const split = await buildWorldInfoSplit();
+        wiBefore = split.before;
+        wiAfter = split.after;
+    } else {
+        fixCardBlock = norm.includeCard ? buildCardSection(ctx) : '';
+        fixWorldBlock = norm.includeWorld ? await buildWorldInfo('st') : '';
+    }
+}
+
+// 校正卡的「解析成功 → 渲染 → 出按钮」公共段：generateReply 的 fixMode 分支与 runFixByTargets 共用（Phase 2b 评审要求去重）。
+// 只处理解析成功这一支（真正重复的那段）：历史存干净校正正文 + persistConvo + 把校正稿渲染进 .so-content（同普通回复
+// 路径，不动 .so-bubble.innerHTML，否则会连角色标签/复制重生删除按钮一起抹掉）+ 在 .so-bubble 层挂「发现并修正」note
+// + 出「应用到回复」按钮条。读 module 级 fixOriginalReply/fixTargetIdx/fixExtraKeep（captureFixContext 已抓好）。
+// 返回 true=已渲染校正卡；false=解析不出 <FixedReply>，**失败处理留给各调用点自己做**（两处失败语义不同：手动分支此时
+// .so-content 已显示剥离后的 cleanText、不应覆盖；按目标分支要把原文/「（空回复）」回填——故不在这里统一）。
+function renderFixCard(assistantEl, contentEl, aEntry, finalText) {
+    const parsed = parseFixedReply(finalText);
+    if (!parsed) return false;
+    aEntry.content = parsed.fixed;   // 历史里存干净的校正正文，而非原始 <FixedReply> 标签
+    persistConvo();
+    const html = renderReplyHtml(parsed.fixed);
+    if (html != null) {
+        contentEl.innerHTML = html;
+        contentEl.classList.add('so-rendered');
+        contentEl.style.whiteSpace = 'normal';
+    } else {
+        contentEl.textContent = parsed.fixed;
+    }
+    // 无改动检测：模型把原文原样返回（手动模式没有 <problems> 可解释——否则用户只看到「同样的输出、没说明」，
+    // 这正是用户报的「偶尔拒绝改动、又不解释」）。明确告知，且【不出「应用」按钮】——应用一条与原文相同的 swipe 没意义。
+    if (fixNoOp(fixTargetProse, parsed.fixed)) {
+        const note = document.createElement('div');
+        note.className = 'so-fix-changes';
+        note.textContent = '模型没有做出改动——它认为按当前要求无需修改。可换一句更具体的指令、或调整目标后再试。';
+        assistantEl.querySelector('.so-bubble')?.appendChild(note);
+        return true;   // 已处理（无 <FixedReply> 解析失败那条 note 不该再补）；但不挂应用按钮
+    }
+    if (parsed.problems) {
+        const note = document.createElement('div');
+        note.className = 'so-fix-changes';
+        note.textContent = '发现并修正：\n' + parsed.problems;
+        // 「发现并修正」note 挂在 .so-bubble 层（同 addApplyControls 的做法），落在 .so-content 下方而非混进正文。
+        assistantEl.querySelector('.so-bubble')?.appendChild(note);
+    }
+    addFixApplyControls(assistantEl, parsed, fixOriginalReply, fixTargetIdx, fixExtraKeep);
+    return true;
+}
+
+// 「按目标校正最新回复」：用勾选的目标 + 约束（不是手动输入）当指令，对最新回复跑一次两段式校正并出卡。
+// 这是后续自动模式的核心，这里由按钮手动触发。一次性非流式调用（仿 runAutoDiagnose）。
+async function runFixByTargets() {
+    if (isGenerating) return;
+    const s = getSettings();
+    if (s.mode === 'direct' && (!s.endpoint || !s.model)) { addSystemNote('请先在设置里配置直连端点与模型。'); return; }
+    if (s.mode === 'profile' && !s.profileId) { addSystemNote('请先在设置里选择一个连接配置档。'); return; }
+    await captureFixContext(s, { mode: 'auto' });   // 「按目标校正」= 自动那套（双稿 / 目标 / 上下文按 fixA_*），手动触发一次
+    if (!fixTargetProse.trim()) { addSystemNote('没找到可校正的 AI 回复（主聊天里要先有一条 AI 回复）。'); return; }
+    // 自动模式配置（per-chat 覆盖全局，再经 resolveFixModeCfg 归一）。
+    const a = resolveFixModeCfg(getEffectiveFixCfg(s, getFixCfg()), 'auto');
+    const directive = compileFixTargets(
+        a.targets,
+        { card: a.includeCard, context: a.includeContext, world: a.includeWorld },
+        { knowledge: a.knowledge, guardrails: a.guardrails },
+    );
+    if (!directive) { addSystemNote('还没勾选任何校正目标、也没填约束。请在「校正设置」里勾选或填写，或直接在下方输入框手动说要改什么。'); return; }
+
+    const ctx = getCtx();
+    const messages = (fixUsePresetFor(s, 'auto') && presetCurationActive(s))
+        ? buildFixPresetMessages(s, directive)   // 破限 / 越狱：套上自定义补全预设（仅文本块 + 角色，跳过 RP 内容标记）
+        : [{ role: 'system', content: buildFixPrompt(ctx, s) }, { role: 'user', content: directive }];
+    const aEntry = { id: ++cidSeq, role: 'assistant', content: '' };
+    const assistantEl = addMessage('assistant', '', aEntry);
+    aEntry._el = assistantEl;
+    const contentEl = assistantEl.querySelector('.so-content');
+    const clearTyping = showTyping(contentEl);
+    setGenerating(true);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, 120000);
+    try {
+        const effMaxTokens = Math.max(s.maxTokens, 4096);
+        let finalText = '';
+        if (s.mode === 'direct') {
+            const url = normalizeUrl(s.endpoint);
+            const body = { model: s.model, messages, max_tokens: effMaxTokens };
+            if (s.sendTemperature) body.temperature = s.temperature;
+            if (s.stream) {
+                contentEl.classList.add('so-streaming');
+                finalText = await streamDirect(url, s.apiKey, body, ctl.signal, (delta) => { clearTyping(); contentEl.textContent += delta; scrollToBottom(); });
+                contentEl.classList.remove('so-streaming');
+            } else {
+                finalText = await callDirect(url, s.apiKey, body, ctl.signal);
+            }
+        } else {
+            const override = s.sendTemperature ? { temperature: s.temperature } : {};
+            if (s.stream) {
+                contentEl.classList.add('so-streaming');
+                finalText = await callProfileStream(s.profileId, messages, effMaxTokens, override, ctl.signal, (full) => { clearTyping(); contentEl.textContent = full; scrollToBottom(); });
+                contentEl.classList.remove('so-streaming');
+            } else {
+                finalText = await callProfile(s.profileId, messages, effMaxTokens, override, ctl.signal);
+            }
+        }
+        clearTyping();
+        if (!renderFixCard(assistantEl, contentEl, aEntry, finalText)) {
+            contentEl.textContent = finalText || '（空回复）';
+            addSystemNote('没能从模型回复里解析出 <FixedReply> 校正稿。请检查连接 / 模型，或调整目标后重试。');
+        }
+    } catch (e) {
+        clearTyping();
+        contentEl.textContent = '校正失败：' + (e?.message || e);
+        contentEl.classList.add('so-hint-error');
+    } finally {
+        clearTimeout(timer);
+        setGenerating(false);
+        scrollToBottom();
+    }
+}
+
+// 「正在校正…」提示（仿 showAutoDiagGenerating）。timeOut:0 = 不自动消失，由我们在生成结束后 dismissToast 收掉。
+function showAutoFixGenerating() {
+    try {
+        if (window.toastr && window.toastr.info) {
+            return window.toastr.info('正在校正最新回复…', '故事神谕 · 自动校正', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+        }
+    } catch (e) { /* ignore */ }
+    return null;
+}
+
+// 纯副作用：在侧聊里留一条【持久】自动校正记录（仿 notifyAutoDiagnose 的记录部分）。status:
+// fixed / nochange / failed；problems = 「发现并修正」摘要（仅 fixed 有意义，可空）。窗口关着也留得下
+// （DOM 在 init 建好），随 per-chat 持久化、跨重载存活；是 note 条目、绝不回灌给模型（见 convoForPrompt）。
+function addAutoFixNote(status, problems, fix = null) {
+    try {
+        const stamp = (() => { try { return new Date().toLocaleTimeString(); } catch (e) { return ''; } })();
+        const entry = { id: ++cidSeq, role: 'note', content: autoFixNoteContent({ status, problems, stamp }) };
+        convo.push(entry);
+        persistConvo();
+        // fix（仅 'fixed' 结果带）= { idx, before, after, fixSwipeId }，给记录挂「用原文 / 看改动」按钮。
+        // 注意：和手动校正回复一样，按钮只在【本会话】可用——重载后记录是纯文本（fix 不进 persistConvo）。
+        if (messagesEl) entry._el = addNoteMessage(entry, fix ? { fix } : null);
+    } catch (e) { console.warn('[Story Oracle] 自动校正记录写入侧聊失败：', e); }
+}
+
+// 自动校正【运行步】（仿 runAutoDiagnose）：对最新一条主聊天 AI 回复用【勾选目标 + 约束】跑一次两段式校正，
+// 解析成功且确有改动则自动【作为新 swipe】应用（非破坏性，原文留在 swipe 0），每跑一轮在侧聊留一条记录。
+// 后台操作：自建上下文、不碰窗口共享态、不 setGenerating、不出问答气泡（与手动 runFixByTargets 的区别）。
+// 【不】自管锁 / settle——编排（Task 5 的 message_received 监听）持锁；本函数只负责「跑这一次」。
+// 一次性非流式调用（own AbortController + 120s 超时）。
+async function runAutoFix(ctx, s) {
+    // 连接没配好就静默退出——别让每条回复都报错（开自动模式的人一般已配好直连 / 配置档）。
+    if (s.mode === 'direct' && (!s.endpoint || !s.model)) return;
+    if (s.mode === 'profile' && !s.profileId) return;
+
+    await captureFixContext(s, { mode: 'auto' });               // 自动模式：双稿 / 目标 / 上下文按 fixA_*（收紧仍受 ✂️收紧 开关）
+    if (!fixTargetProse.trim()) return;                         // 没有可校正的 AI 回复正文
+
+    // 自动模式配置（per-chat 覆盖全局，再归一）；fixAutoMinChars = 成本门最小字符数（自动专属，不进归一）。
+    const cfg = getEffectiveFixCfg(s, getFixCfg());
+    const a = resolveFixModeCfg(cfg, 'auto');
+    const targets = a.targets;
+    const constraints = { knowledge: a.knowledge, guardrails: a.guardrails };
+
+    // 成本门：不值得发调用（太短 / 没勾目标的禁词命中 / 没约束）→ 记一条「无需校正」直接跳过，不发 LLM。
+    if (!fixPreFilter(fixTargetProse, targets, constraints, cfg.fixAutoMinChars)) { addAutoFixNote('nochange'); return; }
+
+    const directive = compileFixTargets(
+        targets,
+        { card: a.includeCard, context: a.includeContext, world: a.includeWorld },
+        constraints,
+    );
+    if (!directive) return;                                      // 什么都没配（无目标 + 无约束）——不留记录、静默退出
+
+    const messages = (fixUsePresetFor(s, 'auto') && presetCurationActive(s))
+        ? buildFixPresetMessages(s, directive)   // 破限 / 越狱：套上自定义补全预设（仅文本块 + 角色，跳过 RP 内容标记）
+        : [{ role: 'system', content: buildFixPrompt(ctx, s) }, { role: 'user', content: directive }];
+    const effMaxTokens = Math.max(s.maxTokens, 4096);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, 120000);
+    const genToast = showAutoFixGenerating();
+    let finalText = '';
+    try {
+        if (s.mode === 'direct') {
+            const body = { model: s.model, messages, max_tokens: effMaxTokens };
+            if (s.sendTemperature) body.temperature = s.temperature;
+            finalText = await callDirect(normalizeUrl(s.endpoint), s.apiKey, body, ctl.signal);
+        } else {
+            const override = s.sendTemperature ? { temperature: s.temperature } : {};
+            finalText = await callProfile(s.profileId, messages, effMaxTokens, override, ctl.signal);
+        }
+    } finally {
+        clearTimeout(timer);
+        dismissToast(genToast);
+    }
+
+    const parsed = parseFixedReply(finalText);
+    if (!parsed) { addAutoFixNote('failed'); return; }          // 解析不出 <FixedReply> 校正稿
+    if (fixNoOp(fixTargetProse, parsed.fixed)) { addAutoFixNote('nochange'); return; }   // 校正稿与原文除空白外无差 → 无操作
+
+    // 接回原回复的机制块（<UpdateVariable> + 状态栏占位符）+ 用户「排除·保留」区，再作为【新 swipe】应用。
+    const finalText2 = composeFixedReply(parsed.fixed, fixOriginalReply, fixExtraKeep);
+    await applyFixAsSwipe(fixTargetIdx, finalText2);
+    // 抓【应用后】落点的 swipe_id（addSwipeToMessage 把新 swipe 设为当前），给记录的「用原文 ↔ 用校正稿」
+    // 开关用；原文留在 swipe 0。before = 去机制块的原文 prose（fixTargetProse）；after 必须也是【纯散文】
+    // parsed.fixed——不是 finalText2：finalText2 经 composeFixedReply 接回了 <UpdateVariable> + 状态栏占位符
+    // + 保留区，拿它做 after 会让 MVU 卡的整个状态块在差异里被误标成大段绿色新增。prose ↔ prose 才干净
+    //（与手动卡 stripMechanismBlocks(原文) vs parsed.fixed 一致）。swipe 目标仍是 finalText2 落点（不动）。
+    const fixSwipeId = (ctx.chat[fixTargetIdx] || {}).swipe_id;
+    addAutoFixNote('fixed', parsed.problems, { idx: fixTargetIdx, before: fixTargetProse, after: parsed.fixed, fixSwipeId });
 }
 
 function stopGeneration() {
@@ -7593,6 +9225,28 @@ function editUserMessage(entry) {
     });
 }
 
+// 失败回复气泡上的【常显】「↻ 重试」按钮（用户功能请求）。.so-actions 里的 regen 按钮只在 hover 时出现，
+// 手机上够不着；这里显式加一个一直可见的按钮。点它 = regenerateFrom(entry)：去掉这条失败气泡，对当前侧聊尾部
+// （刚发的那条用户消息还在）重新生成——不用重打。复用 .so-apply-bar/.so-apply-btn 样式（零新 CSS）。
+function addRetryControl(assistantEl, entry) {
+    if (!assistantEl) return;
+    const bubble = assistantEl.querySelector('.so-bubble');
+    if (!bubble || bubble.querySelector('.so-retry-btn')) return;   // 防重复添加
+    const bar = document.createElement('div');
+    bar.className = 'so-apply-bar so-retry-bar';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'so-apply-btn so-retry-btn';
+    btn.innerHTML = '<i class="fa-solid fa-rotate-right"></i> 重试';
+    bar.appendChild(btn);
+    bubble.appendChild(bar);
+    scrollToBottom();
+    btn.addEventListener('click', () => {
+        if (isGenerating) return;
+        regenerateFrom(entry);
+    });
+}
+
 // Apply / Undo bar appended to a diagnose reply that contains a corrective patch.
 function addApplyControls(assistantEl, patchBlock) {
     const bar = document.createElement('div');
@@ -7639,6 +9293,64 @@ function addApplyControls(assistantEl, patchBlock) {
             status.classList.add('so-hint-error');
         }
         btn.disabled = false;
+    });
+}
+
+// 校正卡的「应用到回复」按钮条（仿 addApplyControls）。应用 = 把校正稿（接回原文机制块后）作为新
+// swipe 写入目标消息；原文留在左滑。Phase 1 只做应用（撤销 = 左滑回 swipe 0）。
+function addFixApplyControls(assistantEl, parsed, originalReply, targetIdx, keepSections) {
+    const bar = document.createElement('div');
+    bar.className = 'so-apply-bar';
+    const btn = document.createElement('button');
+    btn.className = 'so-apply-btn';
+    btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> 应用到回复';
+    // 「看改动」：原文（去机制块，prose↔prose）→ 校正稿的内联差异卡，懒构建一次后切 hidden 复用。
+    const diffBtn = document.createElement('button');
+    diffBtn.className = 'so-apply-btn';
+    diffBtn.innerHTML = '<i class="fa-solid fa-eye"></i> 看改动';
+    const status = document.createElement('span');
+    status.className = 'so-apply-status';
+    bar.appendChild(btn);
+    bar.appendChild(diffBtn);
+    bar.appendChild(status);
+    const bubble = assistantEl.querySelector('.so-bubble');
+    bubble.appendChild(bar);
+    scrollToBottom();
+
+    let diffCard = null;
+    diffBtn.addEventListener('click', () => {
+        if (!diffCard) {
+            diffCard = renderDiffCard(stripMechanismBlocks(String(originalReply || '')), parsed.fixed);
+            bubble.appendChild(diffCard);
+        } else {
+            diffCard.hidden = !diffCard.hidden;
+        }
+        scrollToBottom();
+    });
+
+    let applied = false;
+    btn.addEventListener('click', async () => {
+        if (applied) return;
+        status.classList.remove('so-hint-error');
+        btn.disabled = true;
+        status.textContent = '正在应用…';
+        try {
+            const finalText = composeFixedReply(parsed.fixed, originalReply, keepSections);
+            const ok = await applyFixAsSwipe(targetIdx, finalText);
+            if (ok) {
+                applied = true;
+                btn.innerHTML = '<i class="fa-solid fa-check"></i> 已应用（左滑看原文）';
+                status.textContent = '已作为新 swipe 写入这条回复。';
+            } else {
+                status.textContent = '应用失败：没找到目标消息或保存失败。';
+                status.classList.add('so-hint-error');
+                btn.disabled = false;
+            }
+        } catch (e) {
+            status.textContent = '应用失败：' + (e?.message || e);
+            status.classList.add('so-hint-error');
+            btn.disabled = false;
+        }
     });
 }
 
@@ -7738,6 +9450,27 @@ function addLorebookApplyControls(assistantEl, parsed) {
         btn.disabled = false;
         scrollToBottom();
     });
+}
+
+// 纯函数：解析两段式校正输出。<problems>（违规片段定位，可在前、可缺闭合）+ <FixedReply>（修正稿，容忍缺闭合）。
+// 无 <FixedReply> 或正文为空 → null。可单测。
+function parseFixedReply(text) {
+    const src = String(text || '');
+    const open = src.match(/<FixedReply\b[^>]*>/i);
+    if (!open) return null;
+    const rest = src.slice(open.index + open[0].length);
+    const close = rest.match(/<\/FixedReply\s*>/i);
+    const fixed = (close ? rest.slice(0, close.index) : rest).trim();
+    if (!fixed) return null;
+    let problems = '';
+    const po = src.match(/<problems\b[^>]*>/i);
+    if (po) {
+        const after = src.slice(po.index + po[0].length);
+        const pc = after.match(/<\/problems\s*>/i);
+        if (pc) problems = after.slice(0, pc.index).trim();
+        else { const fr = after.match(/<FixedReply\b[^>]*>/i); problems = (fr ? after.slice(0, fr.index) : after).trim(); }
+    }
+    return { fixed, problems };
 }
 
 /* ------------------------------------------------------------------ *
@@ -7895,6 +9628,7 @@ function addNoteMessage(entry, opts) {
     txt.textContent = entry ? entry.content : '';
     wrap.appendChild(txt);
     if (opts && opts.snapshot && opts.patch) addNoteUndoControls(wrap, opts.snapshot, opts.patch);
+    else if (opts && opts.fix) addAutoFixControls(wrap, opts.fix);
     messagesEl.appendChild(wrap);
     scrollToBottom();
     return wrap;
