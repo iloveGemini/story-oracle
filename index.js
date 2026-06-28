@@ -4086,6 +4086,23 @@ async function undoFix(snapshot) {
  * ------------------------------------------------------------------ */
 let postReplyBusy = false;         // 单一共享锁：自动校正与自动诊断不得并发抢占同一条回复
 let autoDiagErrorToasted = false;  // 诊断错误 toast 每会话只弹一次，免得每条回复都打扰
+let postReplyAbortCtl = null;      // 当前在途的「回复后」自动调用（自动校正 / 自动诊断）的中断器（120s 超时 + 用户中断共用）
+let postReplyCancelled = false;    // 用户点了「正在自动…」提示里的中断 → 跳过本轮剩余步骤（如自动校正被中断后不再接着自动诊断）
+
+// 仿 arcBeginCall：把在途调用的中断器挂到模块级，让「正在自动校正 / 诊断…」提示可点一下中断它（ms = 超时兜底）。
+function beginPostReplyCall(ms) {
+    let ctl = null;
+    try { ctl = new AbortController(); } catch (e) { return { signal: undefined, end() {} }; }
+    postReplyAbortCtl = ctl;
+    let timer = null;
+    try { timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, ms); } catch (e) { /* 无 timers 环境 */ }
+    return { signal: ctl.signal, end() { if (timer) clearTimeout(timer); if (postReplyAbortCtl === ctl) postReplyAbortCtl = null; } };
+}
+// 用户点提示「中断」：作废本轮（让 maybePostReply 跳过剩余步骤）+ 中断在途调用。自动校正与自动诊断共用同一个。
+function cancelPostReply() {
+    postReplyCancelled = true;
+    try { if (postReplyAbortCtl) postReplyAbortCtl.abort(); } catch (e) { /* ignore */ }
+}
 
 // 纯决策核（零回归证据核，单测在 fix-orchestrator.test.mjs）：给定两个杀死开关 flags={fix,diag}
 // 与设置 s，返回按执行顺序排好的处理器名数组。'fix' 在前、'diag' 在后；某项要跑当且仅当
@@ -4112,15 +4129,18 @@ async function maybePostReply(messageId) {
     const idx = Number(messageId); const m = (ctx.chat || [])[idx];
     if (!m || m.is_user || m.is_system) return;             // 只处理 AI 回复（排除用户 / 系统消息）
     postReplyBusy = true;
+    postReplyCancelled = false;                                 // 每轮开始清零；用户点提示「中断」会把它置真
     try {
         // 给 MVU 先消化这条回复的更新，再读取权威状态（诊断的额外模型解析模式本就不支持）。
         // 校正与诊断共用这一次 settle（不另加延时），复用诊断既有的 autoDiagnoseDelayMs。
         await new Promise((r) => setTimeout(r, Math.max(0, (s.autoDiagnoseDelayMs | 0) || 1200)));
         for (const step of plan) {
+            if (postReplyCancelled) break;                      // 用户已中断 → 跳过剩余步骤（如校正被中断后不再自动诊断）
             try {
                 if (step === 'fix') await runAutoFix(ctx, s);
                 else await runAutoDiagnose(ctx, s);
             } catch (e) {
+                if (postReplyCancelled) break;                  // 用户点「中断」导致的 abort → 静默收尾，不当报错
                 console.warn(`[Story Oracle] 自动${step === 'fix' ? '校正' : '诊断'}失败：`, e);
                 // 沿用诊断的「每会话一次」错误 toast（校正的失败已在其侧聊记录里反映，不再额外打扰）。
                 if (step === 'diag' && !autoDiagErrorToasted) {
@@ -4130,6 +4150,9 @@ async function maybePostReply(messageId) {
             }
         }
     } finally {
+        // 用户中断：给一句确认（abort 发生在写入之前，故这条回复未被改动）。
+        if (postReplyCancelled) { try { window.toastr && window.toastr.info && window.toastr.info('已中断本轮自动处理（未改动这条回复）。', '故事神谕'); } catch (e) { /* ignore */ } }
+        postReplyCancelled = false;
         postReplyBusy = false;
     }
 }
@@ -4169,9 +4192,8 @@ async function runAutoDiagnose(ctx, s) {
     ];
 
     const effMaxTokens = Math.max(s.maxTokens, 4096);
-    const ctl = new AbortController();
-    const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, 120000);
-    const genToast = showAutoDiagGenerating();   // 用户功能请求：生成报告时给个「正在自动诊断…」提示
+    const ctl = beginPostReplyCall(120000);      // 模块级中断器：120s 超时兜底 + 让「正在自动诊断…」提示可点一下中断
+    const genToast = showAutoDiagGenerating();   // 「正在分析…（点此中断）」——点一下即 cancelPostReply
     let finalText = '';
     try {
         if (s.mode === 'direct') {
@@ -4183,7 +4205,7 @@ async function runAutoDiagnose(ctx, s) {
             finalText = await callProfile(s.profileId, messages, effMaxTokens, override, ctl.signal);
         }
     } finally {
-        clearTimeout(timer);
+        ctl.end();
         dismissToast(genToast);   // 无论成功 / 失败 / 抛错，都收掉「正在诊断」提示
     }
 
@@ -4439,7 +4461,7 @@ function notifyAutoDiagnose(result, patch) {
 function showAutoDiagGenerating() {
     try {
         if (window.toastr && window.toastr.info) {
-            return window.toastr.info('正在分析最新回复、生成诊断报告…', '故事神谕 · 自动诊断', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+            return window.toastr.info('正在分析最新回复、生成诊断报告…（点此中断）', '故事神谕 · 自动诊断', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, onclick: () => cancelPostReply() });
         }
     } catch (e) { /* ignore */ }
     return null;
@@ -8745,7 +8767,7 @@ async function runFixByTargets() {
 function showAutoFixGenerating() {
     try {
         if (window.toastr && window.toastr.info) {
-            return window.toastr.info('正在校正最新回复…', '故事神谕 · 自动校正', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+            return window.toastr.info('正在校正最新回复…（点此中断）', '故事神谕 · 自动校正', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, onclick: () => cancelPostReply() });
         }
     } catch (e) { /* ignore */ }
     return null;
@@ -8799,8 +8821,7 @@ async function runAutoFix(ctx, s) {
         ? buildFixPresetMessages(s, directive)   // 破限 / 越狱：套上自定义补全预设（仅文本块 + 角色，跳过 RP 内容标记）
         : [{ role: 'system', content: buildFixPrompt(ctx, s) }, { role: 'user', content: directive }];
     const effMaxTokens = Math.max(s.maxTokens, 4096);
-    const ctl = new AbortController();
-    const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, 120000);
+    const ctl = beginPostReplyCall(120000);      // 模块级中断器：120s 超时兜底 + 让「正在自动校正…」提示可点一下中断
     const genToast = showAutoFixGenerating();
     let finalText = '';
     try {
@@ -8813,7 +8834,7 @@ async function runAutoFix(ctx, s) {
             finalText = await callProfile(s.profileId, messages, effMaxTokens, override, ctl.signal);
         }
     } finally {
-        clearTimeout(timer);
+        ctl.end();
         dismissToast(genToast);
     }
 
