@@ -9504,6 +9504,14 @@ async function generateReply() {
 // exists?:boolean）。优先级【自上而下】：缺任一 → gone；chatId 变 → chatSwitched（P-CORRUPT，压过一切）；目标
 // 消失（exists:false / targetIdx 空 / <0）→ gone；swipe 变 → swipeChanged；指纹变 → contentChanged；否则 ok。
 // prose 只随行、【不参与】判定。可单测（fix-target-integrity.test.mjs）。
+// ✨ overlap（fixWaitForMvu）：把回复剥成【纯叙述正文】用于陈旧比对——去掉【两种】机制块：<UpdateVariable>（stripMechanismBlocks
+// 管）+ 状态栏占位符 <StatusPlaceHolderImpl/>（stripMechanismBlocks【不】管，得单独去）。MVU 额外模型更新两样都会事后注入，
+// 只有把两样都剥掉，捕获时 vs 写入时的正文才可比——正文一致 = 只 MVU 动过 → 放行。纯函数、nullish 安全、可单测。
+function fixBodyProse(text) {
+    const noPlaceholder = String(text == null ? '' : text).split(STATUS_PLACEHOLDER).join('');
+    return stripMechanismBlocks(noPlaceholder);   // stripMechanismBlocks 内含收敛空行 + trim
+}
+
 function fixTargetStale(captured, current, opts) {
     const o = opts || {};
     if (!captured || !current) return { stale: true, reason: 'gone' };
@@ -9579,8 +9587,8 @@ function fixCurrentSnapshot(idx) {
         targetIdx: t.idx,
         swipeId: exists ? ((m && m.swipe_id) | 0) : -1,
         fingerprint: fixFingerprint(m ? m.mes : ''),
-        // ✨ overlap（fixWaitForMvu）：去机制块的正文——MVU 注入 <UpdateVariable> + 占位符不改它，用户真编辑才改。
-        bodyProse: stripMechanismBlocks(m ? m.mes : '').trim(),
+        // ✨ overlap（fixWaitForMvu）：纯叙述正文（去 <UpdateVariable> + 状态栏占位符）——MVU 注入这两样不改它，用户真编辑才改。
+        bodyProse: fixBodyProse(m ? m.mes : ''),
         exists,
         prose: '',
     };
@@ -9741,8 +9749,8 @@ async function captureFixContext(s, { mode = 'manual', targetId } = {}) {
         swipeId: (ctx.chat[latest.idx]?.swipe_id) | 0,
         fingerprint: fixFingerprint(ctx.chat[latest.idx]?.mes),
         prose: fixTargetProse,
-        // ✨ overlap（fixWaitForMvu）：捕获时（MVU 写块【之前】）的去机制块正文；写入前与当前比对——只有 MVU 注块 → 一致 → 放行。
-        bodyProse: stripMechanismBlocks(latest.text).trim(),
+        // ✨ overlap（fixWaitForMvu）：捕获时（MVU 写块【之前】）的纯叙述正文（去 <UpdateVariable> + 状态栏占位符）；写入前与当前比对——只有 MVU 注块 → 一致 → 放行。
+        bodyProse: fixBodyProse(latest.text),
     };
     fixSummaryBlock = norm.includeSummary ? getSummary() : '';   // 📜剧情概要（手动默认带、自动可选）；buildFixEnvelope 包成 <story_summary>
     fixTightenActive = norm.tighten;   // ✨ 收紧：手动恒 false（单稿省时间）；自动按 ✂️收紧 开关（默认开）
