@@ -669,6 +669,9 @@ const defaults = {
     apiKey: '',
     model: '',
     stream: true,
+    // 直连「经酒馆后端转发」（1.17.23）：直连撞第三方端点 CORS（failed to fetch）时勾选——复用同一端点+密钥，改由
+    // 酒馆服务器代发（custom 源 + 显式 Authorization 头），无浏览器跨域、无需连接配置文件。默认关 = 字节不变。
+    directViaBackend: false,
     // profile mode
     profileId: '',
     // shared generation params
@@ -5327,7 +5330,11 @@ function buildWindow() {
                             <select id="so-model-list" style="display:none"></select>
                             <div class="so-hint" id="so-model-hint"></div>
                         </label>
-                        <div class="so-hint">如果请求因 CORS / 网络错误失败，请切换到“连接配置文件”模式（通过 ST 服务器转发）。</div>
+                        <label class="so-row" title="打开后，直连请求改由酒馆服务器代发——避免浏览器跨域(CORS)，用的还是上面这个端点和密钥（无需连接配置文件）。">
+                            <span>经酒馆后端转发（避免跨域 CORS）</span>
+                            <input id="so-direct-backend" type="checkbox">
+                        </label>
+                        <div class="so-hint">端点直连若报 <b>CORS / failed to fetch</b>，勾选此项即可（由酒馆服务器代发，仍用上面的端点 + 密钥）。“获取模型”按钮仍走浏览器直连，可能失败——手动填模型名即可。</div>
                     </div>
 
                     <div id="so-profile-fields">
@@ -6011,6 +6018,7 @@ function bindControls() {
     bind('#so-apikey', 'apiKey', (v) => v.trim());
     bind('#so-model', 'model', (v) => v.trim());
     bind('#so-stream', 'stream');
+    bind('#so-direct-backend', 'directViaBackend'); // 1.17.23：经酒馆后端转发（避免直连 CORS）
     // 用户功能请求：聊天栏快捷按钮开关——改设置后立刻放 / 撤按钮（不只是存）。
     win.querySelector('#so-chatbar-toggle').addEventListener('change', (e) => {
         getSettings().showChatBarButton = e.target.checked;
@@ -6187,6 +6195,8 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-apikey').value = s.apiKey;
     win.querySelector('#so-model').value = s.model;
     win.querySelector('#so-stream').checked = !!s.stream;
+    win.querySelector('#so-direct-backend').checked = !!s.directViaBackend; // 1.17.23：经酒馆后端转发
+
     win.querySelector('#so-temp').value = s.temperature;
     win.querySelector('#so-maxtok').value = s.maxTokens;
     win.querySelector('#so-depth').value = s.contextDepth;
@@ -10146,6 +10156,84 @@ function directHeaders(apiKey) {
     return h;
 }
 
+// PURE：为「经酒馆后端转发的直连」（s.directViaBackend）构造 ChatCompletionService.processRequest 的 requestData。
+// 背景（2026-07-01 用户 xxw / 若葉睦）：直连=浏览器→端点，会撞第三方端点的 CORS（opencode 等 → failed to fetch）；
+// 配置文件模式又因【无自带密钥的配置档回退到激活连接的密钥】而 401（只有神谕选档 == 酒馆当前激活档才不报错）。
+// 这条路复用用户【已在直连里填好的】端点+密钥，但让【酒馆服务器】去发（无浏览器 CORS）：走 ST 的 custom 源，把密钥
+// 作为显式 Authorization 头随 custom_include_headers 送——ST 后端把 custom_include_headers 合并在 secret 派生的
+// 'Authorization: Bearer '+apiKey 之【后】故覆盖生效，且 custom 源豁免「缺密钥」400 守卫
+// （src/endpoints/backends/chat-completions.js:2516 / 2579）。→ 不需要连接配置文件、不需要在 ST 里存 secret、与激活连接无关。
+// 入参 url = 直连规范化后的 .../chat/completions（callDirect/streamDirect 收到的那个）；后端会对 custom_url 再追加
+// /chat/completions，故这里剥掉后缀，保证 custom_url + '/chat/completions' == 原直连 URL（端点逐字一致）。
+// custom_include_headers 必须是【字符串】（后端 mergeObjectWithYaml → yaml.parse；JSON 是合法 YAML 流式映射）。
+function buildBackendForwardPayload(url, apiKey, body, stream) {
+    const customUrl = String(url || '').replace(/\/chat\/completions\/?$/, '');
+    const headers = apiKey ? { Authorization: 'Bearer ' + apiKey } : {};
+    const { model, messages, max_tokens, stream: _drop, ...rest } = (body || {});
+    return {
+        chat_completion_source: 'custom',
+        custom_url: customUrl,
+        custom_include_headers: JSON.stringify(headers),
+        model,
+        messages,
+        max_tokens,
+        stream: !!stream,
+        ...rest,
+    };
+}
+
+// 经酒馆后端转发的「直连」——非流式。复用直连的 (url, apiKey, body)，走 ST 的 ChatCompletionService（custom 源 + 显式
+// Authorization 头），由酒馆服务器发出 → 无浏览器 CORS、无需连接配置文件 / secret。见 buildBackendForwardPayload。
+async function callBackendForward(url, apiKey, body, signal) {
+    const ctx = getCtx();
+    if (typeof ctx?.ChatCompletionService?.processRequest !== 'function') {
+        throw new Error('此 SillyTavern 版本缺少 ChatCompletionService，无法用后端转发——请取消勾选“经酒馆后端转发”，或改用连接配置文件。');
+    }
+    const payload = buildBackendForwardPayload(url, apiKey, body, false);
+    const result = await ctx.ChatCompletionService.processRequest(payload, { presetName: undefined }, true, signal);
+    return result?.content ?? '';
+}
+
+// 同上——流式。ChatCompletionService 流式返回一个「创建 AsyncGenerator 的函数」，每个 chunk.text 是【累计】全文；
+// 为与 streamDirect 的回调契约一致（onDelta 收【增量】），这里按累计差分算增量再回调。
+async function streamBackendForward(url, apiKey, body, signal, onDelta) {
+    const ctx = getCtx();
+    if (typeof ctx?.ChatCompletionService?.processRequest !== 'function') {
+        throw new Error('此 SillyTavern 版本缺少 ChatCompletionService，无法用后端转发——请取消勾选“经酒馆后端转发”，或改用连接配置文件。');
+    }
+    const payload = buildBackendForwardPayload(url, apiKey, body, true);
+    const gen = await ctx.ChatCompletionService.processRequest(payload, { presetName: undefined }, true, signal);
+    const iterator = (typeof gen === 'function') ? gen() : gen;
+    let prev = '';
+    for await (const chunk of iterator) {
+        if (chunk && typeof chunk.text === 'string') {
+            const delta = chunk.text.slice(prev.length);
+            prev = chunk.text;
+            if (delta) onDelta(delta);
+        }
+    }
+    return prev;
+}
+
+// 同上——弧线「实时输出」专用（onLive({content, reasoning})，均为累计）。ChatCompletionService 把 reasoning 累在
+// chunk.state.reasoning。返回 content 全文（与 streamDirectArc 一致，供 parseArcBeat / parseArcCheck 解析）。
+async function streamBackendForwardArc(url, apiKey, body, signal, onLive) {
+    const ctx = getCtx();
+    if (typeof ctx?.ChatCompletionService?.processRequest !== 'function') {
+        throw new Error('此 SillyTavern 版本缺少 ChatCompletionService，无法用后端转发——请取消勾选“经酒馆后端转发”，或改用连接配置文件。');
+    }
+    const payload = buildBackendForwardPayload(url, apiKey, body, true);
+    const gen = await ctx.ChatCompletionService.processRequest(payload, { presetName: undefined }, true, signal);
+    const iterator = (typeof gen === 'function') ? gen() : gen;
+    let content = '', reasoning = '';
+    for await (const chunk of iterator) {
+        if (chunk && typeof chunk.text === 'string') content = chunk.text;
+        if (chunk && chunk.state && typeof chunk.state.reasoning === 'string' && chunk.state.reasoning) reasoning = chunk.state.reasoning;
+        if (onLive) onLive({ content, reasoning });
+    }
+    return content;
+}
+
 // Derive the OpenAI-compatible models endpoint from whatever the user typed.
 function modelsUrl(u) {
     u = (u || '').trim().replace(/\/+$/, '');
@@ -10215,6 +10303,7 @@ async function onFetchModels() {
 }
 
 async function callDirect(url, apiKey, body, signal) {
+    if (getSettings().directViaBackend) return callBackendForward(url, apiKey, body, signal); // 经酒馆后端转发（避免 CORS）
     const res = await fetch(url, {
         method: 'POST',
         headers: directHeaders(apiKey),
@@ -10243,6 +10332,7 @@ function extractNonStreamContent(raw) {
 }
 
 async function streamDirect(url, apiKey, body, signal, onDelta) {
+    if (getSettings().directViaBackend) return streamBackendForward(url, apiKey, body, signal, onDelta); // 经酒馆后端转发（避免 CORS）
     const res = await fetch(url, {
         method: 'POST',
         headers: directHeaders(apiKey),
@@ -10291,6 +10381,7 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
 // 经 onLive({content, reasoning}) 实时报给查看器——这样窗口在 reasoning 模型上也看得到「在动」，而不是盯着
 // content 卡在空。返回值仍是 content 全文（供 parseArcBeat / parseArcCheck 解析，与非流式完全一致）。
 async function streamDirectArc(url, apiKey, body, signal, onLive) {
+    if (getSettings().directViaBackend) return streamBackendForwardArc(url, apiKey, body, signal, onLive); // 经酒馆后端转发（避免 CORS）
     const res = await fetch(url, { method: 'POST', headers: directHeaders(apiKey), body: JSON.stringify({ ...body, stream: true }), signal });
     if (!res.ok || !res.body) {
         const t = await res.text().catch(() => '');
