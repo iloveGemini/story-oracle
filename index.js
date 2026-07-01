@@ -745,6 +745,11 @@ const defaults = {
     autoDiagnoseEnabled: false,
     autoDiagnoseWarned: false,
     autoDiagnoseDelayMs: 1200,
+    // ✨ 自动校正 ↔ MVU「额外模型更新」抢写协调（opt-in，默认关）。开启后校正【照常立刻并行跑】——只在【落新 swipe
+    // 之前】等 MVU 的额外模型解析写完（awaitMvuIdle 轮询 isDuringExtraAnalysis），再把它注入的机制块接到校正稿末尾
+    // （mergeMvuTail），两者不抢写同一条消息、且几乎不增加等待。只有【用 MVU 额外模型更新】的人需要开；不用的保持
+    // 关 = 现行行为字节不变（无 MVU / MVU 不忙时 awaitMvuIdle + mergeMvuTail 都是即时空操作）。
+    fixWaitForMvu: false,
     // ✨ 校正：首次切到「自动校正」时弹一次性提醒（讲清标签块 <sceneinfo>/<details> 的留存要靠排除区·保留）。
     // 与 autoDiagnoseWarned 同款一次性警告：勾「不再提示」后置真，从此不再弹。
     autoFixWarned: false,
@@ -4576,6 +4581,19 @@ function composeFixedReply(fixedProse, originalReply, keepBlocks) {
     return out;
 }
 
+// ✨ overlap 版（opt-in fixWaitForMvu）：MVU 额外模型更新在校正【捕获之后】才往回复末尾注入 <UpdateVariable> + 状态栏
+// 占位符；校正是并行跑的，composeFixedReply 只接回了【捕获时】的机制块（那时 MVU 还没写）。这里把【当前】回复里的
+// 机制块补接到校正稿末尾（已在则不重复），让新 swipe 带上 MVU 刚写好的变量块。MVU 注在整条消息末尾，故末尾追加即对齐。
+// 纯函数、幂等、nullish 安全、可单测。
+function mergeMvuTail(fixedText, currentReply) {
+    let out = String(fixedText == null ? '' : fixedText);
+    const cur = String(currentReply == null ? '' : currentReply);
+    const block = extractUpdateBlock(cur);
+    if (block && !out.includes(block)) out = out.trimEnd() + '\n\n' + block;
+    if (cur.includes(STATUS_PLACEHOLDER) && !out.includes(STATUS_PLACEHOLDER)) out = out.trimEnd() + '\n\n' + STATUS_PLACEHOLDER;
+    return out;
+}
+
 // Apply a corrective <UpdateVariable> block through MVU's own pipeline.
 // Returns a snapshot of the pre-apply data (for undo), or null on failure.
 async function applyFix(patchBlock, statusEl) {
@@ -4645,6 +4663,27 @@ function postReplyPlan(flags, s) {
 }
 
 // message_received 监听的落点：在共享锁下，对一条 AI 回复按 postReplyPlan 顺序跑校正 / 诊断。
+// ✨ 自动校正 ↔ MVU「额外模型更新」抢写协调（opt-in fixWaitForMvu）。MVU 的额外模型解析在回复后【自己异步】发一次
+// 模型调用再写 <UpdateVariable> + 状态；auto-校正也在回复后异步发调用 + 写新 swipe——两者抢写同一条消息会串味 /
+// 覆盖 / 出重复块。MVU 暴露 isDuringExtraAnalysis()（+ mag_variable_update_started/ended 事件），据此在动手前等它写完。
+// 纯防御：无 MVU / 旧版无此 API → 一律「不忙」，等待即刻结束，对不用额外模型更新的人零影响。可单测。
+function mvuIsBusy(mvu) {
+    return !!(mvu && typeof mvu.isDuringExtraAnalysis === 'function' && mvu.isDuringExtraAnalysis());
+}
+// 条件式等待 MVU 空闲：轮询 isDuringExtraAnalysis() 直到为假 / 到 cap（兜底绝不挂死，到点照常继续）/ 被取消。
+// 回已等毫秒（供日志 / 测试）。这是「按条件等」而非盲计时——MVU 写完的那一刻就往下走，无论它的额外模型调用多慢。
+async function awaitMvuIdle(mvu, opts = {}) {
+    const capMs = (opts.capMs != null) ? opts.capMs : 120000;   // 额外模型是一次完整 LLM 往返；给足，但到点仍继续
+    const pollMs = (opts.pollMs != null) ? opts.pollMs : 250;
+    const isCancelled = (typeof opts.isCancelled === 'function') ? opts.isCancelled : () => false;
+    let waited = 0;
+    while (mvuIsBusy(mvu) && waited < capMs && !isCancelled()) {
+        await new Promise((r) => setTimeout(r, pollMs));
+        waited += pollMs;
+    }
+    return waited;
+}
+
 async function maybePostReply(messageId) {
     const ctx = getCtx(); if (!ctx) return;
     const s = getSettings();
@@ -5445,6 +5484,8 @@ function buildWindow() {
                         <button type="button" id="so-fix-run" class="so-fix-run-btn"><i class="fa-solid fa-wand-magic-sparkles"></i> 按目标校正最新回复</button>
                         <label class="so-check so-lb-check"><input id="so-fix-auto" type="checkbox"><span>自动校正每条新回复（实验）</span></label>
                         <label class="so-check so-lb-check"><input id="so-fixa-preset" type="checkbox"><span>经自定义补全预设发送（破限 / 越狱用）</span></label>
+                        <label class="so-check so-lb-check"><input id="so-fix-wait-mvu" type="checkbox"><span>⏳ 与 MVU「额外模型更新」并用（避免抢写冲突）</span></label>
+                        <div class="so-hint">仅当你开了 MVU 的「额外模型更新」（用另一个模型异步解析变量）时才勾。勾上后：校正<strong>照常立刻开跑</strong>（与 MVU 并行、几乎不多等），只在<strong>生成新回复稿之前</strong>等 MVU 把变量写完再合并进来——两者不再抢写同一条消息、数据不错乱。没开额外模型更新就<strong>保持不勾</strong>。</div>
                         <label class="so-check so-lb-check"><span>只校正此标签内的正文</span>&nbsp;<input id="so-fix-scope" type="text" style="width:110px;"></label>
                         <div class="so-hint">填卡片包裹【正文】的标签名（默认 <code>content</code>）：只校正 &lt;content&gt;…&lt;/content&gt; 之间的正文，正文【外】的所有块（状态栏 / 选项 / 世界书 / htmlcontent 地图 / 变量更新 / 占位符…）原样保留、<strong>原位不动</strong>。回复里没有该标签则自动校正整条（简单卡不受影响）。<strong>留空</strong> = 校正整条回复。卡片若用别的标签包正文，就改成那个标签名（如 &lt;正文&gt; 就填 <code>正文</code>）。</div>
                         <div id="so-fix-verdict" class="so-fix-verdict" hidden></div>
@@ -6014,6 +6055,9 @@ function bindControls() {
     if (fixmPresetCb) fixmPresetCb.addEventListener('change', () => { getSettings().fixM_usePreset = fixmPresetCb.checked; save(); applyFixPresetLock(); });
     const fixaPresetCb = win.querySelector('#so-fixa-preset');
     if (fixaPresetCb) fixaPresetCb.addEventListener('change', () => { getSettings().fixA_usePreset = fixaPresetCb.checked; save(); applyFixPresetLock(); });
+    // ✨ MVU「额外模型更新」抢写协调（opt-in，全局设置——用户环境级，不入 per-chat FIX_CFG_KEYS）。
+    const fixWaitMvuCb = win.querySelector('#so-fix-wait-mvu');
+    if (fixWaitMvuCb) fixWaitMvuCb.addEventListener('change', () => { getSettings().fixWaitForMvu = fixWaitMvuCb.checked; save(); });
     // 数字框条数 parse：非数字 / 非正数 → -1（全部），正数原样。手动 / 自动各一份独立存储。
     const depthParse = (v) => { const n = parseInt(v, 10); return (Number.isNaN(n) || n <= 0) ? -1 : n; };
     // 手动模式控件（fixM_*）——上下文条数 / 卡 / 世界书 / 概要。
@@ -8374,6 +8418,7 @@ function seedFixControls() {
     set('#so-fix-auto', 'checked', !!cfg.autoFixEnabled);
     set('#so-fixm-preset', 'checked', !!getSettings().fixM_usePreset);   // 全局开关（手动）；不在 cfg / FIX_CFG_KEYS 里
     set('#so-fixa-preset', 'checked', !!getSettings().fixA_usePreset);   // 全局开关（自动）
+    set('#so-fix-wait-mvu', 'checked', !!getSettings().fixWaitForMvu);   // ✨ MVU「额外模型更新」抢写协调（全局 opt-in）
     applyFixPresetLock();   // 预设模式下置灰「带角色卡 / 带世界书」（由预设标记提供）
     applyFixModeView();
 }
@@ -9459,12 +9504,20 @@ async function generateReply() {
 // exists?:boolean）。优先级【自上而下】：缺任一 → gone；chatId 变 → chatSwitched（P-CORRUPT，压过一切）；目标
 // 消失（exists:false / targetIdx 空 / <0）→ gone；swipe 变 → swipeChanged；指纹变 → contentChanged；否则 ok。
 // prose 只随行、【不参与】判定。可单测（fix-target-integrity.test.mjs）。
-function fixTargetStale(captured, current) {
+function fixTargetStale(captured, current, opts) {
+    const o = opts || {};
     if (!captured || !current) return { stale: true, reason: 'gone' };
     if (current.chatId !== captured.chatId) return { stale: true, reason: 'chatSwitched' };
     if (current.exists === false || current.targetIdx == null || current.targetIdx < 0) return { stale: true, reason: 'gone' };
     if (current.swipeId !== captured.swipeId) return { stale: true, reason: 'swipeChanged' };
-    if (current.fingerprint !== captured.fingerprint) return { stale: true, reason: 'contentChanged' };
+    // ✨ overlap 版（fixWaitForMvu）：MVU 额外模型更新会在回复末尾注入 <UpdateVariable> + 占位符——那是【预期】变化，
+    // 会让整条 m.mes 的指纹变。mvuTolerant 时改比【去机制块的正文 bodyProse】：正文一致 = 只有 MVU 动过 → 放行；
+    // 正文变了（用户编辑 / 换成别的回复）→ 仍判陈旧。换 swipe / 切聊天 / 目标没了 上面已各自拦下，安全网不塌。
+    if (o.mvuTolerant) {
+        if (current.bodyProse !== captured.bodyProse) return { stale: true, reason: 'contentChanged' };
+    } else if (current.fingerprint !== captured.fingerprint) {
+        return { stale: true, reason: 'contentChanged' };
+    }
     return { stale: false, reason: 'ok' };
 }
 
@@ -9526,6 +9579,8 @@ function fixCurrentSnapshot(idx) {
         targetIdx: t.idx,
         swipeId: exists ? ((m && m.swipe_id) | 0) : -1,
         fingerprint: fixFingerprint(m ? m.mes : ''),
+        // ✨ overlap（fixWaitForMvu）：去机制块的正文——MVU 注入 <UpdateVariable> + 占位符不改它，用户真编辑才改。
+        bodyProse: stripMechanismBlocks(m ? m.mes : '').trim(),
         exists,
         prose: '',
     };
@@ -9686,6 +9741,8 @@ async function captureFixContext(s, { mode = 'manual', targetId } = {}) {
         swipeId: (ctx.chat[latest.idx]?.swipe_id) | 0,
         fingerprint: fixFingerprint(ctx.chat[latest.idx]?.mes),
         prose: fixTargetProse,
+        // ✨ overlap（fixWaitForMvu）：捕获时（MVU 写块【之前】）的去机制块正文；写入前与当前比对——只有 MVU 注块 → 一致 → 放行。
+        bodyProse: stripMechanismBlocks(latest.text).trim(),
     };
     fixSummaryBlock = norm.includeSummary ? getSummary() : '';   // 📜剧情概要（手动默认带、自动可选）；buildFixEnvelope 包成 <story_summary>
     fixTightenActive = norm.tighten;   // ✨ 收紧：手动恒 false（单稿省时间）；自动按 ✂️收紧 开关（默认开）
@@ -10033,11 +10090,17 @@ async function runAutoFix(ctx, s, targetId) {
     if (fixOutputTruncated(parsed.fixed, finishHint, fixTargetProse).truncated) { addAutoFixNote('truncated'); return; }
 
     // 接回原回复的机制块（<UpdateVariable> + 状态栏占位符）+ 用户「排除·保留」区，再作为【新 swipe】应用。
+    // ✨ overlap（opt-in fixWaitForMvu）：校正的 LLM 已和 MVU 额外模型更新【并行】跑完；写 swipe 前【等 MVU 写完】，
+    // 再把它事后注入的机制块（<UpdateVariable> + 占位符）从【当前】回复接到校正稿末尾（mergeMvuTail）。不开 / 无 MVU /
+    // MVU 不忙 → awaitMvuIdle 即时返回、mergeMvuTail 无操作，行为字节不变。
+    if (s.fixWaitForMvu && !postReplyCancelled) await awaitMvuIdle(await getMvu(), { isCancelled: () => postReplyCancelled });
+    if (postReplyCancelled) return;   // 等 MVU 期间被中断 → 不写
     const innerFixed = composeFixedReply(parsed.fixed, fixOriginalReply, fixExtraKeep);
-    const finalText2 = wrapContentScope(fixScope, innerFixed);   // ✨ 作用域：把校正后的内层回插信封原位（inactive 时为无操作）
-    // P-CORRUPT 权威网：LLM 返回后聊天可能已切走 / 这条回复已换 swipe / 被编辑 / 被删——写入前再核对捕获快照，
-    // 失效则不写、记一条 stale（原因经 problems 槽映射人话）。这是「切聊天发生在 LLM 返回之后」的最后一道闸。
-    const st = fixTargetStale(fixCaptured, fixCurrentSnapshot(fixTargetIdx));
+    let finalText2 = wrapContentScope(fixScope, innerFixed);   // ✨ 作用域：把校正后的内层回插信封原位（inactive 时为无操作）
+    if (s.fixWaitForMvu) finalText2 = mergeMvuTail(finalText2, (ctx.chat || [])[fixTargetIdx]?.mes);   // MVU 事后注的机制块补接末尾
+    // P-CORRUPT 权威网：LLM 返回后聊天可能已切走 / 这条回复已换 swipe / 被编辑 / 被删——写入前再核对捕获快照，失效则不写、记一条
+    // stale。overlap 模式（fixWaitForMvu）用 mvuTolerant：只比去机制块正文，容忍 MVU 刚注入的块，仍拦真编辑 / 换 swipe / 切聊天 / 目标没了。
+    const st = fixTargetStale(fixCaptured, fixCurrentSnapshot(fixTargetIdx), { mvuTolerant: !!s.fixWaitForMvu });
     if (st.stale) { addAutoFixNote('stale', st.reason); return; }
     await applyFixAsSwipe(fixTargetIdx, finalText2);
     // 抓【应用后】落点的 swipe_id（addSwipeToMessage 把新 swipe 设为当前），给记录的「用原文 ↔ 用校正稿」
