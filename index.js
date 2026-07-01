@@ -2205,7 +2205,7 @@ function resolveFixModeCfg(e, mode) {
             // ✨ 校正提示词选择器（轻校 / 精校 + 侧重）：归一 raw fixA_promptVersion/Flavor 成校验值。缺省 / null /
             // 未知 → 默认（light / deepseek），迁移安全（老聊天无值 = 轻校 = 零行为变化）。resolveFixAutoPrompt 据此选提示。
             promptVersion: (c.fixA_promptVersion === 'thorough' ? 'thorough' : 'light'),
-            promptFlavor: (c.fixA_promptFlavor === 'opus' ? 'opus' : 'deepseek'),
+            promptFlavor: (['opus', 'gemini'].includes(c.fixA_promptFlavor) ? c.fixA_promptFlavor : 'deepseek'),
         };
     }
     // 手动：depth 显式 0 = 不带前文；其余非正数 / 缺省 = -1（全部）。
@@ -2222,13 +2222,18 @@ function resolveFixModeCfg(e, mode) {
 
 // ✨ 自动校正提示词选择器（纯映射，设计 §4）：把归一后的 {promptVersion, promptFlavor} 映射到具体系统提示常量。
 //   version !== 'thorough' → 轻校 = FIX_SYSTEM_PROMPT_TIGHTEN（今天的现行提示，默认，byte 不变）
-//   thorough + flavor==='opus' → FIX_PROMPT_JINGXIAO_OPUS（对「数据包腔」强攻，适合 Claude / Opus）
-//   thorough + 其它 / 缺省     → FIX_PROMPT_JINGXIAO_DEEPSEEK（克制版，适合 DeepSeek / 国产模型）
+//   thorough + flavor==='opus'   → FIX_PROMPT_JINGXIAO_OPUS（对「数据包腔」强攻，适合 Claude / Opus）
+//   thorough + flavor==='gemini' → FIX_PROMPT_JINGXIAO_DEEPSEEK【暂用】——Gemini 经诊断（2026-07-01）属 DeepSeek 类：
+//       它自己就清数据包，而 Opus 强攻 clause 反而把它的正式对白过校正（死谏 −25）。将来若做专属
+//       FIX_PROMPT_JINGXIAO_GEMINI，只改这一行的返回值即可（UI / 设置的 gemini 侧重已就位）。
+//   thorough + 其它 / 缺省       → FIX_PROMPT_JINGXIAO_DEEPSEEK（克制版，适合 DeepSeek / 国产模型）
 // 只有精确的 'thorough' 才是精校；null / '' / 未知一律回落轻校（迁移安全）。cfg 缺失也回落轻校，不抛。
 function resolveFixAutoPrompt(cfg) {
     const c = cfg || {};
     if (c.promptVersion !== 'thorough') return FIX_SYSTEM_PROMPT_TIGHTEN;
-    return c.promptFlavor === 'opus' ? FIX_PROMPT_JINGXIAO_OPUS : FIX_PROMPT_JINGXIAO_DEEPSEEK;
+    if (c.promptFlavor === 'opus') return FIX_PROMPT_JINGXIAO_OPUS;
+    if (c.promptFlavor === 'gemini') return FIX_PROMPT_JINGXIAO_DEEPSEEK;   // ← seam：将来换成 FIX_PROMPT_JINGXIAO_GEMINI
+    return FIX_PROMPT_JINGXIAO_DEEPSEEK;
 }
 
 // 读本聊天保存的校正覆盖（始终回对象，可能为空 {}）。喂给 getEffectiveFixCfg 当 md。
@@ -5159,7 +5164,7 @@ function injectWandButton() {
     rc.id = 'so-wand-recenter';
     rc.className = 'list-group-item flex-container flexGap5 interactable';
     rc.tabIndex = 0;
-    rc.innerHTML = `<i class="fa-solid fa-arrows-to-dot"></i><span>神谕窗口归位（居中）</span>`;
+    rc.innerHTML = `<i class="fa-solid fa-arrows-to-dot"></i><span>窗口归位</span>`;
     rc.addEventListener('click', () => recenterWindow());
     menu.appendChild(rc);
 }
@@ -5440,7 +5445,7 @@ function buildWindow() {
                         <button type="button" id="so-fix-run" class="so-fix-run-btn"><i class="fa-solid fa-wand-magic-sparkles"></i> 按目标校正最新回复</button>
                         <label class="so-check so-lb-check"><input id="so-fix-auto" type="checkbox"><span>自动校正每条新回复（实验）</span></label>
                         <label class="so-check so-lb-check"><input id="so-fixa-preset" type="checkbox"><span>经自定义补全预设发送（破限 / 越狱用）</span></label>
-                        <label class="so-check so-lb-check"><span>只校正此标签内的正文</span>&nbsp;<input id="so-fix-scope" type="text" placeholder="content" style="width:110px;"></label>
+                        <label class="so-check so-lb-check"><span>只校正此标签内的正文</span>&nbsp;<input id="so-fix-scope" type="text" style="width:110px;"></label>
                         <div class="so-hint">填卡片包裹【正文】的标签名（默认 <code>content</code>）：只校正 &lt;content&gt;…&lt;/content&gt; 之间的正文，正文【外】的所有块（状态栏 / 选项 / 世界书 / htmlcontent 地图 / 变量更新 / 占位符…）原样保留、<strong>原位不动</strong>。回复里没有该标签则自动校正整条（简单卡不受影响）。<strong>留空</strong> = 校正整条回复。卡片若用别的标签包正文，就改成那个标签名（如 &lt;正文&gt; 就填 <code>正文</code>）。</div>
                         <div id="so-fix-verdict" class="so-fix-verdict" hidden></div>
                         <button type="button" id="so-fix-scan" class="so-fix-run-btn"><i class="fa-solid fa-magnifying-glass"></i> 扫描本卡正文标签（自动填好）</button>
@@ -5458,8 +5463,8 @@ function buildWindow() {
                         <textarea id="so-fix-guard" rows="2" placeholder="剧情护栏 / 自定义（可空）：例如「保持慢热，不要时间跳跃」"></textarea>
                         <label class="so-check so-lb-check"><input id="so-fix-tighten" type="checkbox"><span>✂️ 收紧（默认开）：校正后再精修一遍（删冗词废话 / 过度描写，读感更紧）。</span></label>
                         <label class="so-check so-lb-check"><span>校正提示词</span>&nbsp;<select id="so-fix-prompt-version" title="轻校＝现行提示词（较克制）；精校＝更彻底的三道工序校正"><option value="light">轻校（现行 · 默认）</option><option value="thorough">精校（三道工序）</option></select></label>
-                        <label class="so-check so-lb-check" id="so-fix-prompt-flavor-row"><span>精校侧重</span>&nbsp;<select id="so-fix-prompt-flavor" title="按你用的模型选侧重：DeepSeek / 国产模型选 DeepSeek 类；Claude / Opus 选 Opus 类"><option value="deepseek">DeepSeek 类（默认）</option><option value="opus">Opus 类</option></select></label>
-                        <div class="so-hint">轻校＝现行提示词（较克制）。精校＝更彻底的三道工序校正（<strong>已含收紧</strong>）；按你用的模型选侧重：DeepSeek / 国产模型选「DeepSeek 类」，Claude / Opus 选「Opus 类」。默认轻校，不选精校则行为不变。</div>
+                        <label class="so-check so-lb-check" id="so-fix-prompt-flavor-row"><span>精校侧重</span>&nbsp;<select id="so-fix-prompt-flavor" title="按你用的模型选侧重：DeepSeek / 国产模型选 DeepSeek 类；Claude / Opus 选 Opus 类；Gemini 选 Gemini 类"><option value="deepseek">DeepSeek 类（默认）</option><option value="opus">Opus 类</option><option value="gemini">Gemini 类</option></select></label>
+                        <div class="so-hint">轻校＝现行提示词（较克制）。精校＝更彻底的三道工序校正（<strong>已含收紧</strong>）；按你用的模型选侧重：DeepSeek / 国产模型选「DeepSeek 类」，Claude / Opus 选「Opus 类」，Gemini 选「Gemini 类」。默认轻校，不选精校则行为不变。</div>
                         <details class="so-mode-collapse" id="so-fix-ctx-adv">
                             <summary class="so-fix-targets-head" style="cursor:pointer;">上下文（默认关，点开）</summary>
                             <div class="so-hint">⚠ 默认关闭以省时间。仅当你的「知识边界 / 剧情护栏」需要参考前文 / 角色卡 / 世界书才能判断时，才勾选。</div>
@@ -6036,7 +6041,7 @@ function bindControls() {
         applyFixFlavorView();
     });
     win.querySelector('#so-fix-prompt-flavor')?.addEventListener('change', (e) => {
-        setFixCfg({ fixA_promptFlavor: e.target.value === 'opus' ? 'opus' : 'deepseek' });
+        setFixCfg({ fixA_promptFlavor: ['opus', 'gemini'].includes(e.target.value) ? e.target.value : 'deepseek' });
     });
     bindFix('#so-fix-card', 'fixA_includeCard');
     bindFix('#so-fix-ctx', 'fixA_includeContext');
@@ -6120,7 +6125,11 @@ function bindControls() {
         }
     });
     inputEl.addEventListener('input', autoGrowInput);                                                      // #4 输入框随内容自动增高
-    messagesEl.addEventListener('scroll', () => { if (!soProgScroll) soFollowStream = nearBottom(); });    // #1 用户滚动更新「是否跟随到底部」
+    // #1 跟随意图【只】由真·用户手势（滚轮 / 触摸）更新——程序化滚动（固定顶部 / 跟随到底）不触发 wheel / touchmove，
+    // 故不会被「空占位气泡刚固定到顶时 nearBottom 恰好为真」误翻成跟随（先前用通用 scroll 监听正栽在这）。
+    const soUpdateFollow = () => { try { requestAnimationFrame(() => { soFollowStream = nearBottom(); }); } catch (e) { soFollowStream = nearBottom(); } };
+    messagesEl.addEventListener('wheel', soUpdateFollow, { passive: true });        // 桌面滚轮
+    messagesEl.addEventListener('touchmove', soUpdateFollow, { passive: true });    // 手机触摸滑动
 
     // 用户功能请求：反映持久化的自动诊断状态（重载后若 AUTO 仍开着，按钮显示红色 + AUTO）。
     updateDiagButtonVisual();
@@ -8356,7 +8365,7 @@ function seedFixControls() {
     set('#so-fix-guard', 'value', cfg.fixA_guardrails || '');
     set('#so-fix-tighten', 'checked', cfg.fixA_tighten !== false);
     set('#so-fix-prompt-version', 'value', (cfg.fixA_promptVersion === 'thorough') ? 'thorough' : 'light');   // ✨ 校正提示词（轻校 / 精校）
-    set('#so-fix-prompt-flavor', 'value', (cfg.fixA_promptFlavor === 'opus') ? 'opus' : 'deepseek');           // ✨ 精校侧重（DeepSeek / Opus）
+    set('#so-fix-prompt-flavor', 'value', ['opus', 'gemini'].includes(cfg.fixA_promptFlavor) ? cfg.fixA_promptFlavor : 'deepseek');   // ✨ 精校侧重（DeepSeek / Opus / Gemini）
     set('#so-fix-card', 'checked', !!cfg.fixA_includeCard);
     set('#so-fix-ctx', 'checked', !!cfg.fixA_includeContext);
     set('#so-fix-ctx-depth', 'value', cfg.fixA_contextDepth);
@@ -9434,7 +9443,7 @@ async function generateReply() {
     } finally {
         setGenerating(false);
         abortCtl = null;
-        scrollToBottom();
+        if (soFollowStream) scrollToBottom();   // #1 定稿后只在用户跟随到底部时才滚；否则保持固定顶部（从头读）
     }
 }
 
@@ -9843,7 +9852,7 @@ async function runFixByTargets() {
         clearTimeout(timer);
         setGenerating(false);
         abortCtl = null;                                             // 交还共享中断器（与 generateReply 一致）
-        scrollToBottom();
+        if (soFollowStream) scrollToBottom();   // #1 定稿后只在用户跟随到底部时才滚
     }
 }
 
