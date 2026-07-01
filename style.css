@@ -628,23 +628,38 @@
 }
 
 /* ---------- diagnose mode ---------- */
+/* 诊断模式的「淡红」色调：作为当前模式时是一抹淡红（16% 底纹），自动诊断再升到实心强红。
+   与 advisor / lorebook 同法，用主题强调色调温以融入用户主题。 */
+#so-window { --so-diag-accent: color-mix(in srgb, var(--so-accent) 45%, #d9534f 55%); }
+
 #so-diagnose-btn.so-diag-active {
-    color: var(--so-accent);
-    background-color: color-mix(in srgb, var(--so-accent) 16%, transparent);
+    color: var(--so-diag-accent);
+    background-color: color-mix(in srgb, var(--so-diag-accent) 16%, transparent);
     opacity: 1;
 }
 
 /* ---------- reply-fix mode (校正) ---------- */
+/* 校正模式的「淡金」色调：作为当前模式时是一抹淡金（16% 底纹），与「自动校正」指示灯同一支金
+   （#e3b341）——active 淡、auto 亮，同属一个金色系；同样用主题强调色调温以融入主题。 */
+#so-window { --so-fix-accent: color-mix(in srgb, var(--so-accent) 45%, #e3b341 55%); }
+
 #so-fix-btn.so-fix-active {
-    color: var(--so-accent);
-    background-color: color-mix(in srgb, var(--so-accent) 16%, transparent);
+    color: var(--so-fix-accent);
+    background-color: color-mix(in srgb, var(--so-fix-accent) 16%, transparent);
     opacity: 1;
 }
-/* ✨ 自动校正开启：把校正图标染金，作为「小指示」（用户功能请求）。只改 color/opacity——本块在 .so-fix-active
-   之后、源序更高，故自动开启时金色图标优先；又因不改 background，与 active 的强调底色叠加时仍能看出「在校正模式」。 */
+/* ✨ 自动校正开启：把校正图标染成更亮的金（用户功能请求）。只改 color/opacity——本块在 .so-fix-active
+   之后、源序更高，故自动开启时亮金图标优先；又因不改 background，仍保留 active 的淡金底纹（同一金色系，
+   由淡→亮 = 「校正模式 + 自动开启」）。 */
 #so-fix-btn.so-fix-auto {
     color: var(--so-fix-auto-gold, #e3b341);
     opacity: 1;
+}
+/* 进入校正模式时给标题栏一抹淡金，和 advisor / lorebook / diagnose 一样让整窗染上模式色。 */
+#so-window.so-fix-on #so-header {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--so-fix-accent) 22%, transparent),
+        transparent);
 }
 /* 校正稿卡片里"改了哪些"的小字摘要。 */
 .so-fix-changes { margin-top: 6px; font-size: 0.85em; opacity: 0.78; line-height: 1.4; white-space: pre-wrap; }
@@ -663,16 +678,16 @@
     letter-spacing: 0.08em;
     vertical-align: middle;
     color: #fff;
-    background-color: var(--so-accent);
+    background-color: var(--so-diag-accent);
     background: linear-gradient(160deg,
-        color-mix(in srgb, var(--so-accent) 95%, white 5%),
-        color-mix(in srgb, var(--so-accent) 78%, black 6%));
+        color-mix(in srgb, var(--so-diag-accent) 95%, white 5%),
+        color-mix(in srgb, var(--so-diag-accent) 78%, black 6%));
 }
 #so-window.so-diag-on #so-diag-pill { display: inline-block; }
 
 #so-window.so-diag-on #so-header {
     background: linear-gradient(180deg,
-        color-mix(in srgb, var(--so-accent) 22%, transparent),
+        color-mix(in srgb, var(--so-diag-accent) 22%, transparent),
         transparent);
 }
 
@@ -723,16 +738,16 @@
 #so-window.so-settings-open #so-lb-bar { display: none; }
 
 /* 诊断模式「精选世界书条目」栏。复用世界书 .so-lb-* 选条目控件，但把 --so-lb-accent 局部改写成
-   诊断的蓝色调（--so-accent），整套控件一并换肤，无需重复样式。 */
+   诊断的淡红色调（--so-diag-accent），整套控件一并换肤，无需重复样式。 */
 #so-diag-bar {
-    --so-lb-accent: var(--so-accent);
+    --so-lb-accent: var(--so-diag-accent);
     display: none;
     flex: 0 0 auto;
     flex-direction: column;
     gap: 6px;
     padding: 9px 12px;
     border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
-    background: color-mix(in srgb, var(--so-accent) 7%, transparent);
+    background: color-mix(in srgb, var(--so-diag-accent) 7%, transparent);
 }
 #so-window.so-diag-on #so-diag-bar { display: flex; }
 #so-window.so-settings-open #so-diag-bar { display: none; }
@@ -741,16 +756,16 @@
 #so-diag-bar.so-diag-usesel-on #so-diag-picker { display: flex; }
 
 /* 校正模式配置栏。结构与诊断栏同构（默认隐藏 + 竖向 flex 布局），只在 .so-fix-on 时显示、
-   配置面板打开时让位。复用 --so-accent 的局部换肤与共享的 .so-mode-collapse 折叠机制。 */
+   配置面板打开时让位。复用 --so-fix-accent（淡金）的局部换肤与共享的 .so-mode-collapse 折叠机制。 */
 #so-fix-bar {
-    --so-lb-accent: var(--so-accent);
+    --so-lb-accent: var(--so-fix-accent);
     display: none;
     flex: 0 0 auto;
     flex-direction: column;
     gap: 6px;
     padding: 9px 12px;
     border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
-    background: color-mix(in srgb, var(--so-accent) 7%, transparent);
+    background: color-mix(in srgb, var(--so-fix-accent) 7%, transparent);
     /* 校正栏内容多、且默认展开（不像诊断 / 世界书栏把大块内容默认折起）：桌面上它的自然高度
        可达 ~680px，超过整窗（默认 540px）。因为是 flex:0 0 auto（绝不收缩）且桌面无高度上限，
        它会撑爆窗口——把消息区与输入框整体顶到 overflow:hidden 边界之外、自身底部也被裁掉，
@@ -1625,15 +1640,16 @@
     line-height: 1;
     vertical-align: middle;
 }
-/* 红色覆盖普通诊断的蓝色高亮（本块在 #so-diagnose-btn.so-diag-active 之后，源序更高）。 */
+/* 实心强红覆盖手动诊断按钮的淡红高亮（本块在 #so-diagnose-btn.so-diag-active 之后，源序更高）。 */
 #so-diagnose-btn.so-diag-auto {
     color: #fff;
     background-color: var(--so-auto-red, #d9534f);
     opacity: 1;
 }
 #so-diagnose-btn.so-diag-auto .so-auto-tag { display: inline; }
-/* 自动模式给标题栏一抹红，呼应按钮（红优先于 .so-diag-on 的蓝标题栏）。仅在【确实处于
-   诊断窗口模式】时染红——这样重载后 AUTO 仍开、但窗口停在聊天模式时，只有按钮红、标题栏不红。 */
+/* 自动模式给标题栏一抹更浓的红，呼应按钮（本块比 .so-diag-on 多一个类，故这抹浓红压过手动诊断的
+   淡红标题栏）。仅在【确实处于诊断窗口模式】时染红——这样重载后 AUTO 仍开、但窗口停在聊天模式时，
+   只有按钮红、标题栏不红。 */
 #so-window.so-diag-auto-on.so-diag-on #so-header {
     background: linear-gradient(180deg,
         color-mix(in srgb, var(--so-auto-red, #d9534f) 22%, transparent),
@@ -1735,7 +1751,8 @@
 }
 
 /* ---------- 自动诊断首开警告弹窗（居中卡片，仿 #so-curate） ---------- */
-#so-autowarn {
+/* 一次性警告弹窗：自动诊断（#so-autowarn）与 自动校正（#so-fixwarn）共用同一套样式 */
+#so-autowarn, #so-fixwarn {
     display: none;
     position: absolute;
     inset: 0;
@@ -1747,8 +1764,8 @@
     background: rgba(8, 9, 12, 0.84);
     backdrop-filter: blur(4px);
 }
-#so-autowarn.open { display: flex; }
-#so-autowarn-card {
+#so-autowarn.open, #so-fixwarn.open { display: flex; }
+#so-autowarn-card, #so-fixwarn-card {
     width: 100%;
     max-width: 440px;
     box-sizing: border-box;
@@ -1759,7 +1776,7 @@
     box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.7);
     padding: 16px 18px;
 }
-#so-autowarn-head {
+#so-autowarn-head, #so-fixwarn-head {
     font-weight: 700;
     font-size: 1.02em;
     display: flex;
@@ -1767,16 +1784,16 @@
     gap: 8px;
     margin-bottom: 10px;
 }
-#so-autowarn-head > i { color: var(--so-auto-red, #d9534f); }
-#so-autowarn-body { font-size: 0.84em; line-height: 1.6; }
-#so-autowarn-body p { margin: 0 0 9px; }
-#so-autowarn-body .so-autowarn-danger {
+#so-autowarn-head > i, #so-fixwarn-head > i { color: var(--so-auto-red, #d9534f); }
+#so-autowarn-body, #so-fixwarn-body { font-size: 0.84em; line-height: 1.6; }
+#so-autowarn-body p, #so-fixwarn-body p { margin: 0 0 9px; }
+#so-autowarn-body .so-autowarn-danger, #so-fixwarn-body .so-autowarn-danger {
     padding: 8px 10px;
     border-radius: 8px;
     border: 1px solid color-mix(in srgb, var(--so-auto-red, #d9534f) 55%, transparent);
     background: color-mix(in srgb, var(--so-auto-red, #d9534f) 14%, transparent);
 }
-#so-autowarn-body .so-autowarn-note { opacity: 0.68; }
+#so-autowarn-body .so-autowarn-note, #so-fixwarn-body .so-autowarn-note { opacity: 0.68; }
 .so-autowarn-check {
     display: flex;
     align-items: center;
@@ -1786,12 +1803,12 @@
     cursor: pointer;
 }
 .so-autowarn-check input { cursor: pointer; }
-#so-autowarn-btns {
+#so-autowarn-btns, #so-fixwarn-btns {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
 }
-#so-autowarn-btns button {
+#so-autowarn-btns button, #so-fixwarn-btns button {
     padding: 7px 14px;
     border-radius: 8px;
     border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
@@ -1800,7 +1817,7 @@
     cursor: pointer;
     font-size: 0.86em;
 }
-#so-autowarn-btns button:hover { background: rgba(255, 255, 255, 0.12); }
+#so-autowarn-btns button:hover, #so-fixwarn-btns button:hover { background: rgba(255, 255, 255, 0.12); }
 #so-autowarn-ok {
     background: var(--so-auto-red, #d9534f) !important;
     border-color: var(--so-auto-red, #d9534f) !important;

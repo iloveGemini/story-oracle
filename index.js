@@ -578,6 +578,8 @@ const SYSPROMPT_MODES = [
     { id: 'chat',     label: '普通聊天',   key: 'systemPrompt',         builtin: DEFAULT_SYSTEM_PROMPT },
     { id: 'diagnose', label: '诊断 🩺',    key: 'diagnoseSystemPrompt', builtin: DIAGNOSE_SYSTEM_PROMPT },
     { id: 'lorebook', label: '世界书 📖',  key: 'lorebookSystemPrompt', builtin: LOREBOOK_SYSTEM_PROMPT },
+    // 剧情参谋（单拍 <StoryPlan> 指令；不含弧线编译器）—— 1.17.7 起开放编辑（用户功能请求）。
+    { id: 'advisor',  label: '剧情参谋 🧭', key: 'advisorSystemPrompt',  builtin: ADVISOR_SYSTEM_PROMPT },
 ];
 
 // 设置里「系统提示词」文本框当前正在编辑哪个模式（仅 UI 状态、不持久化，每次会话默认 chat）。
@@ -596,10 +598,11 @@ const defaults = {
     temperature: 0.7,
     maxTokens: 2000,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
-    // 诊断 / 世界书模式的系统提示词【覆盖】。空串 = 用内置默认（见 SYSPROMPT_MODES）。
-    // 参谋模式的提示词暂不开放修改，故此处不含 advisor。
+    // 诊断 / 世界书 / 剧情参谋 模式的系统提示词【覆盖】。空串 = 用内置默认（见 SYSPROMPT_MODES）。
+    // 参谋自 1.17.7 起也可编辑（毕业进 SYSPROMPT_MODES；仅单拍参谋指令，不含弧线编译器）。
     diagnoseSystemPrompt: '',
     lorebookSystemPrompt: '',
+    advisorSystemPrompt: '',
     sysPromptPresetName: '',   // '' = use systemPrompt textarea; else name of a Chat Completion preset
     // Frozen, per-preset curations. Keyed by preset name -> { items:[...], curatedAt }.
     // Each item is a kept block in final (possibly reordered) order:
@@ -628,6 +631,11 @@ const defaults = {
     fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: true, fixA_targetMagic: false, fixA_targetPacing: true,
     fixA_knowledgeBoundary: '', fixA_guardrails: '',
     fixA_keepTags: '', fixA_dropTags: '',
+    // ✨ 作用域标签（用户功能请求）：只校正 <content>…</content> 内的正文，正文【外】的所有块（状态栏 / 选项 /
+    // 世界书 / htmlcontent 地图 / UpdateVariable / 占位符…）原样保留、原位不动（信封式，绝不抽出重排）。默认
+    // 'content'，且【仅当回复里确有该标签时才生效】——简单卡（无此标签）自动回退到「校正整条」的旧行为。
+    // 留空 = 关闭作用域、校正整条回复。卡片若用别的标签包正文，改成那个标签名。
+    fixA_scopeTag: 'content',
     fixA_tighten: true,          // ✨ 收紧：自动校正后再精修一遍（删冗词废话 / 过度描写，读感更紧）；默认开
     // ✨ 校正模式 Phase 3：自动校正（开启后每条新主聊天 AI 回复后台跑一次校正、自动应用为新 swipe；
     // 经 maybePostReply 编排 → runAutoFix）。默认关。fixAutoMinChars = 成本门最小字符数（短回复不值得发调用，见
@@ -653,6 +661,9 @@ const defaults = {
     autoDiagnoseEnabled: false,
     autoDiagnoseWarned: false,
     autoDiagnoseDelayMs: 1200,
+    // ✨ 校正：首次切到「自动校正」时弹一次性提醒（讲清标签块 <sceneinfo>/<details> 的留存要靠排除区·保留）。
+    // 与 autoDiagnoseWarned 同款一次性警告：勾「不再提示」后置真，从此不再弹。
+    autoFixWarned: false,
     worldInfoMode: 'off',      // 'off' | 'st' (constant + keyword) | 'all' (every entry)
     // 读取隐藏楼层（用户功能请求）：默认关。开启后神谕读取主聊天时也纳入被 /hide 隐藏的消息。
     // 只影响「神谕读取对话记录」的所有模式；不影响世界书关键词扫描，也不影响弧线节奏计数。
@@ -743,6 +754,7 @@ let fixContextBlock = '';  // 校正：前文上下文块
 let fixWorldBlock = '';    // 校正：激活世界书块
 let fixSummaryBlock = '';  // 校正：📜剧情概要块（手动默认带 / 自动可选；buildFixEnvelope 包成 <story_summary>）
 let fixExtraKeep = [];      // 排除·保留区抠出的块数组（composeFixedReply 据 ⟦SO_KEEP_n⟧ 标记按位置还原回原位）
+let fixScope = { active: false };   // ✨ 作用域信封（splitContentScope）：active 时只校正 <content> 内层，应用时把校正稿原位回插（wrapContentScope）
 let fixTightenActive = true;   // ✨ 收紧 toggle 生效值（captureFixContext 经 resolveFixModeCfg 设：手动恒 false，自动按 fixA_tighten）；on → buildFixPrompt 用 FIX_SYSTEM_PROMPT_TIGHTEN
 let fixActiveMode = 'manual';  // 当前校正调用是哪套（captureFixContext 设）：'manual' → buildFixPrompt 用 FIX_SYSTEM_PROMPT_MANUAL；'auto' → FIX_SYSTEM_PROMPT(_TIGHTEN)
 let advStatData = '';       // stringified current MVU stat_data for advisor sends
@@ -2055,7 +2067,7 @@ const FIX_CFG_KEYS = [
     // 自动模式（per-chat 可覆盖）
     'fixA_includeCard', 'fixA_includeContext', 'fixA_contextDepth', 'fixA_includeWorld', 'fixA_includeSummary',
     'fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing',
-    'fixA_knowledgeBoundary', 'fixA_guardrails', 'fixA_keepTags', 'fixA_dropTags', 'fixA_tighten',
+    'fixA_knowledgeBoundary', 'fixA_guardrails', 'fixA_keepTags', 'fixA_dropTags', 'fixA_scopeTag', 'fixA_tighten',
     'autoFixEnabled', 'fixAutoMinChars',
 ];
 
@@ -2096,6 +2108,8 @@ function resolveFixModeCfg(e, mode) {
             },
             knowledge: c.fixA_knowledgeBoundary || '', guardrails: c.fixA_guardrails || '',
             keepTags: c.fixA_keepTags || '', dropTags: c.fixA_dropTags || '',
+            // 作用域标签：缺省（旧聊天 / 未设）→ 'content' 默认；显式空串 '' → 关闭作用域（校正整条）。
+            scopeTag: (c.fixA_scopeTag == null ? 'content' : c.fixA_scopeTag),
         };
     }
     // 手动：depth 显式 0 = 不带前文；其余非正数 / 缺省 = -1（全部）。
@@ -2104,7 +2118,7 @@ function resolveFixModeCfg(e, mode) {
         includeCard: !!c.fixM_includeCard, includeContext: depth !== 0, contextDepth: depth,
         includeWorld: !!c.fixM_includeWorld, includeSummary: !!c.fixM_includeSummary, tighten: false,
         targets: { slop: false, dialogue: false, precision: false, magic: false, pacing: false },
-        knowledge: '', guardrails: '', keepTags: '', dropTags: '',
+        knowledge: '', guardrails: '', keepTags: '', dropTags: '', scopeTag: '',   // 手动不走作用域（captureFixContext 也按 mode 门控）
     };
 }
 
@@ -3869,6 +3883,19 @@ function parseExcludeTagNames(str) {
         .filter(Boolean);
 }
 
+// 纯函数（fix-exclude-nested-bracket.test.mjs）：把「排除区」输入解析成 [{name, bracket}]。每行 / 逗号一项。
+// <tag> / </tag> / 裸名 tag → 尖括号块（bracket:false）；[tag] / [/tag] → 方括号块（bracket:true，如图生指令 [IMG_GEN]…[/IMG_GEN]）。
+// 名字按标签名字符集（含中文、下划线、连字符）提取，容错前缀 < / </ / [ / [/。空 / 杂项 → 丢弃。
+function parseExcludeTags(str) {
+    return String(str || '').split(/[,\n]+/).map((s) => {
+        const t = s.trim();
+        if (!t) return null;
+        const bracket = t.charAt(0) === '[';
+        const m = t.replace(/^[<[]\/?/, '').match(/^[A-Za-z0-9_一-龥-]+/);
+        return m ? { name: m[0], bracket } : null;
+    }).filter(Boolean);
+}
+
 // 排除·保留区占位标记：keep 块从 prose 里抠走时，原位留下 ⟦SO_KEEP_n⟧ 作锚点（n = 该块在 keepBlocks 里的下标），
 // 让 composeFixedReply 能把原块还原【回原位】，而不是一律接到末尾（用户报的「保留块被挪到故事结尾」bug）。⟦⟧ 是罕见
 // 数学括号，正文几乎不可能自然出现；模型被 buildFixPrompt 提示原样保留，万一弄丢由 composeFixedReply 兜底接回（不丢内容）。
@@ -3876,29 +3903,81 @@ const FIX_KEEP_MARK = '⟦SO_KEEP_';
 function fixKeepPlaceholder(i) { return FIX_KEEP_MARK + i + '⟧'; }
 function stripFixKeepMarks(t) { return String(t == null ? '' : t).replace(new RegExp(FIX_KEEP_MARK + '\\d+⟧', 'g'), ''); }
 
-// 纯函数：从 reply 里抠出用户指定的"排除区"。keep 标签的 <tag>…</tag> 块（含截断未闭合）抠出后【原位留下占位标记 ⟦SO_KEEP_n⟧】
+// 纯函数：从 reply 里抠出用户指定的"排除区"。keep 标签的整块（含截断未闭合）抠出后【原位留下占位标记 ⟦SO_KEEP_n⟧】
 // 并把原块收进 keepBlocks（composeFixedReply 据标记还原回原位）；drop 标签的块抠出后直接丢弃（无标记）。两者都从 prose
-// （送去校正的正文）里移除。返回 { prose, keep, keepBlocks } —— prose 送去校正，keepBlocks 是要按位置接回的块数组。可单测。
+// （送去校正的正文）里移除。返回 { prose, keep, keepBlocks }。可单测（fix-exclude*.test.mjs）。
+// 【深度配平】（1.17.9）：按开 / 闭标签计数找【配平】的整块——嵌套同名标签（<div> 套 <div>）抠的是【最外层】整块，
+// 而非旧非贪婪正则「外开配第一个内闭」把结构切碎（用户报的「<div> 放进保留区也没用、整段被肘碎」根因）。
+// 【方括号块】（1.17.9）：[IMG_GEN]…[/IMG_GEN] 这类方括号分隔块同样支持（图生卡常用；parseExcludeTags 的 bracket）。
+// 孤立闭合标签（深度 0、无配对开标签）留在 prose；开了没闭（截断）→ 取到结尾。各标签按列表顺序逐一抠（与旧版同）。
 function extractExcludedSections(reply, keepStr, dropStr) {
     let prose = String(reply || '');
     const keepBlocks = [];
     const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const nb = '(?![A-Za-z0-9_\\u4e00-\\u9fa5-])';   // 标签名后不得再跟名字字符（避免 <plan> 误匹配 <planning>；兼容中文标签）
-    const pull = (name, collect) => {
-        const n = esc(name);
-        const repl = (m) => {
-            if (!collect) return '';                              // drop：直接抠掉，不留痕
-            const ph = fixKeepPlaceholder(keepBlocks.length);     // keep：原位留下带下标的占位标记
-            keepBlocks.push(m);
-            return ph;
-        };
-        prose = prose.replace(new RegExp('<' + n + nb + '[^>]*>[\\s\\S]*?<\\/' + n + nb + '[^>]*>', 'gi'), repl);
-        prose = prose.replace(new RegExp('<' + n + nb + '[^>]*>[\\s\\S]*$', 'i'), repl);
+    const nb = '(?![A-Za-z0-9_\\u4e00-\\u9fa5-])';   // 标签名后不得再跟名字字符（避免 <plan> 误匹配 <planning> / [IMG] 误匹配 [IMGX]；兼容中文标签）
+    const pull = (spec, collect) => {
+        const n = esc(spec.name);
+        // 按尖 / 方括号给出开、闭标记的正则源（方括号块允许 [name attrs] 形态，闭标记 [/name]）。
+        const openSrc = spec.bracket ? ('\\[' + n + nb + '[^\\]]*\\]') : ('<' + n + nb + '[^>]*>');
+        const closeSrc = spec.bracket ? ('\\[\\/' + n + nb + '[^\\]]*\\]') : ('<\\/' + n + nb + '[^>]*>');
+        const tokRe = new RegExp('(' + openSrc + ')|(' + closeSrc + ')', 'gi');
+        const spans = [];
+        let depth = 0, spanStart = -1, m;
+        while ((m = tokRe.exec(prose)) !== null) {
+            if (m[1] != null) {                                  // 开标签：深度 0→1 记起点，向上计数
+                if (depth === 0) spanStart = m.index;
+                depth += 1;
+            } else if (depth > 0) {                              // 闭标签：向下计数，回到 0 即一整块配平
+                depth -= 1;
+                if (depth === 0) spans.push([spanStart, m.index + m[0].length]);
+            }                                                    // 深度 0 的孤立闭合标签：忽略（留在 prose）
+        }
+        if (depth > 0 && spanStart >= 0) spans.push([spanStart, prose.length]);   // 截断：开了没闭 → 取到结尾
+        if (!spans.length) return;
+        let out = '', last = 0;
+        for (const [a, b] of spans) {                            // 文档顺序遍历 → keepBlocks 文档顺序、占位标记落原位
+            out += prose.slice(last, a);
+            if (collect) { out += fixKeepPlaceholder(keepBlocks.length); keepBlocks.push(prose.slice(a, b)); }
+            // drop：什么都不接（块被丢弃）
+            last = b;
+        }
+        prose = out + prose.slice(last);
     };
-    for (const name of parseExcludeTagNames(keepStr)) pull(name, true);
-    for (const name of parseExcludeTagNames(dropStr)) pull(name, false);
+    for (const spec of parseExcludeTags(keepStr)) pull(spec, true);
+    for (const spec of parseExcludeTags(dropStr)) pull(spec, false);
     prose = prose.replace(/\n{3,}/g, '\n\n').trim();
     return { prose, keep: keepBlocks.join('\n\n'), keepBlocks };
+}
+
+// ✨ 校正「只校正 <content> 内」作用域（纯函数，单测钉 fix-content-scope.test.mjs）。
+// splitContentScope —— 把回复按【正文标签】拆成「信封 + 内层正文」：prefix + <tag…> + inner + </tag> + suffix。
+//   只有 inner 会送去校正，其余作为信封【逐字保留、原位回插】——绝不抽出重排，所以正文【外】的状态栏 / 选项 /
+//   世界书 / htmlcontent 地图 / UpdateVariable / 占位符 全都原地不动（这正是「排除区逐个枚举又对嵌套同名标签失效」
+//   的根治：反过来只圈定要改的正文，其余一律不动）。tag 为空 / 回复里找不到该标签 → {active:false}，调用方回退到
+//   「校正整条回复」的旧行为（简单卡不受影响）。截断（只有 <tag> 没 </tag>）→ inner 取到结尾、close/suffix 空。
+//   只作用域【第一处】<tag>…</tag>，其余留在 suffix（不丢、不改）。tag 名经 parseExcludeTagNames 容错
+//   （content / <content> / </content> 等价）。<content> 不会误命中 <contentX>（nb 名字边界）。
+function splitContentScope(reply, tagName) {
+    const name = parseExcludeTagNames(tagName)[0] || '';
+    if (!name) return { active: false };
+    const text = String(reply == null ? '' : reply);
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nb = '(?![A-Za-z0-9_\\u4e00-\\u9fa5-])';
+    const mo = text.match(new RegExp('<' + esc + nb + '[^>]*>', 'i'));
+    if (!mo) return { active: false };
+    const prefix = text.slice(0, mo.index);
+    const open = mo[0];
+    const rest = text.slice(mo.index + open.length);
+    const mc = rest.match(new RegExp('<\\/' + esc + nb + '[^>]*>', 'i'));
+    if (!mc) return { active: true, prefix, open, inner: rest, close: '', suffix: '' };   // 截断：内层取到结尾
+    return { active: true, prefix, open, inner: rest.slice(0, mc.index), close: mc[0], suffix: rest.slice(mc.index + mc[0].length) };
+}
+
+// 把校正后的内层正文回插信封原位：prefix + <tag…> + innerFixed + </tag> + suffix。inactive → 直接返回 inner（无操作）。
+function wrapContentScope(scope, innerFixed) {
+    const inner = String(innerFixed == null ? '' : innerFixed);
+    if (!scope || !scope.active) return inner;
+    return scope.prefix + scope.open + inner + scope.close + scope.suffix;
 }
 
 /* ------------------------------------------------------------------ *
@@ -4068,6 +4147,7 @@ async function applyFix(patchBlock, statusEl) {
         return null;
     }
     await Mvu.replaceMvuData(newData, opts);
+    refreshLatestMvuBar();   // 应用后刷新楼层状态栏（replaceMvuData 不发刷新事件，否则要手动重载——用户反馈）
     return snapshot;
 }
 
@@ -4075,6 +4155,7 @@ async function undoFix(snapshot) {
     const Mvu = await getMvu();
     if (!Mvu || typeof Mvu.replaceMvuData !== 'function') throw new Error('MVU not available');
     await Mvu.replaceMvuData(snapshot, { type: 'message', message_id: 'latest' });
+    refreshLatestMvuBar();   // 撤销后同样刷新，免得状态栏停在已应用值
 }
 
 /* ------------------------------------------------------------------ *
@@ -4258,6 +4339,18 @@ function refreshMessageBar(idx) {
             Promise.resolve(ctx.eventSource.emit(et.MESSAGE_UPDATED || 'message_updated', idx)).catch(() => {});
         }
     } catch (e) { console.warn('[Story Oracle] 自动诊断后发 MESSAGE_UPDATED 失败：', e); }
+}
+
+// 手动诊断「应用 / 撤销」后刷新楼层状态栏。手动 applyFix / undoFix 也走 Mvu.replaceMvuData 写库，它同样【不发】
+// VARIABLE_UPDATE_ENDED，状态栏（卡片 <StatusPlaceHolderImpl/> iframe）不会自己更新 —— 用户得手动点「重新读取
+// 初始变量」才看到新数据（用户反馈：茶茶）。自动诊断早有 refreshMessageBar 兜底，手动这条路一直没接上（pre-1.17.0
+// 备份里也没有，是历史欠账，非校正改动所致）。这里对最新一条 AI 消息（= MVU 'latest' 指向的那条）复用同一刷新
+// （重渲染 + 补发 MESSAGE_UPDATED，让酒馆助手重建状态栏 iframe）。尽力而为：拿不到目标 / 重渲染失败都不影响数据已写入。
+function refreshLatestMvuBar() {
+    try {
+        const { idx } = getLatestAiMessage();
+        if (idx >= 0) refreshMessageBar(idx);
+    } catch (e) { console.warn('[Story Oracle] 诊断应用 / 撤销后刷新状态栏失败：', e); }
 }
 
 // 纯函数：把 block（+ 可选状态栏占位符 placeholder）幂等追加到 m.mes，并【镜像到当前 swipe 槽】。
@@ -4847,13 +4940,15 @@ function buildWindow() {
                         <button type="button" id="so-fix-run" class="so-fix-run-btn"><i class="fa-solid fa-wand-magic-sparkles"></i> 按目标校正最新回复</button>
                         <label class="so-check so-lb-check"><input id="so-fix-auto" type="checkbox"><span>自动校正每条新回复（实验）</span></label>
                         <label class="so-check so-lb-check"><input id="so-fixa-preset" type="checkbox"><span>经自定义补全预设发送（破限 / 越狱用）</span></label>
+                        <label class="so-check so-lb-check"><span>只校正此标签内的正文</span>&nbsp;<input id="so-fix-scope" type="text" placeholder="content" style="width:110px;"></label>
+                        <div class="so-hint">填卡片包裹【正文】的标签名（默认 <code>content</code>）：只校正 &lt;content&gt;…&lt;/content&gt; 之间的正文，正文【外】的所有块（状态栏 / 选项 / 世界书 / htmlcontent 地图 / 变量更新 / 占位符…）原样保留、<strong>原位不动</strong>。回复里没有该标签则自动校正整条（简单卡不受影响）。<strong>留空</strong> = 校正整条回复。卡片若用别的标签包正文，就改成那个标签名（如 &lt;正文&gt; 就填 <code>正文</code>）。</div>
                         <div class="so-fix-targets-head">校正目标</div>
                         <label class="so-check so-lb-check"><input id="so-fix-tgt-slop" type="checkbox"><span>AI 八股 / 套话</span></label>
                         <label class="so-check so-lb-check"><input id="so-fix-tgt-dialogue" type="checkbox"><span>对话机械 / 不自然</span></label>
                         <label class="so-check so-lb-check"><input id="so-fix-tgt-precision" type="checkbox"><span>过度精确（数学论文腔）</span></label>
                         <label class="so-check so-lb-check"><input id="so-fix-tgt-magic" type="checkbox"><span>魔法被写成理科（仅奇幻设定）</span></label>
                         <label class="so-check so-lb-check"><input id="so-fix-tgt-pacing" type="checkbox"><span>描写拖沓 / 流水账</span></label>
-                        <div class="so-fix-targets-head">排除区（这些标签的整段不送去校正，省时间）。每行写一个【起始】标记即可，如 &lt;thinking&gt;——不用写结束的 &lt;/thinking&gt;。</div>
+                        <div class="so-fix-targets-head">排除区（这些标签的整段不送去校正，省时间）。每行写一个【起始】标记即可，如 &lt;thinking&gt;——不用写结束的 &lt;/thinking&gt;。<br>支持<strong>嵌套同名标签</strong>（如 &lt;div&gt; 套 &lt;div&gt; 会整块保留最外层）和<strong>方括号块</strong>（图生卡的 <code>[IMG_GEN]</code> 这类，直接写 <code>[IMG_GEN]</code>）。若整篇正文都包在一个标签里，优先用上面的「只校正此标签内的正文」，比在这里逐个枚举更省心。</div>
                         <textarea id="so-fix-keep" rows="2" placeholder="保留区标签（每行一个，如 <status>）：不改，原样留在回复里"></textarea>
                         <textarea id="so-fix-drop" rows="2" placeholder="丢弃区标签（每行一个，如 <thinking>）：不改，也不放回（思考块这类）"></textarea>
                         <textarea id="so-fix-know" rows="2" placeholder="角色知识边界（可空）：例如「主角不知道自己的真实身世」"></textarea>
@@ -5035,6 +5130,22 @@ function buildWindow() {
                 <div id="so-autowarn-btns">
                     <button type="button" id="so-autowarn-cancel">取消</button>
                     <button type="button" id="so-autowarn-ok">开启自动模式</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="so-fixwarn">
+            <div id="so-fixwarn-card">
+                <div id="so-fixwarn-head"><i class="fa-solid fa-circle-info"></i> 自动校正：只改你的故事正文</div>
+                <div id="so-fixwarn-body">
+                    <p><strong>自动校正</strong>会把你的<strong>故事正文</strong>交给模型重写一遍（去掉 AI 腔 / 套话、收紧读感），并作为<strong>新的一条 swipe</strong> 应用——原回复留在左滑，随时能滑回去，<strong>不破坏存档</strong>。</p>
+                    <p class="so-autowarn-danger">默认它<strong>只改 &lt;content&gt; 标签里的正文</strong>。你卡片正文<strong>之外</strong>的一切——状态栏、选项菜单、世界书、图片、变量面板——都会<strong>原样保留、原位不动</strong>，你不用做任何设置。</p>
+                    <p><strong>唯一要确认的一点：</strong>如果你的卡片不是用 &lt;content&gt; 包正文，而是别的标签（例如 &lt;gametxt&gt;），把下面「<strong>只校正此标签内的正文</strong>」那一栏改成你卡片用的标签名就行。（留空 = 校正整条回复。）</p>
+                    <p class="so-autowarn-note">进阶（多数卡用不到）：如果正文<strong>里面</strong>还夹着你想原样保住的小块（某个面板 / 折叠块 / 图片指令），把它的<strong>起始标记</strong>加进「排除区 · 保留」。正文<strong>外</strong>的东西不用管。</p>
+                </div>
+                <label class="so-autowarn-check"><input type="checkbox" id="so-fixwarn-never"><span>不再提示</span></label>
+                <div id="so-fixwarn-btns">
+                    <button type="button" id="so-fixwarn-ok">知道了</button>
                 </div>
             </div>
         </div>
@@ -5313,6 +5424,12 @@ function bindControls() {
         closeAutoWarn();
         applyDiagButtonState('auto');
     });
+    // ✨ 校正：切到「自动校正」时的一次性标签块提醒（信息性，无需取消——已经切过去了，只是提醒）。
+    const fixWarnOk = win.querySelector('#so-fixwarn-ok');
+    if (fixWarnOk) fixWarnOk.addEventListener('click', () => {
+        if (win.querySelector('#so-fixwarn-never').checked) { getSettings().autoFixWarned = true; save(); }
+        win.querySelector('#so-fixwarn').classList.remove('open');
+    });
     win.querySelector('#so-profile-refresh').addEventListener('click', refreshProfiles);
 
     // settings inputs -> persist
@@ -5368,6 +5485,9 @@ function bindControls() {
             getSettings().fixSettingsView = (fixModeSel.value === 'auto') ? 'auto' : 'manual';
             save();
             applyFixModeView();
+            // 首次切到「自动校正」→ 弹一次性标签块提醒（用户功能请求）。仅用户手动 change 触发；
+            // applyFixModeView 程序化设 sel.value 不发 change，故载入 / 切聊天不会误弹。
+            if (fixModeSel.value === 'auto' && !getSettings().autoFixWarned) openAutoFixWarn();
         });
     }
     // ✨ 经预设发送（破限 / 越狱用）—— 全局开关（不进 per-chat），同 advisorUsePreset 写法（写 getSettings + save）。
@@ -5388,6 +5508,7 @@ function bindControls() {
     bindFix('#so-fix-tgt-precision', 'fixA_targetPrecision');
     bindFix('#so-fix-tgt-magic', 'fixA_targetMagic');
     bindFix('#so-fix-tgt-pacing', 'fixA_targetPacing');
+    win.querySelector('#so-fix-scope').addEventListener('input', (e) => { setFixCfg({ fixA_scopeTag: e.target.value }); });   // ✨ 作用域标签（per-chat）
     win.querySelector('#so-fix-keep').addEventListener('input', (e) => { setFixCfg({ fixA_keepTags: e.target.value }); });
     win.querySelector('#so-fix-drop').addEventListener('input', (e) => { setFixCfg({ fixA_dropTags: e.target.value }); });
     win.querySelector('#so-fix-know').addEventListener('input', (e) => { setFixCfg({ fixA_knowledgeBoundary: e.target.value }); });
@@ -6442,6 +6563,16 @@ function openAutoDiagWarn() {
     const never = win.querySelector('#so-autowarn-never');
     if (never) never.checked = false;
     const modal = win.querySelector('#so-autowarn');
+    if (modal) modal.classList.add('open');
+}
+
+// ✨ 校正：首次切到「自动校正」时弹的一次性提醒（标签块 <sceneinfo>/<details> 的留存要靠排除区·保留——写起始标记即可）。
+// 与 openAutoDiagWarn 同款：纯展示弹窗，「知道了」关闭、勾「不再提示」则置 autoFixWarned。仅在 !autoFixWarned 时由切到自动的处理器调起。
+function openAutoFixWarn() {
+    if (!win) return;
+    const never = win.querySelector('#so-fixwarn-never');
+    if (never) never.checked = false;
+    const modal = win.querySelector('#so-fixwarn');
     if (modal) modal.classList.add('open');
 }
 
@@ -7558,6 +7689,7 @@ function seedFixControls() {
     set('#so-fix-tgt-precision', 'checked', !!cfg.fixA_targetPrecision);
     set('#so-fix-tgt-magic', 'checked', !!cfg.fixA_targetMagic);
     set('#so-fix-tgt-pacing', 'checked', !!cfg.fixA_targetPacing);
+    set('#so-fix-scope', 'value', cfg.fixA_scopeTag != null ? cfg.fixA_scopeTag : 'content');   // ✨ 作用域标签（默认 content）
     set('#so-fix-keep', 'value', cfg.fixA_keepTags || '');
     set('#so-fix-drop', 'value', cfg.fixA_dropTags || '');
     set('#so-fix-know', 'value', cfg.fixA_knowledgeBoundary || '');
@@ -7937,7 +8069,7 @@ function buildAdvisorArcBlock(arc, since) {
 // 用）+ 角色卡 + 世界书 + 【整段】对话记录。无论全局上下文深度设成多少，参谋
 // 都看全史——只看最近十几条提出的方案会漏掉长线伏笔。
 function buildAdvisorPrompt(ctx, s) {
-    const parts = [ADVISOR_SYSTEM_PROMPT];
+    const parts = [resolveModePrompt(s, 'advisor')];   // 用户在设置里自定义了就用其覆盖，否则用内置 ADVISOR_SYSTEM_PROMPT
 
     // 说话人格（仅当用户主动选了某个人格时）：参谋指令之上叠语气皮肤，附带
     // 职责调整（构思未来剧情正是本职，不算「擅自续写」）+ 结构保护。
@@ -8593,8 +8725,11 @@ async function generateReply() {
                 if (plans.length) addPlanControls(assistantEl, plans);
             } else if (fixMode) {
                 // 失败时 .so-content 已显示剥离机制/思维链后的 cleanText，不覆盖它——只补一条说明 note。
-                if (!renderFixCard(assistantEl, contentEl, aEntry, finalText)) {
-                    addSystemNote('没能从模型回复里解析出 <FixedReply> 校正稿，已原样保留。请检查连接/模型，或换一句指令重试。');
+                const fixStatus = renderFixCard(assistantEl, contentEl, aEntry, finalText);
+                if (fixStatus === 'truncated') {
+                    addSystemNote('校正稿似乎被截断了（模型没写完就断了）——把设置里的「最大 token 数」调大些，或点 ↻ 重试。');
+                } else if (fixStatus !== 'ok') {
+                    addSystemNote('没能从模型回复里解析出校正稿，已原样保留。请检查连接/模型，或换一句指令重试。');
                 }
             }
         }
@@ -8625,8 +8760,13 @@ async function captureFixContext(s, { mode = 'manual' } = {}) {
     const norm = resolveFixModeCfg(getEffectiveFixCfg(s, getFixCfg()), mode);
     const latest = getLatestAiMessage();
     fixTargetIdx = latest.idx;
-    fixOriginalReply = latest.text;
-    const ex = extractExcludedSections(latest.text, norm.keepTags, norm.dropTags);   // 排除区（仅自动）；思考块去留由用户「保留/丢弃」决定
+    // ✨ 作用域（仅自动；用户功能请求）：若设了正文标签（默认 content）且回复里确有该标签 → 只校正 <content> 内层，
+    // 正文外的所有块作为【信封】逐字保留、原位回插（应用时 wrapContentScope）。找不到该标签 / 留空 → active:false，
+    // baseText 回退整条回复（旧行为，简单卡不受影响）。后续 extractExcludedSections / 机制块剥离 / 看改动 都基于 baseText。
+    fixScope = (mode === 'auto') ? splitContentScope(latest.text, norm.scopeTag) : { active: false };
+    const baseText = fixScope.active ? fixScope.inner : latest.text;
+    fixOriginalReply = baseText;   // 机制块接回 + 看改动「before」基于作用域内层（作用域外的块在信封里、不参与校正与差异）
+    const ex = extractExcludedSections(baseText, norm.keepTags, norm.dropTags);   // 排除区（仅自动）；思考块去留由用户「保留/丢弃」决定
     fixTargetProse = stripMechanismBlocks(ex.prose);   // 仍自动剥离 MVU 机制块（<UpdateVariable>，composeFixedReply 会原样接回）
     fixExtraKeep = ex.keepBlocks;   // 保留区块数组（composeFixedReply 按 ⟦SO_KEEP_n⟧ 位置还原，而非接到末尾）
     fixSummaryBlock = norm.includeSummary ? getSummary() : '';   // 📜剧情概要（手动默认带、自动可选）；buildFixEnvelope 包成 <story_summary>
@@ -8663,8 +8803,10 @@ async function captureFixContext(s, { mode = 'manual' } = {}) {
 // 返回 true=已渲染校正卡；false=解析不出 <FixedReply>，**失败处理留给各调用点自己做**（两处失败语义不同：手动分支此时
 // .so-content 已显示剥离后的 cleanText、不应覆盖；按目标分支要把原文/「（空回复）」回填——故不在这里统一）。
 function renderFixCard(assistantEl, contentEl, aEntry, finalText) {
-    const parsed = parseFixedReply(finalText);
-    if (!parsed) return false;
+    // 手动宽容 / 自动严格：路由归一成 status；非 ok（'truncated' / 'unparseable'）原样回传给调用点出对应提示。
+    const r = parseFixReply(finalText, fixActiveMode);
+    if (r.status !== 'ok') return r.status;
+    const parsed = { fixed: r.fixed, problems: r.problems };   // 保持下游 parsed.fixed / parsed.problems / addFixApplyControls 契约不变
     aEntry.content = parsed.fixed;   // 历史里存干净的校正正文，而非原始 <FixedReply> 标签
     persistConvo();
     const html = renderReplyHtml(parsed.fixed);
@@ -8682,7 +8824,7 @@ function renderFixCard(assistantEl, contentEl, aEntry, finalText) {
         note.className = 'so-fix-changes';
         note.textContent = '模型没有做出改动——它认为按当前要求无需修改。可换一句更具体的指令、或调整目标后再试。';
         assistantEl.querySelector('.so-bubble')?.appendChild(note);
-        return true;   // 已处理（无 <FixedReply> 解析失败那条 note 不该再补）；但不挂应用按钮
+        return 'ok';   // 已处理（解析失败那条 note 不该再补）；但不挂应用按钮
     }
     if (parsed.problems) {
         const note = document.createElement('div');
@@ -8691,8 +8833,8 @@ function renderFixCard(assistantEl, contentEl, aEntry, finalText) {
         // 「发现并修正」note 挂在 .so-bubble 层（同 addApplyControls 的做法），落在 .so-content 下方而非混进正文。
         assistantEl.querySelector('.so-bubble')?.appendChild(note);
     }
-    addFixApplyControls(assistantEl, parsed, fixOriginalReply, fixTargetIdx, fixExtraKeep);
-    return true;
+    addFixApplyControls(assistantEl, parsed, fixOriginalReply, fixTargetIdx, fixExtraKeep, fixScope);
+    return 'ok';
 }
 
 // 「按目标校正最新回复」：用勾选的目标 + 约束（不是手动输入）当指令，对最新回复跑一次两段式校正并出卡。
@@ -8750,7 +8892,7 @@ async function runFixByTargets() {
             }
         }
         clearTyping();
-        if (!renderFixCard(assistantEl, contentEl, aEntry, finalText)) {
+        if (renderFixCard(assistantEl, contentEl, aEntry, finalText) !== 'ok') {
             contentEl.textContent = finalText || '（空回复）';
             addSystemNote('没能从模型回复里解析出 <FixedReply> 校正稿。请检查连接 / 模型，或调整目标后重试。');
         }
@@ -8845,7 +8987,8 @@ async function runAutoFix(ctx, s) {
     if (fixNoOp(fixTargetProse, parsed.fixed)) { addAutoFixNote('nochange'); return; }   // 校正稿与原文除空白外无差 → 无操作
 
     // 接回原回复的机制块（<UpdateVariable> + 状态栏占位符）+ 用户「排除·保留」区，再作为【新 swipe】应用。
-    const finalText2 = composeFixedReply(parsed.fixed, fixOriginalReply, fixExtraKeep);
+    const innerFixed = composeFixedReply(parsed.fixed, fixOriginalReply, fixExtraKeep);
+    const finalText2 = wrapContentScope(fixScope, innerFixed);   // ✨ 作用域：把校正后的内层回插信封原位（inactive 时为无操作）
     await applyFixAsSwipe(fixTargetIdx, finalText2);
     // 抓【应用后】落点的 swipe_id（addSwipeToMessage 把新 swipe 设为当前），给记录的「用原文 ↔ 用校正稿」
     // 开关用；原文留在 swipe 0。before = 去机制块的原文 prose（fixTargetProse）；after 必须也是【纯散文】
@@ -9360,7 +9503,7 @@ function addApplyControls(assistantEl, patchBlock) {
 
 // 校正卡的「应用到回复」按钮条（仿 addApplyControls）。应用 = 把校正稿（接回原文机制块后）作为新
 // swipe 写入目标消息；原文留在左滑。Phase 1 只做应用（撤销 = 左滑回 swipe 0）。
-function addFixApplyControls(assistantEl, parsed, originalReply, targetIdx, keepSections) {
+function addFixApplyControls(assistantEl, parsed, originalReply, targetIdx, keepSections, scope) {
     const bar = document.createElement('div');
     bar.className = 'so-apply-bar';
     const btn = document.createElement('button');
@@ -9382,7 +9525,12 @@ function addFixApplyControls(assistantEl, parsed, originalReply, targetIdx, keep
     let diffCard = null;
     diffBtn.addEventListener('click', () => {
         if (!diffCard) {
-            diffCard = renderDiffCard(stripMechanismBlocks(String(originalReply || '')), stripFixKeepMarks(parsed.fixed));
+            // 看改动 = 原文 ↔【实际会应用的结果】。after 用 composeFixedReply（把保留区块 + 机制块接回原位）而非
+            // 裸 parsed.fixed——否则「保留区块」在 after 里是被抹掉的占位标记，会被【误标成大段删除】（用户报的
+            // 「<branches> 放进保留区还是被删」其实是这个 diff 假象：块并没送模型、应用后也在，只是看改动显示错了）。
+            // 两侧都 stripMechanismBlocks，让 <UpdateVariable> 不在差异里刷屏；真正被删的【未保留】块仍会如实标红。
+            const appliedPreview = stripMechanismBlocks(composeFixedReply(parsed.fixed, originalReply, keepSections));
+            diffCard = renderDiffCard(stripMechanismBlocks(String(originalReply || '')), appliedPreview);
             bubble.appendChild(diffCard);
         } else {
             diffCard.hidden = !diffCard.hidden;
@@ -9397,7 +9545,8 @@ function addFixApplyControls(assistantEl, parsed, originalReply, targetIdx, keep
         btn.disabled = true;
         status.textContent = '正在应用…';
         try {
-            const finalText = composeFixedReply(parsed.fixed, originalReply, keepSections);
+            const innerFixed = composeFixedReply(parsed.fixed, originalReply, keepSections);
+            const finalText = wrapContentScope(scope, innerFixed);   // ✨ 作用域：校正稿回插信封原位（inactive 时为无操作）
             const ok = await applyFixAsSwipe(targetIdx, finalText);
             if (ok) {
                 applied = true;
@@ -9533,6 +9682,48 @@ function parseFixedReply(text) {
         else { const fr = after.match(/<FixedReply\b[^>]*>/i); problems = (fr ? after.slice(0, fr.index) : after).trim(); }
     }
     return { fixed, problems };
+}
+
+// 纯函数：手动校正的宽容解析（recovery + 截断守卫）。仅手动模式用；自动仍用严格 parseFixedReply。
+// 恢复顺序（先命中先返回）：① 有 <FixedReply> → parseFixedReply（干净两端定界，向后兼容/容忍缺闭合）；
+// ② 无可用 <FixedReply> 但有【闭合的】<fix_think>…</fix_think> → </fix_think> 之后的正文；③ 连 <fix_think>
+// 都没有 → 整条回复即答案；④ <fix_think> 开了没闭 + 无 <FixedReply> → 判【截断】。剥思维链标签 + 抠掉残留
+// 结构标记（<fix_think>/<FixedReply>），避免它们混进被应用的正文。<fix_think> 标签名须与 FIX_SYSTEM_PROMPT_MANUAL 同步。可单测。
+function parseManualFix(text) {
+    const src = String(text || '');
+    const strip = (s) => stripReasoningTags(s)
+        .replace(/<\/?fix_think\b[^>]*>/gi, '')
+        .replace(/<\/?FixedReply\b[^>]*>/gi, '')
+        .trim();
+    // ① 显式 <FixedReply>（干净路径，向后兼容）
+    const strict = parseFixedReply(src);
+    if (strict && strict.fixed) return { fixed: strict.fixed };
+    // ②/④ 看 <fix_think>
+    const open = src.match(/<fix_think\b[^>]*>/i);
+    if (open) {
+        const rest = src.slice(open.index + open[0].length);
+        const close = rest.match(/<\/fix_think\s*>/i);
+        if (!close) return { truncated: true };                 // ④ 开了没闭 + 无 FixedReply → 截断
+        const after = strip(rest.slice(close.index + close[0].length));
+        return after ? { fixed: after } : { truncated: true };  // ② 闭合后的正文；空 → 也当截断
+    }
+    // ③ 无 fix_think、无 FixedReply → 整条即答案
+    const whole = strip(src);
+    return whole ? { fixed: whole } : null;
+}
+
+// 纯函数：按模式选解析器 + 归一成状态。手动 → parseManualFix（宽容 + 截断守卫）；其余（自动）→ parseFixedReply（严格）。
+// 返回 { status, fixed, problems }：status ∈ 'ok'|'truncated'|'unparseable'。renderFixCard 据 status 分派 DOM。可单测。
+function parseFixReply(text, mode) {
+    if (mode === 'manual') {
+        const r = parseManualFix(text);
+        if (!r) return { status: 'unparseable', fixed: '', problems: '' };
+        if (r.truncated) return { status: 'truncated', fixed: '', problems: '' };
+        return { status: 'ok', fixed: r.fixed, problems: '' };
+    }
+    const parsed = parseFixedReply(text);
+    if (!parsed) return { status: 'unparseable', fixed: '', problems: '' };
+    return { status: 'ok', fixed: parsed.fixed, problems: parsed.problems };
 }
 
 /* ------------------------------------------------------------------ *
