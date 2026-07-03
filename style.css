@@ -378,6 +378,22 @@
 .so-content.so-rendered { white-space: normal; }
 .so-content.so-rendered img { max-width: 100%; height: auto; }
 
+/* 参谋 Markdown 渲染时的 <StoryPlan> 原样块（1.18.2）：安静的等宽小块——方案正文在下方的采纳卡里
+   有结构化展示，这里只是让原始块保持可读、不被 Markdown 搅碎。 */
+.so-content .so-plan-raw {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--monoFontFamily, ui-monospace, monospace);
+    font-size: 11px;
+    line-height: 1.45;
+    opacity: 0.72;
+    background: rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 6px 9px;
+    margin: 6px 0;
+}
+
 #so-sysprompt:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* system-prompt mode editor: a title row with a [↺ reset to default] button */
@@ -1866,3 +1882,7 @@
         scroll-behavior: auto !important;
     }
 }
+
+/* ✨ 1.18.3 新手优先重排：校正目标两列排布（手机窄屏回落单列）；进阶折叠沿用 so-mode-collapse。 */
+.so-fix-tgt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
+@media (max-width: 600px) { .so-fix-tgt-grid { grid-template-columns: 1fr; } }
