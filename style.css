@@ -1835,9 +1835,16 @@
     backdrop-filter: blur(4px);
 }
 #so-autowarn.open, #so-fixwarn.open { display: flex; }
+/* 卡片高度必须被窗口封顶、正文内部滚动（同 #so-cur-card 的骨架）：卡片比窗口高时 flex 居中会把
+   上下两端一起裁进 #so-window 的 overflow:hidden——标题、「不再提示」、「知道了」全都够不着，
+   哪层都不滚 → 手机上整个神谕窗口被遮罩锁死，只能刷新（2026-07-03 手机截图报告）。 */
 #so-autowarn-card, #so-fixwarn-card {
+    display: flex;
+    flex-direction: column;
     width: 100%;
     max-width: 440px;
+    max-height: 100%;
+    min-height: 0;
     box-sizing: border-box;
     border-radius: 12px;
     border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
@@ -1855,7 +1862,13 @@
     margin-bottom: 10px;
 }
 #so-autowarn-head > i, #so-fixwarn-head > i { color: var(--so-auto-red, #d9534f); }
-#so-autowarn-body, #so-fixwarn-body { font-size: 0.84em; line-height: 1.6; }
+#so-autowarn-body, #so-fixwarn-body {
+    font-size: 0.84em;
+    line-height: 1.6;
+    overflow-y: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
+}
 #so-autowarn-body p, #so-fixwarn-body p { margin: 0 0 9px; }
 #so-autowarn-body .so-autowarn-danger, #so-fixwarn-body .so-autowarn-danger {
     padding: 8px 10px;
