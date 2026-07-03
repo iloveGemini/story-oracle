@@ -394,6 +394,34 @@
     margin: 6px 0;
 }
 
+/* Markdown 表格（1.18.4）：showdown 现在开启 tables（此前恒 false = 表格显示成原始 |竖线| 文本）。
+   ST 自带的表格样式只作用于 .mes_text/.mes_reasoning，够不到神谕窗口的 .so-content，故这里自带一套：
+   主题描边 + 表头淡染（--so-accent）+ 斑马纹。表格自身 display:block + overflow-x:auto，宽表在窄窗口
+   （尤其手机）里横向滚动、绝不把气泡撑破。普通聊天关正则 + 参谋散文两条渲染路径共用（都落在 .so-content）。 */
+.so-content table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 6px 0;
+    font-size: 0.92em;
+}
+.so-content th,
+.so-content td {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+    padding: 4px 9px;
+    text-align: left;
+    vertical-align: top;
+}
+.so-content th {
+    background: color-mix(in srgb, var(--so-accent) 16%, transparent);
+    font-weight: 600;
+}
+.so-content tbody tr:nth-child(even) td {
+    background: rgba(255, 255, 255, 0.03);
+}
+
 #so-sysprompt:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* system-prompt mode editor: a title row with a [↺ reset to default] button */

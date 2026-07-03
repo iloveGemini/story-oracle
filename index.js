@@ -9736,7 +9736,7 @@ let soMdConverter = null;
 function renderMarkdownOnly(text) {
     try {
         if (!soMdConverter && typeof window !== 'undefined' && window.showdown) {
-            soMdConverter = new window.showdown.Converter({ simpleLineBreaks: true, strikethrough: true, tables: false, literalMidWordUnderscores: true });
+            soMdConverter = new window.showdown.Converter({ simpleLineBreaks: true, strikethrough: true, tables: true, literalMidWordUnderscores: true });
         }
         if (soMdConverter && typeof window !== 'undefined' && window.DOMPurify) {
             const html = window.DOMPurify.sanitize(soMdConverter.makeHtml(String(text || '')));
