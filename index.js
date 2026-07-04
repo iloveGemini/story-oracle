@@ -639,6 +639,11 @@ const ENABLE_FIX_PIECEWISE = true;
 const FIX_MAX_PIECE_CALLS = 4;
 // 分段校正：单个片段的长度上限（字符）——超长跳过（4096 token 输出地板装不下，硬发只会截断）。fixPiecePlan 读。
 const FIX_PIECE_MAX_CHARS = 8000;
+// 校正 / 诊断的后台 LLM 调用超时（毫秒）：到点 abortCtl.abort() → 气泡「(已停止)」。覆盖按目标校正
+// （runFixByTargets/Pieces）、自动校正（runAutoFix/Pieces）、自动诊断（runAutoDiagnose，共用 beginPostReplyCall）。
+// 大块正文 + 慢模型 / 推理模型的单次整体校正易越 120s（用户报告 (已停止)），2026-07-03 应 Edwin 提到 240s。
+// 注意：与 awaitMvuIdle 的 capMs（MVU 空闲等待上限，语义不同）区分——那个仍是 120000。
+const POST_REPLY_CALL_TIMEOUT_MS = 240000;
 
 // 各模式可在设置里查看 / 修改的系统提示词。剧情参谋（advisor）暂不纳入——它仍是
 // 实验性功能，提示词保持内置、不开放修改。
@@ -5296,7 +5301,7 @@ async function runAutoDiagnose(ctx, s, targetId) {
     ];
 
     const effMaxTokens = Math.max(s.maxTokens, 4096);
-    const ctl = beginPostReplyCall(120000);      // 模块级中断器：120s 超时兜底 + 让「正在自动诊断…」提示可点一下中断
+    const ctl = beginPostReplyCall(POST_REPLY_CALL_TIMEOUT_MS);      // 模块级中断器：240s 超时兜底 + 让「正在自动诊断…」提示可点一下中断
     const genToast = showAutoDiagGenerating();   // 「正在分析…（点此中断）」——点一下即 cancelPostReply
     let finalText = '';
     try {
@@ -10758,7 +10763,7 @@ async function runFixByTargets() {
     // 「停止」键，点它经 onSend → stopGeneration 中断的正是 abortCtl。此前这里用【本地】ctl，停止键够不着 →「按目标
     // 校正最新回复」一旦发出就无法中断（只能等 120s 超时 / 重载）。改用 abortCtl 后停止键即时生效（用户反馈修复）。
     abortCtl = new AbortController();
-    const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, 120000);
+    const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, POST_REPLY_CALL_TIMEOUT_MS);
     try {
         const effMaxTokens = Math.max(s.maxTokens, 4096);
         let finalText = '';
@@ -10836,7 +10841,7 @@ async function runFixByTargetsPieces(s) {
             clearTyping();
             const joinHead = `整体校正中…（1 次调用；${join.keepBlocks.length} 块结构锚点原位保留）`;
             contentEl.textContent = joinHead;
-            const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, 120000);
+            const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, POST_REPLY_CALL_TIMEOUT_MS);
             try {
                 contentEl.classList.add('so-streaming');
                 // ✨ 1.18.3：按钮路径流式直播草稿（尊重全局 流式 开关；锚点 / <FixedReply> 标签会原样闪过——
@@ -10853,7 +10858,7 @@ async function runFixByTargetsPieces(s) {
                 clearTyping();
                 const pieceHead = `正在分段校正…（第 ${k + 1}/${plan.attempts.length} 次调用，共 ${table.pieces.length} 段正文）`;
                 contentEl.textContent = pieceHead;
-                const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, 120000);
+                const timer = setTimeout(() => { try { abortCtl?.abort(); } catch (e) { /* ignore */ } }, POST_REPLY_CALL_TIMEOUT_MS);
                 try {
                     contentEl.classList.add('so-streaming');
                     results[i] = await fixPieceCall(ctx, s, a, directive, table.pieces[i], abortCtl.signal,
@@ -11099,7 +11104,7 @@ async function runAutoFixPieces(ctx, s) {
         if (!fixPreFilter(join.core, a.targets, constraints, clampFixAutoMinChars(cfg.fixAutoMinChars))) { addAutoFixNote('nochange'); return; }
         const genToast2 = showAutoFixGenerating();
         let r;
-        const ctl2 = beginPostReplyCall(120000);
+        const ctl2 = beginPostReplyCall(POST_REPLY_CALL_TIMEOUT_MS);
         try {
             r = await fixJoinCall(ctx, s, a, directive, join, ctl2.signal);
         } catch (e) {
@@ -11129,7 +11134,7 @@ async function runAutoFixPieces(ctx, s) {
     try {
         for (const i of plan.attempts) {
             if (postReplyCancelled) return;                     // 整轮作废，不写
-            const ctl = beginPostReplyCall(120000);
+            const ctl = beginPostReplyCall(POST_REPLY_CALL_TIMEOUT_MS);
             try {
                 results[i] = await fixPieceCall(ctx, s, a, directive, table.pieces[i], ctl.signal);
             } catch (e) {
@@ -11311,7 +11316,7 @@ async function runAutoFix(ctx, s, targetId) {
         ? buildFixPresetMessages(s, directive)   // 破限 / 越狱：套上自定义补全预设（仅文本块 + 角色，跳过 RP 内容标记）
         : [{ role: 'system', content: buildFixPrompt(ctx, s) }, { role: 'user', content: directive }];
     const effMaxTokens = Math.max(s.maxTokens, 4096);
-    const ctl = beginPostReplyCall(120000);      // 模块级中断器：120s 超时兜底 + 让「正在自动校正…」提示可点一下中断
+    const ctl = beginPostReplyCall(POST_REPLY_CALL_TIMEOUT_MS);      // 模块级中断器：240s 超时兜底 + 让「正在自动校正…」提示可点一下中断
     const genToast = showAutoFixGenerating();
     let finalText = '';
     try {
