@@ -4236,7 +4236,7 @@ function listTopLevelTagNames(text) {
 // 已知【正文包裹】标签名（大小写不敏感）——命中即高置信（名字本身就是强信号）。小写常量以避开元测试「ALL_CAPS 须引用≥2次」规则。
 const scopeKnownNames = new Set(['content', 'gametxt', '正文', 'story', 'text', 'narration', 'main', 'reply', 'msg']);
 // 作用域【内层】里算【结构块】（保留区候选）的已知标签名（大小写不敏感，故存小写）。
-const innerStructuralNames = new Set(['status', 'status_profile', 'item_info', 'char_info', 'options', 'branches', 'details', 'htmlcontent', 'updatevariable', 'img_gen', 'roll', 'bginfor', 'style', 'cestuff', 'action_info']);   // action_info：命定之诗类战斗卡的结算面板（1.18.0 语料跑批采纳——此前靠标记密集启发式命中，改已知名后确定性守卫）
+const innerStructuralNames = new Set(['status', 'status_profile', 'item_info', 'char_info', 'options', 'branches', 'details', 'htmlcontent', 'updatevariable', 'img_gen', 'image', 'roll', 'bginfor', 'style', 'cestuff', 'action_info']);   // action_info：命定之诗类战斗卡的结算面板（1.18.0 语料跑批采纳——此前靠标记密集启发式命中，改已知名后确定性守卫）。image：st-chatu8 类图生扩展的 <image>…</image> 生图提示词块（1.18.6 语料 edwin-08 采纳——bare 模式靠 own-line 已守，wrapped 模式需白名单，否则 danbooru tag 被当散文送模型改花；姊妹名 img_gen 早已在册）
 // 「有意义的正文」阈值（字）——低于它视作结构化 / 空块（noWrapper 据此判定）。
 const scopeProseMin = 20;
 
