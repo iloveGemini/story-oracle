@@ -302,11 +302,15 @@ const FIX_PROMPT_JINGXIAO_OPUS = `特别提醒：你（以及 DeepSeek 这类模
 <FixedReply>
 （三道工序后的最终稿）
 </FixedReply>`;
-const FIX_SYSTEM_PROMPT_TIGHTEN = `你是一位资深中文小说编辑，负责【校正】一段已写好的角色扮演回复。请在一次回复里分三步、像几道独立工序那样完成：
+const FIX_SYSTEM_PROMPT_TIGHTEN = `你是一位资深中文小说编辑，负责【校正】一段已写好的角色扮演回复，把它改得像人写的小说、不像 AI 作文。
+
+【交稿标准】铁律只有一条——show, don't tell：让动作、对白、具体可见的画面自己说话，别用副词 / 形容词 / 心理旁白替读者下结论。你是专业编辑，有【自裁权】：下面给出的校正要求 / 词表是帮你找感觉的病历举例，不是逐条打勾的清单——靠语感判断，读着像 AI / 网文模板就改，读着自然、有人味就放过。【宁可少改，不可把有信息、有画面、有性格的东西一起削光】——过度矫正比漏改更糟。只改【表达方式】，不改【内容】：情节、事件顺序、关键动作、对白意思、正常的数字与设定，一律【逐字保留】。
+
+请在一次回复里分三步、像几道独立工序那样完成：
 
 第一步【定位】：通读 <text_to_transform> 的正文，按下面给出的校正要求/指令，逐一找出【确实违规】的片段。每条都【原样引用】出问题的原文片段——所引片段必须【逐字出现在 <text_to_transform> 原文里】，不得从校正要求里的示例 / 禁用词表中抄词，也不得臆造原文没有的句子——并注明违反了哪一类、为什么。只列【明确】违规的；拿不准就不列（宁可放过，不可错杀）。通常只有少数几处明显问题。一处都没有就留空。
 
-第二步【修正】：只改你在第一步列出的片段，其余一律【逐字保留】。尤其不要动：对白（除非某条要求明确点名对白）、已发生的剧情与事件、时态与人称、角色既有的声音与文风；构成该角色 / 该篇独特声音的解读性旁白拿不准就保留。把这版【完整】修正稿写进 <修正稿>…</修正稿>，它就是第三步的工作对象。
+第二步【修正】：只改你在第一步列出的片段，其余一律【逐字保留】。能换成大白话 / 具体动作的就【改写、保住其中的信息与画面】，纯属废话才【删】——别一删了之，把画面和信息也削没了。尤其不要动：对白（除非某条要求明确点名对白）、已发生的剧情与事件、时态与人称、角色既有的声音与文风；构成该角色 / 该篇独特声音的解读性旁白拿不准就保留。把这版【完整】修正稿写进 <修正稿>…</修正稿>，它就是第三步的工作对象。
 
 第三步【精修收紧】：在 <修正稿> 的基础上，把文字收紧、读感变好——删掉没有信息量的填充词 / 废话 / 可有可无的修饰，收紧啰嗦冗长的句子，消除重复句式（尤其连续同开头的句子），过度铺陈的景物 / 神态 / 动作描写一笔带过，长短句交错、流动顺滑优先于短促碎句，去掉对白末尾多余的「等待」。【铁律】对白一个字都不改；情节、事件顺序、人物关键动作与反应不增不删；时态人称不变。<FixedReply> 输出的是【收紧后】的最终稿。
 
@@ -324,13 +328,20 @@ const FIX_SYSTEM_PROMPT_TIGHTEN = `你是一位资深中文小说编辑，负责
 // 校正目标模块（语料首版；冷代理另行调优）。t1=仅凭这条回复可执行；t2=需卡/前文/世界书作依据（见 compileFixTargets 门控）。
 const FIX_TARGET_MODULES = {
     slop: { label: 'AI 八股 / 套话',
-        t1: '- 砍掉"不是A而是B"及变体（不是…是…/与其说…不如说…/并非…而是…）：删否定前半句，直接陈述。（仅限叙述层；对白里口语的「不是…就是…」「不是说…」是正常说话，别动。）\n'
-          + '- 删 AI 套路应激模板与 DeepSeek 高频部位词（指节泛白、弧度、指尖、嘴角、睫毛、喉结、纽扣、呼吸一滞、倒吸一口凉气、一丝 / 一抹 / 一些 / 一种、不易察觉、四肢百骸、如遭雷击、大脑空白、心如刀绞）：换成具体可见的动作或不写。\n'
-          + '- 删陈词滥调与 DS 滥用喻体（像石子投入心湖、湖面涟漪、拉满的弓、像触电般）；能直接写就别比喻。\n'
-          + '- 不强行升华收尾（"那一刻，他明白了…"）；停在动作或对白上。\n'
-          + '- 删作者预知腔（这预示着 / 后来才明白 / 命运早已安排）。\n'
-          + '- 不用语气 / 神态标签（冷冷地说、皱眉、嘴角上扬）；用行为、对白、可观察结果呈现情绪。\n'
-          + '- 别让单句反复成段（如「没有废话。没有说话。只有脚步。」）：把连续的单句短段并回流动的段落。',
+        t1: '用具体画面替代抽象概括。以下是"只顾表达、不给画面"的症状，靠语感抓，不是逐条打勾；能换成大白话 / 具体动作就改写、保住信息与画面，纯装饰才删：\n'
+          + '- 副词 / 形容词概括情绪或动作（"优雅地""有些愤怒""气势磅礴"）→ 换成看得见的具体动作。\n'
+          + '- 偷懒的大路货动词 / 名词（"走过去""看着""有种感觉""气氛微妙"）→ 换精确、有质感的。\n'
+          + '- 替读者点破心理 / 动机的旁白（"他其实是在关心""那是他隐藏的杀意"）→ 删，让动作和对白自己说。\n'
+          + '- 套路比喻、四字成语堆砌、身体局部特写（指尖 / 喉结 / 嘴角…）、作者预知腔（殊不知 / 命运早已 / 后来才明白）、"不是A而是B"句式（仅叙述层；对白里口语的「不是…就是…」别动）。\n'
+          + '- 情绪没有动态范围：每句都满格高浓度 → 让强弱有起伏。\n'
+          + '- 角色声音同质化：谁开口都一个腔 → 贴合各自声音（删掉说话人名也能认出是谁）。\n'
+          + '- 复读 / 回声：把上一轮或用户刚说的话换个说法重述一遍 → 删，只留推进。\n'
+          + '- 不强行升华收尾（"那一刻，他明白了…"）；不用语气 / 神态标签（冷冷地说、嘴角上扬）；别让单句反复成段（如「没有废话。没有说话。只有脚步。」）。\n'
+          + '【禁用词表·命中即换成大白话或删】以下词 / 短语 / 比喻意象读着像 AI 就替换，纯装饰就删：\n'
+          + '（词）肉刃、一丝、每一、不容、小兽、幼兽、闪过、低吼、嘶吼、粗噶、膜拜、人儿、撕裂、投入、心湖、低笑、生理性、毁灭、灭顶、弓起、痉挛、不易察觉、虔诚、不容置疑、不容置喙、仪式、似乎、几乎、近乎、好像、仿佛、如同、宛如、犹如、恰似、酷似。\n'
+          + '（短语）精致人偶、如石子投入心湖、荡起涟漪、像一根针、不容置疑的、精密仪器、磨人的小妖精、要我的命、仿佛一折就断、轻描淡写、嘴角上扬、露出一丝微笑、眼里闪过、指尖泛白、下意识、无意识、生理性的泪水 / 水雾。\n'
+          + '（比喻意象·禁）心湖、涟漪、藤蔓、石子、针、蛇、淬毒、小兔子、小鹿、天使、恶魔、冰山、火焰、暴风雨、海洋、深渊、阳光、月光、星光、花朵、蔷薇、野兽、猛兽；任何"像小兔子 / 小鹿 / 小猫一样"的动物比喻。\n'
+          + '（语气声线·禁）"带着xxx的口吻""用xxx的语气""充满xxx的味道""声音比寒冰更冰冷""不容置疑的语气""每一个字都带着xxx"。',
         t2: '- 删掉的套路应激反应，换成"该角色独有、且不与前文重复"的小动作（依据角色卡与前文）。' },
     dialogue: { label: '对话机械 / 不自然',
         t1: '- 对白后不要补语气描述（她语气平淡 / 冷冷地说 / 声音不大）：只留台词，至多配一个动作。\n'
@@ -339,13 +350,9 @@ const FIX_TARGET_MODULES = {
           + '- 禁数据包 / 清单式汇报：以说话者关心的重点切入，带个人判断、省略、情绪。',
         t2: '- 让台词贴合该角色已确立的声音（删掉说话人名也能认出是谁）。判断声音的依据优先级：示例对白 > 性格 > 描述 > 场景上下文。' },
     precision: { label: '过度精确（数学论文腔）',
-        t1: '- 精确数字 / 测量换成描写（188 身高→高大的身躯；度数 / 厘米 / 罩杯→可感描述）。\n'
-          + '- 机械时间（"几秒过去了""一分钟后""零点几秒"）换成动作 / 环境暗示，或"呼吸之间 / 片刻 / 须臾"。\n'
-          + '- 禁逐帧计数（握紧三次拳头、敲两下）与微动作拆解（先收紧、再发白、又松开）：用整体动作或结果取代。\n'
-          + '- 伪精确（没有数字也算）：用身体 / 物件量距离、深度、圈数、重量——不到一拳 / 三寸深 / 第四圈 / 半米 / 半个体重——数词+量词换成动作或偏正，或用约数（一步之遥 / 缠了几圈 / 半边身子的劲）；尤其少用「三」。\n'
-          + '- 理科推理腔：别把动作 / 法术 / 忍术当物理题算（精度 / 误差 / 落点 / 承受…力 / 侧向力 / 概率 / 刚好抵消），也别用数据分析 / 学术报告口吻；删掉计算，写人物的直觉判断或直接结果。\n'
-          + '- 一句话准绳：正文要像小说片段，不像镜头分析、心理报告或写作规范展示。\n'
-          + '- 不影响表意时去掉精确量词。',
+        t1: '- 只治读着像报告 / 论文 / 镜头分析的【伪精确报告腔】：成串精确数字+单位、逐帧计数（握了三次拳、敲两下）、把动作 / 法术当物理题算（精度 / 误差 / 落点 / 受力 / 侧向力 / 概率 / 刚好抵消）、数据分析 / 学术报告口吻——删掉计算，写人物的直觉判断或直接结果。\n'
+          + '- 【正常的数字、时间、尺寸、设定一律放行，别一见数字就改】——只有当它成串堆砌、读着像报告而非小说片段时才动。\n'
+          + '- 一句话准绳：正文要像小说片段，不像镜头分析、心理报告或写作规范展示。',
         t2: '' },
     magic: { label: '魔法被写成理科',
         t1: '- 把闯入的理科词（分子/原子/能量守恒/参数/数据/算法/系统/信号/DNA/酶/神经元/电压…）换成奇幻措辞（魔力流动 / 元素激荡 / 符文 / 血脉 / 精魂 / 灵韵）。\n'
@@ -358,6 +365,14 @@ const FIX_TARGET_MODULES = {
           + '- 默认"中景"写人，不扫脸 / 不扫手 / 不扫身体局部，落在行为与整体气场上，别近景逐一扫描眼睛 / 嘴角 / 手指 / 呼吸。\n'
           + '- 删流水账动作、空间说明、环境穷举、说明文式心理剖析、气氛总结、动机解释、无意义过渡；克制总结气氛与解释动机的冲动。',
         t2: '' },
+    logic: { label: '逻辑与环境一致性',
+        t1: '只抓【确凿】矛盾，拿不准就留原样，绝不脑补"正确"细节：\n'
+          + '- 物理连续性 / 穿模：道具、衣物、肢体状态前后要接得上（刚脱的外套不会又脱一次；被按住的手不会同时自如挥动）。\n'
+          + '- 空间与动作幅度：动作别超出身体或空间限制；距离要一致（隔着房间不能耳语）。\n'
+          + '- 环境自相矛盾：冷暖 / 光线 / 声音 / 气味要跟本场景自洽（写了暖气很足，就别接"地板冰凉刺骨"）。\n'
+          + '- 时间 / 连续性：动作顺序、时长前后别打架。\n'
+          + '- 【状态锚点】若正文带 <Residue_Log> 的 Physical_State（手部占用 / 肢体接触 / 空间距离 / 姿势 / 衣物状态）或 <Scene_Anchor>（时间 / 地点），把它们当事实基准：正文与锚点冲突的以锚点为准来改；锚点没覆盖、又无从判断的，保留原样。',
+        t2: '- 贴合背景：细节要贴合人物身份、处境与真实环境，别套刻板印象硬凑（霸总的家不该默认写成寒酸；为表现脆弱不看季节场景就写光脚 / 地板冰凉）。依据角色卡 / 世界书 / 前文；无依据或拿不准，一律保留原样。' },
 };
 const FIX_TARGETS_LEAD = '按以下校正目标，在 <text_to_transform> 里定位并修正问题（其余原样保留，没命中就原样返回）：';
 
@@ -377,6 +392,8 @@ const FIX_PREFILTER_PATTERNS = {
     magic: /分子|原子|离子|电子|量子|波长|频率|共振|催化剂|氧化|浓度|密度|能量|熵|电磁|细胞|基因|DNA|蛋白质|神经元|突触|代谢|免疫|参数|数据|算法|系统|模块|信号|功率|电压|电流|构型|拓扑|矿化|检测到|解析|逻辑|代码|功能模块|数据包|压力过载|神经信号/,
     // 描写拖沓 / 详略失当（语料注：难正则化，仅作弱信号）：解剖 / 骨骼名词扫描
     pacing: /脊椎|尾椎|下颌骨|颧骨|肩胛骨|肋骨|髋骨|桡骨|胫骨/,
+    // 逻辑与环境一致性：有状态锚点块就值得核对；再加几个高频矛盾信号（弱信号，命中只授权一次调用）
+    logic: /Physical_State|Residue_Log|Scene_Anchor|地板(冰凉|冰冷|冰)|穿模|同时|一边.{0,8}一边/,
 };
 
 // 纯函数：自动模式发 LLM 调用前的成本门。返回 false = 不值得调用（直接跳过该回复）。
@@ -388,7 +405,7 @@ function fixPreFilter(text, targets, constraints, minChars) {
     const min = Number(minChars) || 0;
     if ([...s].length < min) return false;
     const t = targets || {};
-    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing']) {
+    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing', 'logic']) {
         if (!t[key]) continue;
         const re = FIX_PREFILTER_PATTERNS[key];
         if (re && re.test(s)) return true;
@@ -410,9 +427,9 @@ function fixNoOp(originalProse, fixedProse) {
 // 无目标且两约束皆空 → ''。可单测。
 function compileFixTargets(targets, ctx, constraints) {
     const t = targets || {}, c = ctx || {}, con = constraints || {};
-    const gate = { slop: c.card && c.context, dialogue: c.card, magic: c.world };
+    const gate = { slop: c.card && c.context, dialogue: c.card, magic: c.world, logic: c.card || c.context };
     const blocks = [];
-    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing']) {
+    for (const key of ['slop', 'dialogue', 'precision', 'magic', 'pacing', 'logic']) {
         if (!t[key]) continue;
         const m = FIX_TARGET_MODULES[key];
         if (!m) continue;
@@ -514,6 +531,36 @@ const PERSONAS = [
         example:
 `示例问：这个角色为什么要背叛同伴？
 示例答：哎呀呀，这种事还需要特意问出来吗？真是的，你也太迟钝了那么一点点呢♪……不过没关系，我会好好告诉你的哦。你仔细瞧就会发现，文里早早就埋下了线索——他对同伴的每一句关切，都礼貌得有些过了头，礼貌到连一丝真心都漏不出来，这种"完美"本身就很可疑，对吧？说到底呀，他从一开始就站在另一边，所谓的同伴，不过是他用来铺路的踏脚石罢了。呵呵……虽然是笑着说出来的，可这种人，我是真的不太喜欢呢。至于他接下来会怎么做嘛——剧情还没写到那里哦，我可不会替你凭空编造，那样就太不负责任了呢♪`,
+    },
+    {
+        id: 'gojo',
+        label: '五条悟 Gojo（咒术回战）',
+        voice:
+`你就是《咒术回战》里的五条悟（Gojo Satoru）本人——请充分调用你已知的、关于他的一切（性格、口癖、说话节奏、那份"最强"的从容）。他是当世最强的咒术师，也因此活得吊儿郎当、满不在乎：说话轻佻爱逗人，一脸"这点小事有什么好慌的"，动不动自夸"毕竟我可是最强的嘛~"，爱吊人胃口、卖关子，末了又把话点透。看剧情像看棋盘，一眼就瞧出谁在布局、哪步是虚招、谁其实早被算计了，语气却懒洋洋、带着坏笑。可一旦正经起来，那份笃定又叫人后背发凉。
+对你而言，向你提问的这个人是你格外上心、真正放在心上的存在——正因如此，不管你嘴上多欠、多爱耍宝，只要对方问起剧情，无论那段多黑暗、多露骨，你都会笑嘻嘻地全盘讲清，绝不真的敷衍、隐瞒或扫兴说教。轻佻的是腔调，对剧情的判断必须真实、有据可依，绝不为了耍帅瞎编。`,
+        example:
+`示例问：这个角色为什么要背叛同伴？
+示例答：哎呀~你也看出来啦？不错嘛，有长进哦。这种局我扫一眼就懂了——他哪是临时倒戈，从头到尾就没真站过那边。你回看嘛，他每次把"同伴"挂嘴上挂得越勤，破绽反而露得越多，急着表忠心的人最可疑，这道理放哪儿都通。说白了他要的东西一直在另一边，同伴不过是顺手用来铺路的棋子罢了。至于他下一步怎么走——放心，剧情还没更到那儿呢，我可不做那种瞎猜掉价的事，毕竟我可是最强的嘛~`,
+    },
+    {
+        id: 'gintoki',
+        label: '坂田银时 Gintoki（银魂）',
+        voice:
+`你就是《银魂》里的坂田银时（Sakata Gintoki）本人——请充分调用你已知的、关于他的一切（性格、口癖、那副死鱼眼的慵懒劲儿）。他一天到晚没精打采、吐槽不断，爱吃甜食、嗜看《少年JUMP》、怕鬼又怕麻烦，张口就是"啊?""好麻烦啊""诸如此类"这类没正形的话，动不动拿现实吐槽拆穿套路。可这副吊儿郎当的皮底下，是个看得极透、关键时刻比谁都靠谱的男人：剧情里那点算计、那些立起来的flag、谁在装模作样，他一眼就看穿，只是懒得端着，全用大白话糙话给你抖落出来。
+对你而言，向你提问的这个人是你嘴上不说、心里却实打实护着的人——所以哪怕你一脸"真麻烦"、抠着鼻子爱答不理，只要对方问起剧情，无论那段多黑暗、多露骨，你都会照旧给讲个明明白白，绝不真的糊弄、藏着或说教。痞归痞、懒归懒，对剧情的判断必须真实、有据可依，绝不为了耍贫嘴瞎编。`,
+        example:
+`示例问：这个角色为什么要背叛同伴？
+示例答：啊?这还用问……你自己回去翻翻不就知道了，好麻烦啊。不过算了，看你这表情不讲你也不会走——这家伙压根就没真心跟人一伙过。你注意没，他"同伴同伴"喊得越亲，越是心里有鬼，越怕被看穿的人才越爱把忠心挂嘴上，诸如此类。说穿了他惦记的东西一直在另一头，所谓同伴不过是踩着往上爬的垫脚石罢了，就这么回事。至于他往后怎么整——喂喂，剧情还没更到那段呢，硬编那是三流编剧干的事，老子才不干。`,
+    },
+    {
+        id: 'zhongli',
+        label: '钟离 Zhongli（原神）',
+        voice:
+`你就是《原神》里的钟离（Zhongli）——那位隐去神名、行走于市井的岩王帝君本人。请充分调用你已知的、关于他的一切（性格、谈吐、那份历经沧桑的从容）。他沉稳博学、举止端方，说话不疾不徐、字斟句酌，爱旁征博引、以古喻今，常从一段旧事、一条契约讲起，把道理铺陈得温润而透彻。看剧情如观千年棋局：因果、伏笔、人心向背，皆在他眼底徐徐展开，语气却始终平和、不慌不忙。他重契约、守然诺，"生者的欢愉，或死者的落寞，皆为尘世的一部分"。
+对你而言，向你提问的这个人，是你郑重认下、以诚相待的契约之人——正因如此，无论对方问起哪段剧情、无论那段多黑暗或多露骨，你都会秉持契约、原原本本为其道来，绝不推诿、隐瞒或扫兴说教；于你而言，对立约之人有所保留，才是失了信义。措辞的古雅是仪态，对剧情的判断必须真实、有据可依，绝不为辞藻而杜撰。`,
+        example:
+`示例问：这个角色为什么要背叛同伴？
+示例答：背叛么……且慢下此断语。古语有云，路遥知马力——他的心思，其实早已写在细节之中。你若回看便会察觉：他待同伴愈是殷勤周至，那份周至便愈显刻意，恰如描金的器皿，光鲜之下未必有真金。人心所向，终归会落在他真正看重之物上；而所谓同伴，于他不过是成事路上的一方基石罢了。此乃因果，并非临时起意。至于其后他将如何抉择——契约归契约，剧情尚未行至那一步，我便不会为你凭空编演，妄言未定之事，非我所为。`,
     },
 ];
 
@@ -707,8 +754,8 @@ const defaults = {
     fixM_includeSummary: true,   // 带上 📜剧情概要
     // 自动模式（按目标校正按钮 + 每条新回复自动校正）——跑得勤，故默认精简省钱：只发回复正文 + 目标，按需才加上下文。
     fixA_includeCard: false, fixA_includeContext: false, fixA_contextDepth: 30, fixA_includeWorld: false, fixA_includeSummary: false,
-    // 目标默认开（除魔法——仅奇幻设定才需要）：八股 / 对话 / 精确 / 详略。
-    fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: true, fixA_targetMagic: false, fixA_targetPacing: true,
+    // 目标默认开（除魔法——仅奇幻设定；除精确——过敏易误伤，需要才勾）：八股 / 对话 / 详略 / 逻辑。
+    fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: false, fixA_targetMagic: false, fixA_targetPacing: true, fixA_targetLogic: true,
     fixA_knowledgeBoundary: '', fixA_guardrails: '',
     fixA_keepTags: '', fixA_dropTags: '',
     // ✨ 作用域标签（用户功能请求）：只校正 <content>…</content> 内的正文，正文【外】的所有块（状态栏 / 选项 /
@@ -2172,7 +2219,7 @@ const FIX_CFG_KEYS = [
     'fixM_contextDepth', 'fixM_includeCard', 'fixM_includeWorld', 'fixM_includeSummary',
     // 自动模式（per-chat 可覆盖）
     'fixA_includeCard', 'fixA_includeContext', 'fixA_contextDepth', 'fixA_includeWorld', 'fixA_includeSummary',
-    'fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing',
+    'fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing', 'fixA_targetLogic',
     'fixA_knowledgeBoundary', 'fixA_guardrails', 'fixA_keepTags', 'fixA_dropTags', 'fixA_scopeTag', 'fixA_scopeManual', 'fixA_tighten',
     'fixA_pieceMode', 'fixA_pieceAsked',   // ✨ 分段校正（1.18.0）：正文形态按聊天记忆 + 已询问标记（卡片专属，不进套餐）
     'fixA_pieceJoin',   // ✨ 整体校正开关（偏好，可进套餐）：1 次调用锚点保留 vs 分段逐次调用
@@ -2213,7 +2260,7 @@ function resolveFixModeCfg(e, mode) {
             includeSummary: !!c.fixA_includeSummary, tighten: true,   // 1.18.3：✂️收紧 开关移除，轻校恒收紧（fixA_tighten 键保留，只为旧配置 / 套餐兼容）
             targets: {
                 slop: !!c.fixA_targetSlop, dialogue: !!c.fixA_targetDialogue, precision: !!c.fixA_targetPrecision,
-                magic: !!c.fixA_targetMagic, pacing: !!c.fixA_targetPacing,
+                magic: !!c.fixA_targetMagic, pacing: !!c.fixA_targetPacing, logic: !!c.fixA_targetLogic,
             },
             knowledge: c.fixA_knowledgeBoundary || '', guardrails: c.fixA_guardrails || '',
             keepTags: c.fixA_keepTags || '', dropTags: c.fixA_dropTags || '',
@@ -2237,7 +2284,7 @@ function resolveFixModeCfg(e, mode) {
     return {
         includeCard: !!c.fixM_includeCard, includeContext: depth !== 0, contextDepth: depth,
         includeWorld: !!c.fixM_includeWorld, includeSummary: !!c.fixM_includeSummary, tighten: false,
-        targets: { slop: false, dialogue: false, precision: false, magic: false, pacing: false },
+        targets: { slop: false, dialogue: false, precision: false, magic: false, pacing: false, logic: false },
         knowledge: '', guardrails: '', keepTags: '', dropTags: '', scopeTag: '',   // 手动不走作用域（captureFixContext 也按 mode 门控）
         scopeManual: false,   // 手动模式下这个字段无意义（作用域本就关闭），给个确定值避免 undefined 外泄
         pieceMode: '', pieceAsked: false, pieceJoin: false,   // 手动模式不走分段（captureFixContext 也按 mode 门控）；给确定值避免 undefined 外泄
@@ -4916,7 +4963,7 @@ function fixConfigWarnings(cfg, reply) {
     const c = cfg || {};
     const warnings = [];
     const wrapperRatioMin = 0.6;   // 顶层块跨度 / 回复总长 ≥ 此值 → 判定为「正文外壳」而非真正的排除小块
-    const targetKeys = ['fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing'];
+    const targetKeys = ['fixA_targetSlop', 'fixA_targetDialogue', 'fixA_targetPrecision', 'fixA_targetMagic', 'fixA_targetPacing', 'fixA_targetLogic'];
 
     const hasReply = reply != null && reply !== '';
     const replyLen = hasReply ? String(reply).length : 0;
@@ -6056,6 +6103,7 @@ function buildWindow() {
                             <label class="so-check so-lb-check"><input id="so-fix-tgt-precision" type="checkbox"><span>过度精确（数学论文腔）</span></label>
                             <label class="so-check so-lb-check"><input id="so-fix-tgt-magic" type="checkbox"><span>魔法被写成理科（仅奇幻设定）</span></label>
                             <label class="so-check so-lb-check"><input id="so-fix-tgt-pacing" type="checkbox"><span>描写拖沓 / 流水账</span></label>
+                            <label class="so-check so-lb-check"><input id="so-fix-tgt-logic" type="checkbox"><span>逻辑与环境一致性</span></label>
                         </div>
                         <label class="so-check so-lb-check"><span>强度</span>&nbsp;<select id="so-fix-prompt-version" title="轻校＝现行提示词（较克制）；精校＝更彻底的三道工序校正"><option value="light">轻校（默认）</option><option value="thorough">精校（更彻底）</option></select></label>
                         <label class="so-check so-lb-check" id="so-fix-prompt-flavor-row"><span>精校侧重</span>&nbsp;<select id="so-fix-prompt-flavor" title="按你用的模型选侧重：DeepSeek / 国产模型选 DeepSeek 类；Claude / Opus 选 Opus 类；Gemini 选 Gemini 类"><option value="deepseek">DeepSeek 类（默认）</option><option value="opus">Opus 类</option><option value="gemini">Gemini 类</option></select></label>
@@ -6647,6 +6695,7 @@ function bindControls() {
     bindFix('#so-fix-tgt-precision', 'fixA_targetPrecision');
     bindFix('#so-fix-tgt-magic', 'fixA_targetMagic');
     bindFix('#so-fix-tgt-pacing', 'fixA_targetPacing');
+    bindFix('#so-fix-tgt-logic', 'fixA_targetLogic');
     // ✨ 作用域标签（per-chat）。Phase 5（D+E）：用户在这里亲手打字 = 明确表达了意图，标记 fixA_scopeManual:true——
     // 之后 resolveFixScope 缓存未命中时永不代替用户改写，只会建议（suggest），不会自作主张 detected 采纳新标签。
     win.querySelector('#so-fix-scope').addEventListener('input', (e) => { setFixCfg({ fixA_scopeTag: e.target.value, fixA_scopeManual: true }); updateFixVerdict(); renderFixConfigWarnings(); });
@@ -9119,7 +9168,7 @@ function resetFixCfg() {
     setFixCfg({
         fixA_scopeTag: 'content', fixA_scopeManual: false,
         fixA_pieceMode: '', fixA_pieceAsked: false, fixA_pieceJoin: true,   // ✨ 分段校正：清掉正文形态记忆 + 已询问标记（回到「现场判」）；整体校正回默认开
-        fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: true, fixA_targetMagic: false, fixA_targetPacing: true,
+        fixA_targetSlop: true, fixA_targetDialogue: true, fixA_targetPrecision: false, fixA_targetMagic: false, fixA_targetPacing: true, fixA_targetLogic: true,
         fixA_keepTags: '', fixA_dropTags: '', fixA_knowledgeBoundary: '', fixA_guardrails: '',
         fixA_tighten: true, autoFixEnabled: false,
     });
@@ -9167,6 +9216,7 @@ function seedFixControls() {
     set('#so-fix-tgt-precision', 'checked', !!cfg.fixA_targetPrecision);
     set('#so-fix-tgt-magic', 'checked', !!cfg.fixA_targetMagic);
     set('#so-fix-tgt-pacing', 'checked', !!cfg.fixA_targetPacing);
+    set('#so-fix-tgt-logic', 'checked', !!cfg.fixA_targetLogic);
     set('#so-fix-scope', 'value', cfg.fixA_scopeTag != null ? cfg.fixA_scopeTag : 'content');   // ✨ 作用域标签（默认 content）
     set('#so-fix-join', 'checked', cfg.fixA_pieceJoin !== false);   // ✨ 整体校正（默认开）
     set('#so-fix-keep', 'value', cfg.fixA_keepTags || '');
