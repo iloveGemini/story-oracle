@@ -653,11 +653,26 @@
 #so-wand-recenter { display: none; }
 
 @media (max-width: 600px) {
-    #so-window { max-height: 85vh; }
-    #so-wand-recenter { display: flex; }   /* 手机：显示「窗口归位」救援项 */
-    /* bigger grab target on touch screens */
-    #so-resize-grip { width: 32px; height: 32px; opacity: 0.6; }
-    #so-header { touch-action: none; }
+    /* 手机默认全屏：铺满屏幕（留 iOS 安全区），固定不可拖动 / 缩放。用 !important 压过 JS 记住的
+       内联尺寸；桌面（>600px）不受影响，仍是可拖缩的浮窗。 */
+    #so-window {
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        height: 100dvh !important;
+        max-width: 100vw !important;
+        max-height: 100vh !important;
+        max-height: 100dvh !important;
+        border-radius: 0 !important;
+        padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0) env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
+        box-sizing: border-box;
+    }
+    #so-wand-recenter { display: none; }   /* 全屏无需「窗口归位」救援项 */
+    #so-resize-grip { display: none; }     /* 全屏不缩放：隐藏右下角握把 */
+    #so-header { cursor: default; }        /* 全屏不拖动 */
     /* 触摸目标：叠层 / 设置里的图标按钮放大到接近 44px；发送键 44px。挤在一行的 8 个标题栏按钮
        只能小幅放大（手机上仍要排得下），主要靠加大间距防误触。消息操作按钮也加大点击区。 */
     .so-iconbtn { width: 40px; height: 40px; }
