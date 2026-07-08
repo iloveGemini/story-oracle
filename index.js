@@ -860,7 +860,15 @@ const defaults = {
 // In-memory side-chat history (cleared on page reload or via the Clear button).
 // Each entry: { id, role, content, _el }. _el links it to its DOM bubble so
 // edit / delete / regenerate can operate by identity (indices shift on splice).
-let convo = [];
+// 每个功能模式各存一份侧聊历史，互不混。convo 始终指向「当前模式」那一份的数组引用；切模式时由
+// setOracleMode 换成目标模式的数组并重渲染。持久化按模式分桶写入聊天元数据（CONVO_META_KEY）。
+const convosByMode = { chat: [], advisor: [], lorebook: [], diagnose: [], fix: [], game: [] };
+let convo = convosByMode.chat;
+// 把某数组设为「当前模式」的历史（同步分桶表，避免重新赋值 convo 后与分桶脱钩）。
+function setConvoForCurrentMode(arr) {
+    convo = arr;
+    convosByMode[oracleMode] = arr;
+}
 let cidSeq = 0;             // monotonic message-id source
 let isGenerating = false;
 let abortCtl = null;
@@ -894,6 +902,10 @@ let fixMode = false;
 // 退出某个子模式（世界书 / 参谋 / 校正）时回到「进来之前」的模式，而不是一律掉回普通聊天。
 // 用户功能请求：自动诊断 → 开世界书 → 退世界书，应回到诊断而非普通聊天。'chat' = 默认。
 let priorOracleMode = 'chat';
+// 当前功能模式的权威变量（chat/advisor/lorebook/diagnose/fix/game）。布尔 diagnoseMode 等仍保留供各自的
+// prompt 分支使用，但 chat 与 game 都是「四布尔全 false」，无法互相区分，故靠本变量作准。
+let oracleMode = 'chat';
+const ORACLE_MODES = ['chat', 'advisor', 'lorebook', 'diagnose', 'fix', 'game'];
 let fixTargetIdx = -1;        // 待校正回复在 ctx.chat 中的下标（捕获时记下）
 let fixOriginalReply = '';    // 待校正回复的【完整】原文（含机制块，应用时再接回）
 let fixTargetProse = '';      // 剥掉机制块 + CoT 后的正文（喂给校正模型）
@@ -2116,19 +2128,31 @@ function convoForPrompt(list = convo) {
     return (Array.isArray(list) ? list : []).filter((m) => m && (m.role === 'user' || m.role === 'assistant'));
 }
 
-// 读取本聊天保存的侧聊历史（始终回数组）。
+// 读取本聊天保存的侧聊历史，按模式分桶返回 { mode: array }。兼容旧格式：旧版存的是单个数组
+// （所有模式混在一起），自动迁移进「普通」桶，老存档不丢历史。
 function getConvoMeta() {
     const md = getChatMetadataSafe();
-    const arr = md ? md[CONVO_META_KEY] : null;
-    return Array.isArray(arr) ? arr : [];
+    const raw = md ? md[CONVO_META_KEY] : null;
+    const out = { chat: [], advisor: [], lorebook: [], diagnose: [], fix: [], game: [] };
+    if (Array.isArray(raw)) {
+        out.chat = raw;                                  // 旧格式（单数组）→ 迁移进「普通」桶
+    } else if (raw && typeof raw === 'object') {
+        for (const mode of ORACLE_MODES) if (Array.isArray(raw[mode])) out[mode] = raw[mode];
+    }
+    return out;
 }
 
-// 把当前 convo 写回本聊天的元数据（空则删键，保持元数据干净）。每次 convo 变动后调用。
+// 把各模式的侧聊历史按分桶写回本聊天的元数据（全空则删键）。每次 convo 变动 / 切模式后调用。
+// convo 是「当前模式」桶的引用，所以当前模式的最新内容已在 convosByMode 里，整体序列化即可。
 function persistConvo() {
     const md = getChatMetadataSafe();
     if (!md) return false;
-    const arr = serializeConvo(convo);
-    if (arr.length) md[CONVO_META_KEY] = arr; else delete md[CONVO_META_KEY];
+    const obj = {};
+    for (const mode of ORACLE_MODES) {
+        const arr = serializeConvo(convosByMode[mode]);
+        if (arr.length) obj[mode] = arr;
+    }
+    if (Object.keys(obj).length) md[CONVO_META_KEY] = obj; else delete md[CONVO_META_KEY];
     saveChatMetadata();
     return true;
 }
@@ -5885,26 +5909,27 @@ function buildWindow() {
 
     win.innerHTML = `
         <div id="so-header">
-            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span><span id="so-diag-pill">诊断</span><span id="so-lb-pill">世界书</span><span id="so-adv-pill">参谋</span></div>
+            <div id="so-title"><i class="fa-solid fa-moon"></i> 故事神谕 <span id="so-mode-badge"></span></div>
             <div id="so-header-btns">
-                <div class="so-iconbtn" id="so-advisor-btn" title="剧情参谋 —— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i></div>
-                <div class="so-iconbtn" id="so-lorebook-btn" title="世界书模式 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i></div>
-                <div class="so-iconbtn" id="so-diagnose-btn" title="诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）"><i class="fa-solid fa-stethoscope"></i><span class="so-auto-tag">AUTO</span></div>
-                <div class="so-iconbtn" id="so-fix-btn" title="校正模式 —— 修一修最新这条回复（AI 味 / 对话 / 设定 / 详略…），应用后原文仍在"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
-                <span class="so-hdr-div" aria-hidden="true"></span>
                 <div class="so-tools-wrap">
-                    <div class="so-iconbtn" id="so-tools-btn" aria-haspopup="true" aria-expanded="false" title="更多 —— 剧情概要 / 调试提示词 / 设置"><i class="fa-solid fa-ellipsis"></i></div>
+                    <div class="so-iconbtn" id="so-tools-btn" aria-haspopup="true" aria-expanded="false" title="更多 —— 剧情概要 / 调试提示词 / 设置 / 清空"><i class="fa-solid fa-ellipsis"></i></div>
                     <div id="so-tools-menu" aria-label="更多工具">
-                        <div class="so-iconbtn so-tools-item" id="so-normalchat-btn" title="回到普通聊天（自动诊断如已开启会继续在后台运行）"><i class="fa-solid fa-comment"></i><span>普通聊天</span></div>
                         <div class="so-iconbtn so-tools-item" id="so-summary-btn" title="剧情概要 —— 粘贴你的运行总结 / 前情提要，神谕会在最近对话前读到它"><i class="fa-solid fa-scroll"></i><span>剧情概要</span></div>
                         <div class="so-iconbtn so-tools-item" id="so-debug-btn" title="查看上一次发送的提示词"><i class="fa-solid fa-bug"></i><span>调试提示词</span></div>
                         <div class="so-iconbtn so-tools-item" id="so-settings-btn" title="设置"><i class="fa-solid fa-gear"></i><span>设置</span></div>
+                        <div class="so-iconbtn so-tools-item" id="so-clear-btn" title="清空当前模式的对话"><i class="fa-solid fa-trash-can"></i><span>清空对话</span></div>
                     </div>
                 </div>
-                <span class="so-hdr-div" aria-hidden="true"></span>
-                <div class="so-iconbtn" id="so-clear-btn" title="清空对话"><i class="fa-solid fa-trash-can"></i></div>
                 <div class="so-iconbtn" id="so-close-btn" title="关闭"><i class="fa-solid fa-xmark"></i></div>
             </div>
+        </div>
+        <div id="so-modebar" role="tablist" aria-label="模式切换">
+            <button type="button" class="so-modetab" id="so-chat-btn" data-mode="chat" role="tab" title="普通聊天 —— 问剧情、聊设定"><i class="fa-solid fa-comment"></i><span>普通</span></button>
+            <button type="button" class="so-modetab" id="so-advisor-btn" data-mode="advisor" role="tab" title="剧情参谋 —— 构思新剧情走向，并引导主线靠近它"><i class="fa-solid fa-compass"></i><span>参谋</span></button>
+            <button type="button" class="so-modetab" id="so-lorebook-btn" data-mode="lorebook" role="tab" title="世界书 —— 聊聊或修改世界书"><i class="fa-solid fa-book"></i><span>世界书</span></button>
+            <button type="button" class="so-modetab" id="so-diagnose-btn" data-mode="diagnose" role="tab" title="诊断 —— 修复 MVU 状态变量（自动诊断在诊断设置里开）"><i class="fa-solid fa-stethoscope"></i><span>诊断</span></button>
+            <button type="button" class="so-modetab" id="so-fix-btn" data-mode="fix" role="tab" title="校正 —— 修一修最新这条回复，应用后原文仍在"><i class="fa-solid fa-wand-magic-sparkles"></i><span>校正</span></button>
+            <button type="button" class="so-modetab" id="so-game-btn" data-mode="game" role="tab" title="游戏 —— 和角色一起玩小游戏（开发中）"><i class="fa-solid fa-gamepad"></i><span>游戏</span></button>
         </div>
 
         <div id="so-settings">
@@ -6041,6 +6066,8 @@ function buildWindow() {
             <details class="so-mode-collapse" id="so-diag-collapse" open>
                 <summary class="so-mode-collapse-sum"><i class="fa-solid fa-stethoscope"></i><span>诊断设置</span></summary>
                 <div class="so-mode-collapse-body">
+            <label class="so-check so-lb-check" id="so-diag-auto-row"><input id="so-diag-auto-toggle" type="checkbox"><span>🔴 自动诊断（每条新回复后台自动检查并应用 MVU 修复，可撤销）</span></label>
+            <div class="so-hint" id="so-diag-auto-hint">开启后窗口关着也照常在后台工作。这是唯一会自动写入状态的功能，首次开启会提醒一次。</div>
             <label class="so-check so-lb-check"><input id="so-diag-usesel" type="checkbox"><span>诊断使用精选世界书条目（关闭则用默认扫描）</span></label>
             <div class="so-hint">开启后可【按本聊天】挑选要喂给诊断的世界书条目，无视其在 ST 里的启用 / 禁用状态——解决「禁用了变量规则条目后诊断就看不到」与「全量太吵」的两难。首次开启会按当前激活情况预选一份，之后随你增删、按聊天记忆。</div>
             <div id="so-diag-picker">
@@ -6375,10 +6402,12 @@ function bindControls() {
 
     win.querySelector('#so-close-btn').addEventListener('click', () => toggleWindow(false));
     win.querySelector('#so-clear-btn').addEventListener('click', clearConversation);
-    win.querySelector('#so-diagnose-btn').addEventListener('click', toggleDiagnose);
-    win.querySelector('#so-lorebook-btn').addEventListener('click', toggleLorebook);
-    win.querySelector('#so-advisor-btn').addEventListener('click', toggleAdvisor);
-    win.querySelector('#so-fix-btn').addEventListener('click', toggleFix);
+    win.querySelector('#so-chat-btn').addEventListener('click', () => selectMode('chat'));
+    win.querySelector('#so-advisor-btn').addEventListener('click', () => selectMode('advisor'));
+    win.querySelector('#so-lorebook-btn').addEventListener('click', () => selectMode('lorebook'));
+    win.querySelector('#so-diagnose-btn').addEventListener('click', () => selectMode('diagnose'));
+    win.querySelector('#so-fix-btn').addEventListener('click', () => selectMode('fix'));
+    win.querySelector('#so-game-btn').addEventListener('click', () => selectMode('game'));
     win.querySelector('#so-adv-preset').addEventListener('change', (e) => {
         const s2 = getSettings();
         s2.advisorUsePreset = e.target.checked;
@@ -6550,21 +6579,7 @@ function bindControls() {
             if (e.key === 'Escape' && toolsMenu.classList.contains('open')) closeToolsMenu();
         });
     }
-    // 「普通聊天」菜单项：从任何模式一键回普通聊天（仅切换视图——自动诊断如开启会继续在后台跑，
-    // 诊断按钮仍红；要停自动诊断请点诊断按钮）。菜单收起由上面的 .so-tools-item 监听统一处理。
-    win.querySelector('#so-normalchat-btn')?.addEventListener('click', () => {
-        if (currentOracleMode() === 'chat') {
-            // 已在普通聊天：自动诊断后台武装时，本项当开关用——再点一次回到诊断视图（否则普通聊天是死胡同）。
-            if (diagShouldReveal(diagnoseMode, ENABLE_AUTO_DIAGNOSE && !!getSettings().autoDiagnoseEnabled)) {
-                setOracleMode('diagnose');
-                if (inputEl) inputEl.focus();
-            }
-            return;
-        }
-        priorOracleMode = 'chat';
-        setOracleMode('chat');
-        modeEntryNote('已返回普通聊天模式。');
-    });
+    // 「普通聊天」现在是模式条上的第一个 tab（#so-chat-btn），不再是「更多」菜单项，绑定见上方 selectMode。
     win.querySelector('#so-debug-btn').addEventListener('click', openDebug);
     win.querySelector('#so-debug-close').addEventListener('click', () => win.querySelector('#so-debug').classList.remove('open'));
     win.querySelector('#so-debug-copy').addEventListener('click', async () => {
@@ -6583,6 +6598,29 @@ function bindControls() {
         win.classList.toggle('so-settings-open', open);   // lets CSS free up space (hide mode toolbar)
         if (open) { refreshProfiles(); populateSysPromptPresets(); }
     });
+    // 弹层面板（设置 / 概要 / 调试）：点面板外的空白处、或按 Esc，自动收起——不用再点一次触发按钮。
+    const OVERLAY_PANELS = [
+        { panel: 'so-settings', trigger: 'so-settings-btn' },
+        { panel: 'so-summary',  trigger: 'so-summary-btn' },
+        { panel: 'so-debug',    trigger: 'so-debug-btn' },
+    ];
+    const closeOverlayPanel = (id) => {
+        const p = win.querySelector('#' + id);
+        if (p) p.classList.remove('open');
+        if (id === 'so-settings') win.classList.remove('so-settings-open');
+    };
+    document.addEventListener('click', (e) => {
+        for (const { panel, trigger } of OVERLAY_PANELS) {
+            const p = win.querySelector('#' + panel);
+            if (!p || !p.classList.contains('open')) continue;
+            if (e.target.closest('#' + panel)) continue;         // 点在面板内 —— 不关
+            if (e.target.closest('#' + trigger)) continue;       // 点触发按钮 —— 交给它自己 toggle
+            closeOverlayPanel(panel);
+        }
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') OVERLAY_PANELS.forEach(({ panel }) => closeOverlayPanel(panel));
+    });
     // 用户功能请求：剧情概要编辑器（本聊天，自动保存到元数据）。
     win.querySelector('#so-summary-btn').addEventListener('click', openSummary);
     win.querySelector('#so-summary-close').addEventListener('click', () => win.querySelector('#so-summary').classList.remove('open'));
@@ -6600,12 +6638,31 @@ function bindControls() {
     });
     // 用户功能请求：自动诊断首次开启前的一次性警告弹窗。
     const closeAutoWarn = () => win.querySelector('#so-autowarn').classList.remove('open');
-    win.querySelector('#so-autowarn-cancel').addEventListener('click', closeAutoWarn);
+    win.querySelector('#so-autowarn-cancel').addEventListener('click', () => {
+        closeAutoWarn();
+        syncDiagAutoToggle();   // 用户取消开启自动诊断 → 诊断设置栏的复选框回弹到未勾
+    });
     win.querySelector('#so-autowarn-ok').addEventListener('click', () => {
         if (win.querySelector('#so-autowarn-never').checked) { getSettings().autoDiagnoseWarned = true; save(); }
         closeAutoWarn();
         applyDiagButtonState('auto');
     });
+    // 诊断设置栏的「自动诊断」开关（原顶栏诊断图标三态循环里的 AUTO 态，tab 化后移到这里）。
+    const diagAutoToggle = win.querySelector('#so-diag-auto-toggle');
+    if (diagAutoToggle) {
+        if (!ENABLE_AUTO_DIAGNOSE) {
+            const row = win.querySelector('#so-diag-auto-row'); if (row) row.style.display = 'none';
+            const hint = win.querySelector('#so-diag-auto-hint'); if (hint) hint.style.display = 'none';
+        }
+        diagAutoToggle.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                if (!getSettings().autoDiagnoseWarned) { openAutoDiagWarn(); return; }  // 确认后由 so-autowarn-ok 落地并回填勾选
+                applyDiagButtonState('auto');
+            } else {
+                applyDiagButtonState('diagnose');
+            }
+        });
+    }
     // ✨ 校正：切到「自动校正」时的一次性标签块提醒（信息性，无需取消——已经切过去了，只是提醒）。
     const fixWarnOk = win.querySelector('#so-fixwarn-ok');
     if (fixWarnOk) fixWarnOk.addEventListener('click', () => {
@@ -7628,6 +7685,7 @@ const MODE_PLACEHOLDERS = {
     lorebook: '问问这本世界书，或让我改写 / 新增 / 删除某个条目…',
     advisor: '聊聊剧情接下来可以怎么走…（出方案后可一键开始引导）',
     fix: '想怎么改最新这条回复都行——重写、删改、换语气、调节奏、改设定…说出来，我来改一版…',
+    game: '游戏功能开发中…',
 };
 
 // 各模式的空状态：模式图标 + 引导语 +（可选）副标题 + 示例 chip。点一下 chip 把问题填进输入框
@@ -7663,10 +7721,16 @@ const MODE_EMPTY = {
         sub: '校正只去 AI 腔 / 收紧读感——不翻译、不改设定、不算数值、不修卡片本身的问题。',
         chips: ['这个角色不该知道这件事，重写他的对话', '这个事件的日期不对，回看上下文改正', '这个角色的台词太机械，重写得更像真人', '扩写这一段，补充更多剧情细节'],
     },
+    game: {
+        icon: 'fa-gamepad',
+        lead: '游戏模式还在开发中。',
+        sub: '之后可以在这里和角色一起玩真心话大冒险、猜心等小游戏，敬请期待。',
+        chips: [],
+    },
 };
 
 function currentOracleMode() {
-    return diagnoseMode ? 'diagnose' : (lorebookMode ? 'lorebook' : (advisorMode ? 'advisor' : (fixMode ? 'fix' : 'chat')));
+    return oracleMode;
 }
 
 function modeReturnNote(mode) {
@@ -7678,6 +7742,8 @@ function modeReturnNote(mode) {
 }
 
 function setOracleMode(target) {
+    const prevMode = oracleMode;
+    oracleMode = ORACLE_MODES.includes(target) ? target : 'chat';
     diagnoseMode = target === 'diagnose';
     lorebookMode = target === 'lorebook';
     advisorMode = target === 'advisor';
@@ -7692,10 +7758,48 @@ function setOracleMode(target) {
     win.querySelector('#so-fix-btn').classList.toggle('so-fix-active', fixMode);
     inputEl.placeholder = MODE_PLACEHOLDERS[target] || MODE_PLACEHOLDERS.chat;
     if (ENABLE_DIAG_WI_PICKER) refreshDiagPickerUI();   // 诊断「精选条目」栏随模式刷新（用户功能请求）
-    // 空侧聊时切换模式要刷新空状态（每模式自带一组引导语 + 示例 chip）；有内容则保留现有记录不动。
-    if (messagesEl && !convo.length) { messagesEl.innerHTML = ''; renderEmptyState(); }
+    // 历史分桶：切走时先把各模式历史落盘，再把 convo 换成当前模式那一份并重渲染（每模式各存各的、互不混）。
+    if (messagesEl) {
+        if (prevMode !== oracleMode) persistConvo();
+        convo = convosByMode[oracleMode];
+        renderConvoMessages();
+    }
     updateDiagButtonVisual();   // 诊断按钮（含红色 AUTO）状态随模式切换始终对齐（含从子模式回到诊断时）
     updateFixButtonVisual();    // ✨ 校正按钮：自动校正开启时图标染金（随模式切换对齐）
+    // 模式 tab 高亮同步：统一用 data-mode 匹配当前模式（chat / game 也覆盖，不依赖 so-xxx-active 布尔）。
+    if (win) win.querySelectorAll('.so-modetab').forEach((t) => t.classList.toggle('active', t.dataset.mode === oracleMode));
+}
+
+// 模式 tab 点击入口：进入目标模式（含各模式的进入副作用与提示）。与旧的 toggleXxx 不同——tab 语义是
+// 「切到该模式」，点当前 tab 不退出（要切走就点别的 tab）。诊断的「自动」由诊断设置栏的开关掌管，与进入解耦。
+function selectMode(mode) {
+    if (!ORACLE_MODES.includes(mode)) mode = 'chat';
+    if (mode === 'fix' && !ENABLE_REPLY_FIX) return;        // 校正杀死开关关闭时不可进入
+    if (currentOracleMode() === mode) { if (inputEl) inputEl.focus(); return; }
+    priorOracleMode = currentOracleMode();
+    setOracleMode(mode);
+    if (mode === 'lorebook') populateLorebookBooks();
+    if (mode === 'advisor' && convoForPrompt().length > 0 && !getPlan()) addBridgeChip();
+    modeEntryNote(modeEnterNote(mode));
+    if (inputEl) inputEl.focus();
+}
+
+function modeEnterNote(mode) {
+    switch (mode) {
+        case 'diagnose':
+            return '诊断模式已开启。我会把最新一条 AI 回复中的变量更新，对照本角色卡的 MVU 规则与当前状态进行检查，给出一份可一键应用（并可撤销）的纠正补丁。想让每条回复都自动诊断，去下方「诊断设置」里打开「自动诊断」。';
+        case 'lorebook':
+            return '世界书模式已开启。我已读取选定世界书的全部条目——你可以问里面写了什么、找矛盾、聊扩写思路；也可以让我改写、新增或删除条目，我会给出一份你能一键应用（并可撤销）的改动。上方可切换要处理哪一本。';
+        case 'advisor':
+            return '剧情参谋模式已开启。我会通读整段对话，和你一起构思剧情接下来可以怎么走。讨论出具体方案后，我会把它列成卡片——点「开始引导」并选强度，主聊天就会被悄悄引导着把剧情推向那个方向。'
+                + (getPlan() ? '\n当前已有一个方案在引导中——可以问我「检查进度」。' : '');
+        case 'fix':
+            return '校正模式已开启。我会读取最新一条 AI 回复，按你说的把它改一版——重写某段、改语气、调节奏、删减、改掉某个设定或不合适的描写都行。直接说你想改什么，我给出一份可一键应用的校正稿（应用后原文仍在，左滑即可看回）。';
+        case 'game':
+            return '游戏模式还在开发中——之后可以在这里和角色一起玩真心话大冒险、猜心等小游戏。敬请期待。';
+        default:
+            return '已进入普通聊天模式，问剧情、聊设定都行。';
+    }
 }
 
 // 用户功能请求：诊断按钮三态循环 —— 关 → 诊断 → 诊断·自动(AUTO) → 关。两个纯函数便于单测：
@@ -7768,8 +7872,16 @@ function updateDiagButtonVisual() {
     btn.classList.toggle('so-diag-auto', auto);
     win.classList.toggle('so-diag-auto-on', auto);
     btn.title = auto
-        ? '诊断 · 自动模式开启 —— 每条新回复都会自动检查并修复 MVU（再点一次关闭）'
-        : '诊断模式 —— 修复 MVU 状态变量（再点一次开启自动模式）';
+        ? '诊断 · 自动模式开启 —— 每条新回复都会自动检查并修复 MVU'
+        : '诊断模式 —— 修复 MVU 状态变量（自动诊断在诊断设置里开）';
+    syncDiagAutoToggle();
+}
+
+// 同步「自动诊断」复选框到实际的 autoDiagnoseEnabled（init / 切模式 / 开关变更后调用）。
+function syncDiagAutoToggle() {
+    if (!win) return;
+    const t = win.querySelector('#so-diag-auto-toggle');
+    if (t) t.checked = ENABLE_AUTO_DIAGNOSE && !!getSettings().autoDiagnoseEnabled;
 }
 
 // 校正按钮视觉（用户功能请求）：自动校正开启时把 ✨ 图标染金，作为「小指示」。读【本聊天生效】的 autoFixEnabled
@@ -12499,9 +12611,9 @@ function renderEmptyState() {
 async function clearConversation() {
     // 清空会连带删除本聊天已保存的侧聊历史（含自动诊断记录），无法撤销——与本扩展其它破坏性
     // 操作（清空概要 / 重置提示词 / 退出弧线）保持一致，先确认再执行。空对话则无需打扰直接返回。
-    if (convo.length && !(await uiConfirm('确定清空本聊天的侧聊历史吗？此操作会删除已保存的记录，无法撤销。'))) return;
-    convo = [];
-    persistConvo();   // 用户功能请求：手动清空也清掉本聊天保存的历史（删元数据键）
+    if (convo.length && !(await uiConfirm('确定清空【当前模式】的侧聊历史吗？此操作会删除本模式已保存的记录，无法撤销（其它模式不受影响）。'))) return;
+    setConvoForCurrentMode([]);
+    persistConvo();   // 只清当前模式桶；持久化会把其余模式原样保留
     messagesEl.innerHTML = '';
     renderEmptyState();
 }
@@ -12511,18 +12623,27 @@ async function clearConversation() {
  * ------------------------------------------------------------------ */
 // 从本聊天的元数据重建侧聊窗口。chat 切换 / 首次载入时调用（onChatChanged）。先中止任何在途
 // 生成，避免流式气泡继续写到被清掉的 DOM 上。
-function loadConvoForChat() {
-    if (!messagesEl) return;                       // 窗口还没建好（极早期）——略过，init 末尾会再调一次
-    if (isGenerating && abortCtl) { try { abortCtl.abort(); } catch (e) { /* ignore */ } }
-    const saved = getConvoMeta();
-    convo = saved
-        .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'note') && typeof m.content === 'string')
-        .map((m) => ({ id: m.id, role: m.role, content: m.content }));
-    cidSeq = convo.reduce((mx, m) => Math.max(mx, Number(m.id) || 0), cidSeq);
+// 按当前 convo 重建侧聊窗口 DOM（清空后逐条渲染；空则空状态）。切模式 / 载入聊天时复用。
+function renderConvoMessages() {
+    if (!messagesEl) return;
     messagesEl.innerHTML = '';
     if (!convo.length) { renderEmptyState(); return; }
     for (const m of convo) { m._el = (m.role === 'note') ? addNoteMessage(m) : addMessage(m.role, m.content, m); }
     scrollToBottom();
+}
+
+function loadConvoForChat() {
+    if (!messagesEl) return;                       // 窗口还没建好（极早期）——略过，init 末尾会再调一次
+    if (isGenerating && abortCtl) { try { abortCtl.abort(); } catch (e) { /* ignore */ } }
+    const saved = getConvoMeta();                  // { mode: array }，已含旧格式迁移
+    for (const mode of ORACLE_MODES) {
+        convosByMode[mode] = (saved[mode] || [])
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'note') && typeof m.content === 'string')
+            .map((m) => ({ id: m.id, role: m.role, content: m.content }));
+        cidSeq = convosByMode[mode].reduce((mx, m) => Math.max(mx, Number(m.id) || 0), cidSeq);
+    }
+    convo = convosByMode[oracleMode];
+    renderConvoMessages();
 }
 
 // 打开运行概要编辑器（叠层，仿 openDebug）。

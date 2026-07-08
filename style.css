@@ -1927,3 +1927,66 @@
 /* ✨ 1.18.3 新手优先重排：校正目标两列排布（手机窄屏回落单列）；进阶折叠沿用 so-mode-collapse。 */
 .so-fix-tgt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
 @media (max-width: 600px) { .so-fix-tgt-grid { grid-template-columns: 1fr; } }
+
+/* ---------- 模式条（标题栏下方一整排 tab：普通 / 参谋 / 世界书 / 诊断 / 校正 / 游戏） ---------- */
+/* 把原来挤在标题栏的模式图标提成平级 tab：进出对称、当前模式一目了然。诊断 / 校正 tab 复用了原
+   按钮 id（#so-diagnose-btn / #so-fix-btn），所以它们的专属色高亮（.so-diag-active / .so-fix-active
+   及自动态）会自动落到对应 tab 上；其余模式用下面的通用 .active（主题强调色）。 */
+#so-modebar {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    padding: 4px;
+    flex: 0 0 auto;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+#so-modebar::-webkit-scrollbar { display: none; }
+.so-modetab {
+    flex: 1 1 0;
+    min-width: 46px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 6px 2px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    opacity: 0.6;
+    cursor: pointer;
+    border-radius: 8px;
+    position: relative;
+    transition: opacity 0.15s, color 0.15s, background-color 0.15s;
+}
+.so-modetab > i { font-size: 16px; }
+.so-modetab > span { font-size: 11px; line-height: 1; white-space: nowrap; }
+.so-modetab:hover { opacity: 1; background-color: rgba(255, 255, 255, 0.06); }
+.so-modetab:active { transform: scale(0.96); }
+.so-modetab:focus-visible { outline: 2px solid var(--so-accent); outline-offset: -2px; opacity: 1; }
+.so-modetab.active {
+    opacity: 1;
+    color: var(--so-accent);
+    background-color: color-mix(in srgb, var(--so-accent) 12%, transparent);
+}
+/* 当前模式的底部指示条：用 currentColor，于是诊断 tab 是红、校正是金、其余是主题强调色。 */
+.so-modetab.active::after {
+    content: '';
+    position: absolute;
+    left: 22%;
+    right: 22%;
+    bottom: 0;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: currentColor;
+}
+/* 设置面板展开时收起模式条，把纵向空间让给设置（与各模式设置栏 so-settings-open 的处理一致）。 */
+#so-window.so-settings-open #so-modebar { display: none; }
+/* 手机：触摸目标更大。 */
+@media (max-width: 600px) {
+    .so-modetab { min-width: 52px; padding: 8px 2px; }
+    .so-modetab > i { font-size: 18px; }
+}
